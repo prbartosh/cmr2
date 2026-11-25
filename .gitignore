@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+._*
+
+# Oryginalne pliki gry (zasoby binarne objęte prawami autorskimi)
+Colin McRae Rally 2/
+
+# Pobrane gotowe binarki OpenCMR2
+OpenCMR2-macOS-arm64/
+
+# Paczki aplikacji i katalogi budowania
+*.app/
+build/
