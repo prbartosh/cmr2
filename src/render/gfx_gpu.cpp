@@ -69,6 +69,9 @@ struct FragmentLightingUniforms {
     int32_t texCoordIndex[4];
     float viewUp[4];
     float enhanceParams[4];
+    float eyeToLightClip[16];
+    float shadowParams[4];
+    float sunDirEye[4];
 };
 
 struct ClearUniforms {
@@ -78,6 +81,14 @@ struct ClearUniforms {
 
 struct PostUniforms {
     float params[4];
+};
+
+struct ShadowVertexUniforms {
+    float lightWorldViewProj[16];
+};
+
+struct ShadowFragmentUniforms {
+    float alphaParams[4];
 };
 
 void Multiply(const GfxMatrix &a, const GfxMatrix &b, float *out)
@@ -97,6 +108,113 @@ void TransformPoint(const GfxVector &v, float w, const GfxMatrix &m, float out[3
     const float *p = &m._11;
     for (int c = 0; c < 3; c++)
         out[c] = v.x * p[c] + v.y * p[4 + c] + v.z * p[8 + c] + w * p[12 + c];
+}
+
+GfxVector VecNormalize(GfxVector v)
+{
+    float len = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (len > 1e-6f)
+        return { v.x / len, v.y / len, v.z / len };
+    return { 0.0f, 1.0f, 0.0f };
+}
+
+GfxVector VecCross(GfxVector a, GfxVector b)
+{
+    return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+}
+
+float VecDot(GfxVector a, GfxVector b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+bool InvertAffineMatrix(const GfxMatrix &m, GfxMatrix &out)
+{
+    const float a00 = m._11, a01 = m._12, a02 = m._13;
+    const float a10 = m._21, a11 = m._22, a12 = m._23;
+    const float a20 = m._31, a21 = m._32, a22 = m._33;
+    const float c00 = a11 * a22 - a12 * a21;
+    const float c01 = -(a10 * a22 - a12 * a20);
+    const float c02 = a10 * a21 - a11 * a20;
+    const float det = a00 * c00 + a01 * c01 + a02 * c02;
+    if (fabsf(det) < 1e-7f)
+        return false;
+    const float invDet = 1.0f / det;
+    const float c10 = -(a01 * a22 - a02 * a21);
+    const float c11 = a00 * a22 - a02 * a20;
+    const float c12 = -(a00 * a21 - a01 * a20);
+    const float c20 = a01 * a12 - a02 * a11;
+    const float c21 = -(a00 * a12 - a02 * a10);
+    const float c22 = a00 * a11 - a01 * a10;
+
+    memset(&out, 0, sizeof(out));
+    out._11 = c00 * invDet; out._12 = c10 * invDet; out._13 = c20 * invDet;
+    out._21 = c01 * invDet; out._22 = c11 * invDet; out._23 = c21 * invDet;
+    out._31 = c02 * invDet; out._32 = c12 * invDet; out._33 = c22 * invDet;
+    const float tx = m._41, ty = m._42, tz = m._43;
+    out._41 = -(tx * out._11 + ty * out._21 + tz * out._31);
+    out._42 = -(tx * out._12 + ty * out._22 + tz * out._32);
+    out._43 = -(tx * out._13 + ty * out._23 + tz * out._33);
+    out._44 = 1.0f;
+    return true;
+}
+
+bool BuildSunLightMatrix(const GfxMatrix &camView, const GfxVector &sunLightDir, float shadowDist, int mapSize,
+                         GfxMatrix &outLightVP, GfxVector &outToSunWorld)
+{
+    GfxMatrix invCam;
+    if (!InvertAffineMatrix(camView, invCam))
+        return false;
+    GfxVector camPos = { invCam._41, invCam._42, invCam._43 };
+    GfxVector camFwd = VecNormalize({ camView._13, camView._23, camView._33 });
+
+    GfxVector toSun = VecNormalize({ -sunLightDir.x, -sunLightDir.y, -sunLightDir.z });
+    if (toSun.y < 0.24f) {
+        toSun.y = 0.24f;
+        toSun = VecNormalize(toSun);
+    }
+    outToSunWorld = toSun;
+
+    GfxVector lightFwd = { -toSun.x, -toSun.y, -toSun.z };
+    GfxVector upRef = fabsf(lightFwd.y) > 0.98f ? GfxVector{ 0.0f, 0.0f, 1.0f } : GfxVector{ 0.0f, 1.0f, 0.0f };
+    GfxVector lightRight = VecNormalize(VecCross(upRef, lightFwd));
+    GfxVector lightUp = VecNormalize(VecCross(lightFwd, lightRight));
+
+    float radius = std::clamp(shadowDist, 25.0f, 200.0f);
+    float zRange = std::max(radius * 2.5f, 200.0f);
+    GfxVector focus = {
+        camPos.x + camFwd.x * (radius * 0.35f),
+        camPos.y + camFwd.y * (radius * 0.35f),
+        camPos.z + camFwd.z * (radius * 0.35f),
+    };
+    float texelSize = (2.0f * radius) / (float)std::max(mapSize, 256);
+    float fx = floorf(VecDot(focus, lightRight) / texelSize) * texelSize;
+    float fy = floorf(VecDot(focus, lightUp) / texelSize) * texelSize;
+    float fz = VecDot(focus, lightFwd);
+    GfxVector center = {
+        lightRight.x * fx + lightUp.x * fy + lightFwd.x * fz,
+        lightRight.y * fx + lightUp.y * fy + lightFwd.y * fz,
+        lightRight.z * fx + lightUp.z * fy + lightFwd.z * fz,
+    };
+
+    GfxMatrix lightView = {};
+    lightView._11 = lightRight.x; lightView._12 = lightUp.x; lightView._13 = lightFwd.x;
+    lightView._21 = lightRight.y; lightView._22 = lightUp.y; lightView._23 = lightFwd.y;
+    lightView._31 = lightRight.z; lightView._32 = lightUp.z; lightView._33 = lightFwd.z;
+    lightView._41 = -VecDot(center, lightRight);
+    lightView._42 = -VecDot(center, lightUp);
+    lightView._43 = -VecDot(center, lightFwd);
+    lightView._44 = 1.0f;
+
+    GfxMatrix lightOrtho = {};
+    lightOrtho._11 = 1.0f / radius;
+    lightOrtho._22 = 1.0f / radius;
+    lightOrtho._33 = 1.0f / (2.0f * zRange);
+    lightOrtho._43 = 0.5f;
+    lightOrtho._44 = 1.0f;
+
+    Multiply(lightView, lightOrtho, &outLightVP._11);
+    return true;
 }
 
 void Color(DWORD c, float out[4])
@@ -209,8 +327,14 @@ struct Executor : GfxExecutor {
     SDL_Window *window = nullptr;
     SDL_GPUShader *vs3d = nullptr, *vsTL = nullptr, *fs = nullptr, *vsClear = nullptr, *fsClear = nullptr;
     SDL_GPUShader *vsPost = nullptr, *fsPostBright = nullptr, *fsPostBlur = nullptr, *fsPostComposite = nullptr;
+    SDL_GPUShader *vsShadow = nullptr, *fsShadow = nullptr;
     SDL_GPUGraphicsPipeline *postBrightPipeline = nullptr, *postBlurPipeline = nullptr, *postCompositePipeline = nullptr;
-    SDL_GPUSampler *postSampler = nullptr;
+    SDL_GPUSampler *postSampler = nullptr, *shadowSampler = nullptr;
+    SDL_GPUTexture *shadowMap = nullptr;
+    int shadowMapSize = 0;
+    bool shadowSupported = false;
+    SDL_GPUTextureFormat shadowDepthFormat = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    std::unordered_map<uint32_t, SDL_GPUGraphicsPipeline *> shadowPipelines;
     SDL_GPUTexture *backColor = nullptr, *backDepth = nullptr;
     SDL_GPUTexture *backColorMsaa = nullptr, *backDepthMsaa = nullptr;
     SDL_GPUTexture *backdrop = nullptr;    // the copy of backColor the distance fade reads
@@ -262,6 +386,8 @@ struct Executor : GfxExecutor {
         }
         for (auto &p : pipelines)
             SDL_ReleaseGPUGraphicsPipeline(device, p.second);
+        for (auto &p : shadowPipelines)
+            SDL_ReleaseGPUGraphicsPipeline(device, p.second);
         for (auto &s : samplers)
             SDL_ReleaseGPUSampler(device, s.second);
         SDL_ReleaseGPUTexture(device, backColor);
@@ -280,6 +406,8 @@ struct Executor : GfxExecutor {
         SDL_ReleaseGPUGraphicsPipeline(device, postBlurPipeline);
         SDL_ReleaseGPUGraphicsPipeline(device, postCompositePipeline);
         SDL_ReleaseGPUSampler(device, postSampler);
+        SDL_ReleaseGPUSampler(device, shadowSampler);
+        SDL_ReleaseGPUTexture(device, shadowMap);
         SDL_ReleaseGPUTexture(device, white2D);
         SDL_ReleaseGPUTexture(device, whiteCube);
         SDL_ReleaseGPUTexture(device, flatNormal2D);
@@ -295,6 +423,8 @@ struct Executor : GfxExecutor {
         SDL_ReleaseGPUShader(device, fsPostBright);
         SDL_ReleaseGPUShader(device, fsPostBlur);
         SDL_ReleaseGPUShader(device, fsPostComposite);
+        SDL_ReleaseGPUShader(device, vsShadow);
+        SDL_ReleaseGPUShader(device, fsShadow);
         SDL_ReleaseWindowFromGPUDevice(device, window);
         SDL_DestroyGPUDevice(device);
     }
@@ -401,7 +531,7 @@ struct Executor : GfxExecutor {
 
         vs3d = Shader(SHADER_CODE(fixed3d_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         vsTL = Shader(SHADER_CODE(fixedtl_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
-        fs = Shader(SHADER_CODE(fixed_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 9, 2);
+        fs = Shader(SHADER_CODE(fixed_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 10, 2);
         vsClear = Shader(SHADER_CODE(clear_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         fsClear = Shader(SHADER_CODE(clear_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1);
         if (!vs3d || !vsTL || !fs || !vsClear || !fsClear)
@@ -434,6 +564,29 @@ struct Executor : GfxExecutor {
             } else {
                 hdrSupported = false;
                 Sys_Log("gfx: HDR 3D post-processing unavailable, falling back to SDR");
+            }
+        }
+
+        shadowSupported = SDL_GPUTextureSupportsFormat(device, shadowDepthFormat, SDL_GPU_TEXTURETYPE_2D,
+                                                       SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET |
+                                                           SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        if (shadowSupported) {
+            vsShadow = Shader(SHADER_CODE(shadow_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
+            fsShadow = Shader(SHADER_CODE(shadow_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
+            SDL_GPUSamplerCreateInfo ssi = {};
+            ssi.min_filter = SDL_GPU_FILTER_NEAREST;
+            ssi.mag_filter = SDL_GPU_FILTER_NEAREST;
+            ssi.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+            ssi.address_mode_u = ssi.address_mode_v = ssi.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+            shadowSampler = SDL_CreateGPUSampler(device, &ssi);
+            if (!vsShadow || !fsShadow || !shadowSampler) {
+                shadowSupported = false;
+            } else {
+                EnsureShadowMap(Platform_GetSettingInt("video.shadow_map_size", 2048));
+                if (shadowMap != NULL)
+                    Sys_Log("gfx: real-time sun shadow mapping enabled (%dx%d)", shadowMapSize, shadowMapSize);
+                else
+                    shadowSupported = false;
             }
         }
 
@@ -869,6 +1022,81 @@ struct Executor : GfxExecutor {
         return p;
     }
 
+    static int SanitizeShadowMapSize(int requested)
+    {
+        if (requested >= 4096)
+            return 4096;
+        if (requested >= 2048)
+            return 2048;
+        return 1024;
+    }
+
+    void EnsureShadowMap(int requestedSize)
+    {
+        if (!shadowSupported)
+            return;
+        int sz = SanitizeShadowMapSize(requestedSize);
+        if (shadowMap != NULL && shadowMapSize == sz)
+            return;
+        if (shadowMap != NULL) {
+            SDL_WaitForGPUIdle(device);
+            SDL_ReleaseGPUTexture(device, shadowMap);
+            shadowMap = nullptr;
+        }
+        shadowMap = CreateTexture(SDL_GPU_TEXTURETYPE_2D, shadowDepthFormat, sz, sz, 1, 1,
+                                  SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        shadowMapSize = shadowMap != NULL ? sz : 0;
+    }
+
+    SDL_GPUGraphicsPipeline *ShadowPipeline(int primitive)
+    {
+        uint32_t key = (uint32_t)(primitive & 7);
+        auto it = shadowPipelines.find(key);
+        if (it != shadowPipelines.end())
+            return it->second;
+
+        SDL_GPUVertexBufferDescription vb = {};
+        vb.slot = 0;
+        vb.pitch = sizeof(GfxVertex);
+        vb.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+        SDL_GPUVertexAttribute attrs[6] = {
+            { 0, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 0 },
+            { 1, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3, 12 },
+            { 2, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, 24 },
+            { 3, 0, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, 28 },
+            { 4, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, 32 },
+            { 5, 0, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, 40 },
+        };
+
+        SDL_GPUGraphicsPipelineCreateInfo info = {};
+        info.vertex_shader = vsShadow;
+        info.fragment_shader = fsShadow;
+        info.vertex_input_state.vertex_buffer_descriptions = &vb;
+        info.vertex_input_state.num_vertex_buffers = 1;
+        info.vertex_input_state.vertex_attributes = attrs;
+        info.vertex_input_state.num_vertex_attributes = 6;
+        info.primitive_type = PrimitiveType(primitive);
+        info.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+        info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
+        info.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+        info.rasterizer_state.enable_depth_clip = true;
+        info.rasterizer_state.enable_depth_bias = true;
+        info.rasterizer_state.depth_bias_constant_factor = 1.5f;
+        info.rasterizer_state.depth_bias_slope_factor = 2.0f;
+        info.depth_stencil_state.enable_depth_test = true;
+        info.depth_stencil_state.enable_depth_write = true;
+        info.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+        info.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        info.target_info.num_color_targets = 0;
+        info.target_info.depth_stencil_format = shadowDepthFormat;
+        info.target_info.has_depth_stencil_target = true;
+        SDL_GPUGraphicsPipeline *p = SDL_CreateGPUGraphicsPipeline(device, &info);
+        if (p == NULL)
+            Sys_Log("gfx: shadow pipeline: %s", SDL_GetError());
+        shadowPipelines[key] = p;
+        return p;
+    }
+
     // A draw's pipeline: everything of it the state can change.
     static uint32_t PipelineKey(const GfxCommand &cmd, const GfxDrawState &s,
                                 SDL_GPUSampleCount samples = SDL_GPU_SAMPLECOUNT_1, bool hdr = false)
@@ -1156,7 +1384,8 @@ struct Executor : GfxExecutor {
     }
 
     void FillFragmentLightingUniforms(const GfxDrawState &s, const VertexUniforms &vu, bool overhaul,
-                                      bool perPixel, bool hemisphere, float fresnelStrength,
+                                      bool perPixel, bool hemisphere, float fresnelStrength, bool shadowActive,
+                                      const GfxMatrix &lightViewProj, const GfxVector &toSunWorld, float shadowStrength,
                                       FragmentLightingUniforms &fl)
     {
         memset(&fl, 0, sizeof(fl));
@@ -1177,11 +1406,30 @@ struct Executor : GfxExecutor {
         fl.enhanceParams[1] = hemisphere ? 1.0f : 0.0f;
         fl.enhanceParams[2] = fresnelStrength;
         fl.enhanceParams[3] = overhaul ? 1.0f : 0.0f;
+        if (shadowActive && shadowMapSize > 0) {
+            GfxMatrix invView;
+            if (InvertAffineMatrix(s.view, invView)) {
+                Multiply(invView, lightViewProj, fl.eyeToLightClip);
+                fl.shadowParams[0] = 1.0f;
+                fl.shadowParams[1] = shadowStrength;
+                fl.shadowParams[2] = 1.0f / (float)shadowMapSize;
+                fl.shadowParams[3] = 1.0f;
+                TransformPoint(toSunWorld, 0.0f, s.view, fl.sunDirEye);
+                float slen = sqrtf(fl.sunDirEye[0] * fl.sunDirEye[0] + fl.sunDirEye[1] * fl.sunDirEye[1] +
+                                   fl.sunDirEye[2] * fl.sunDirEye[2]);
+                if (slen > 1e-5f) {
+                    fl.sunDirEye[0] /= slen;
+                    fl.sunDirEye[1] /= slen;
+                    fl.sunDirEye[2] /= slen;
+                }
+            }
+        }
     }
 
     // fade: the draw is a 3D one into the back buffer, which the distance
     // fade applies to.
-    void FillFragmentUniforms(const GfxDrawState &s, bool fade, bool hdr, bool materialMaps, FragmentUniforms &u)
+    void FillFragmentUniforms(const GfxDrawState &s, bool fade, bool hdr, bool materialMaps, bool receiveShadows,
+                              FragmentUniforms &u)
     {
         memset(&u, 0, sizeof(u));
         const GfxStageState &a = s.stages[0], &b = s.stages[1];
@@ -1215,6 +1463,7 @@ struct Executor : GfxExecutor {
         u.fogMode[3] = hdr ? 1 : 0;
         u.fogParams[0] = s.fogStart;
         u.fogParams[1] = s.fogEnd;
+        u.fogParams[2] = receiveShadows ? 1.0f : 0.0f;
         memcpy(u.bumpMatrix, a.bumpMat, sizeof(u.bumpMatrix));
         u.bumpLuminance[0] = a.bumpLumScale;
         u.bumpLuminance[1] = a.bumpLumOffset;
@@ -1226,9 +1475,9 @@ struct Executor : GfxExecutor {
         u.distanceFade[3] = 0.85f;
     }
 
-    // The stages' textures (2D and cube for each), backdrop, native icons, and material maps.
+    // The stages' textures (2D and cube for each), backdrop, native icons, material maps, and shadow map.
     void TextureBindings(const GfxDrawState &s, bool is3D, bool hdr, bool materialMaps,
-                         SDL_GPUTextureSamplerBinding bindings[9])
+                         SDL_GPUTextureSamplerBinding bindings[10])
     {
         bool overhaul = Platform_IsVisualOverhaulEnabled();
         SDL_GPUSampler *stage0Sampler = NULL;
@@ -1278,6 +1527,8 @@ struct Executor : GfxExecutor {
         SDL_GPUSampler *matSampler = stage0Sampler != NULL ? stage0Sampler : Sampler(GfxStageState());
         bindings[7] = { (normGpu != NULL && normGpu->texture != NULL) ? normGpu->texture : flatNormal2D, matSampler };
         bindings[8] = { (specGpu != NULL && specGpu->texture != NULL) ? specGpu->texture : white2D, matSampler };
+        bindings[9] = { shadowMap != NULL ? shadowMap : white2D,
+                        shadowSampler != NULL ? shadowSampler : Sampler(GfxStageState()) };
     }
 
     // What a render pass has bound: each draw sets only what differs from the
@@ -1287,7 +1538,7 @@ struct Executor : GfxExecutor {
         bool viewportSet = false, texturesSet = false, indicesSet = false;
         SDL_GPUViewport viewport = {};
         SDL_Rect scissor = {};
-        SDL_GPUTextureSamplerBinding textures[9] = {};
+        SDL_GPUTextureSamplerBinding textures[10] = {};
         SDL_GPUBuffer *vertices = nullptr;
     };
 
@@ -1556,6 +1807,100 @@ struct Executor : GfxExecutor {
         DrawPostPass(cmd, postCompositePipeline, backColor, backWidth, backHeight, compBindings, 3, compU);
     }
 
+    void RenderShadowPass(SDL_GPUCommandBuffer *cmd, const GfxFrame &frame, size_t backdropIndex,
+                          const GfxMatrix &lightViewProj, bool overhaul)
+    {
+        if (shadowMap == NULL || shadowMapSize <= 0)
+            return;
+        SDL_GPUDepthStencilTargetInfo depth = {};
+        depth.texture = shadowMap;
+        depth.load_op = SDL_GPU_LOADOP_CLEAR;
+        depth.store_op = SDL_GPU_STOREOP_STORE;
+        depth.clear_depth = 1.0f;
+        SDL_GPURenderPass *spass = SDL_BeginGPURenderPass(cmd, NULL, 0, &depth);
+        if (spass == NULL)
+            return;
+
+        SDL_GPUViewport vp = { 0.0f, 0.0f, (float)shadowMapSize, (float)shadowMapSize, 0.0f, 1.0f };
+        SDL_Rect scissor = { 0, 0, shadowMapSize, shadowMapSize };
+        SDL_SetGPUViewport(spass, &vp);
+        SDL_SetGPUScissor(spass, &scissor);
+
+        SDL_GPUGraphicsPipeline *curPipe = NULL;
+        SDL_GPUBuffer *curVB = NULL;
+        bool indicesBound = false;
+        GfxTexture *scanTarget = NULL;
+        for (size_t i = 0; i < frame.commands.size(); i++) {
+            const GfxCommand &c = frame.commands[i];
+            if (c.type == GFX_CMD_TARGET) {
+                scanTarget = c.target;
+                continue;
+            }
+            if (scanTarget != NULL || c.type != GFX_CMD_DRAW || c.transformed)
+                continue;
+            if (backdropIndex != SIZE_MAX && i <= backdropIndex)
+                continue;
+            const GfxDrawState &s = frame.states[c.state];
+            if (!s.depthTest || !s.depthWrite)
+                continue;
+            if (s.alphaBlend && !s.alphaTest)
+                continue;
+
+            SDL_GPUGraphicsPipeline *pipe = ShadowPipeline(c.primitive);
+            if (pipe == NULL)
+                continue;
+            if (pipe != curPipe) {
+                SDL_BindGPUGraphicsPipeline(spass, pipe);
+                curPipe = pipe;
+            }
+
+            ShadowVertexUniforms svu;
+            Multiply(s.world, lightViewProj, svu.lightWorldViewProj);
+            SDL_PushGPUVertexUniformData(cmd, 0, &svu, sizeof(svu));
+
+            ShadowFragmentUniforms sfu = {};
+            const bool alphaTestOn = s.alphaTest && s.stages[0].texture != NULL;
+            if (alphaTestOn) {
+                sfu.alphaParams[0] = 1.0f;
+                sfu.alphaParams[1] = (s.alphaRef & 0xff) / 255.0f;
+                sfu.alphaParams[2] = (float)s.alphaFunc;
+            }
+            SDL_PushGPUFragmentUniformData(cmd, 0, &sfu, sizeof(sfu));
+
+            SDL_GPUTexture *tex = white2D;
+            SDL_GPUSampler *samp = Sampler(GfxStageState());
+            if (alphaTestOn) {
+                GfxTexture *t = Gfx_DrawnTexture(s.stages[0].texture, overhaul);
+                GpuTexture *g = t != NULL ? Ensure(t) : NULL;
+                if (g != NULL && g->texture != NULL && !(t->flags & GFX_TEXTURE_CUBE)) {
+                    tex = g->texture;
+                    samp = Sampler(s.stages[0]);
+                }
+            }
+            SDL_GPUTextureSamplerBinding tb = { tex, samp };
+            SDL_BindGPUFragmentSamplers(spass, 0, &tb, 1);
+
+            SDL_GPUBuffer *vb = c.buffer != NULL ? ((GpuVertexBuffer *)c.buffer->gpu)->buffer : vertexBuffer;
+            uint32_t firstVertex = c.firstVertexByte / sizeof(GfxVertex);
+            if (vb != curVB) {
+                SDL_GPUBufferBinding vbb = { vb, 0 };
+                SDL_BindGPUVertexBuffers(spass, 0, &vbb, 1);
+                curVB = vb;
+            }
+            if (c.firstIndex != ~0u) {
+                if (!indicesBound) {
+                    SDL_GPUBufferBinding ib = { indexBuffer, 0 };
+                    SDL_BindGPUIndexBuffer(spass, &ib, SDL_GPU_INDEXELEMENTSIZE_16BIT);
+                    indicesBound = true;
+                }
+                SDL_DrawGPUIndexedPrimitives(spass, c.indexCount, 1, c.firstIndex, (Sint32)firstVertex, 0);
+            } else {
+                SDL_DrawGPUPrimitives(spass, c.vertexCount, 1, firstVertex, 0);
+            }
+        }
+        SDL_EndGPURenderPass(spass);
+    }
+
     void Execute(GfxFrame &frame, std::vector<GfxTexture *> &textures, GfxReadback &readback, bool present,
                  bool vsync, bool stretch) override
     {
@@ -1612,6 +1957,12 @@ struct Executor : GfxExecutor {
         const float fresnelStrength =
             carFresnel ? std::clamp(Platform_GetSettingFloat("video.car_fresnel_strength", 0.65f), 0.0f, 1.0f) : 0.0f;
         size_t last3D = SIZE_MAX;
+        size_t backdropIndex = SIZE_MAX;
+        bool foundSun = false;
+        GfxVector sunLightDir = { 0.3f, -0.8f, 0.4f };
+        GfxMatrix mainCamView = {};
+        bool foundMainCam = false;
+        float bestSunLuma = 0.0f;
         {
             GfxTexture *scanTarget = NULL;
             for (size_t i = 0; i < frame.commands.size(); i++) {
@@ -1620,8 +1971,50 @@ struct Executor : GfxExecutor {
                     scanTarget = c.target;
                     continue;
                 }
-                if (scanTarget == NULL && c.type == GFX_CMD_DRAW && !c.transformed)
+                if (scanTarget != NULL)
+                    continue;
+                if (c.type == GFX_CMD_BACKDROP) {
+                    backdropIndex = i;
+                    continue;
+                }
+                if (c.type == GFX_CMD_DRAW && !c.transformed) {
                     last3D = i;
+                    const GfxDrawState &s = frame.states[c.state];
+                    if (s.depthTest && s.depthWrite && (!foundMainCam || backdropIndex != SIZE_MAX)) {
+                        mainCamView = s.view;
+                        foundMainCam = true;
+                    }
+                    if (s.lighting) {
+                        for (int li = 0; li < 8; li++) {
+                            if (!s.lightEnabled[li] || s.lights[li].type != GFX_LIGHT_DIRECTIONAL)
+                                continue;
+                            float luma = s.lights[li].diffuse.r * 0.299f + s.lights[li].diffuse.g * 0.587f +
+                                         s.lights[li].diffuse.b * 0.114f;
+                            if (luma > 0.15f && luma > bestSunLuma) {
+                                bestSunLuma = luma;
+                                sunLightDir = s.lights[li].direction;
+                                foundSun = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bool shadowActive = false;
+        GfxMatrix lightViewProj = {};
+        GfxVector toSunWorld = { 0.0f, 1.0f, 0.0f };
+        const float shadowStrength =
+            std::clamp(Platform_GetSettingFloat("video.shadow_strength", 0.65f), 0.0f, 1.0f);
+        if (overhaul && shadowSupported && foundSun && foundMainCam && shadowStrength > 0.01f &&
+            Platform_GetSettingInt("video.shadow_map", 1) != 0) {
+            EnsureShadowMap(Platform_GetSettingInt("video.shadow_map_size", 2048));
+            float shadowDist = std::clamp(Platform_GetSettingFloat("video.shadow_distance", 75.0f), 25.0f, 200.0f);
+            if (shadowMap != NULL &&
+                BuildSunLightMatrix(mainCamView, sunLightDir, shadowDist, shadowMapSize, lightViewProj, toSunWorld)) {
+                RenderShadowPass(cmd, frame, backdropIndex, lightViewProj, overhaul);
+                shadowActive = true;
+                vertexUniformState = NULL;
+                fragmentUniformsSet = false;
             }
         }
         const bool toneMap = overhaul && Platform_GetSettingInt("video.tone_mapping", 1) != 0;
@@ -1641,6 +2034,8 @@ struct Executor : GfxExecutor {
                 : SDL_GPU_SAMPLECOUNT_1;
         for (int phase = 0; phase < 2; phase++) {
             target = NULL;
+            vertexUniformState = NULL;
+            fragmentUniformsSet = false;
             bool inHdr3D = (phase == 1 && postEnabled);
             for (size_t i = 0; i < frame.commands.size(); i++) {
                 const GfxCommand &c = frame.commands[i];
@@ -1737,25 +2132,30 @@ struct Executor : GfxExecutor {
                     FillVertexUniforms(c, s, targetW, targetH, viewport, scaled, vu);
                     SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof(vu));
                     FragmentLightingUniforms fl;
-                    FillFragmentLightingUniforms(s, vu, overhaul, perPixel, hemisphere, fresnelStrength, fl);
+                    FillFragmentLightingUniforms(s, vu, overhaul, perPixel, hemisphere, fresnelStrength,
+                                                 shadowActive && target == NULL, lightViewProj, toSunWorld,
+                                                 shadowStrength, fl);
                     SDL_PushGPUFragmentUniformData(cmd, 1, &fl, sizeof(fl));
                     vertexUniformState = &s;
                     vertexUniformW = targetW;
                     vertexUniformH = targetH;
                     vertexUniformScaled = scaled;
                 }
+                const bool receiveShadows = shadowActive && target == NULL && !c.transformed && s.depthTest &&
+                                            !(s.alphaBlend && s.destBlend == GFX_BLEND_ONE) &&
+                                            (backdropIndex == SIZE_MAX || i > backdropIndex);
                 FragmentUniforms fu;
                 FillFragmentUniforms(s, target == NULL && !c.transformed, inHdr3D && !c.transformed,
-                                     materialMaps && !c.transformed, fu);
+                                     materialMaps && !c.transformed, receiveShadows, fu);
                 if (!fragmentUniformsSet || memcmp(&fu, &fragmentUniforms, sizeof(fu)) != 0) {
                     SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
                     fragmentUniforms = fu;
                     fragmentUniformsSet = true;
                 }
-                SDL_GPUTextureSamplerBinding textures[9];
+                SDL_GPUTextureSamplerBinding textures[10];
                 TextureBindings(s, !c.transformed, inHdr3D, materialMaps && !c.transformed, textures);
                 if (!bound.texturesSet || memcmp(textures, bound.textures, sizeof(textures)) != 0) {
-                    SDL_BindGPUFragmentSamplers(pass, 0, textures, 9);
+                    SDL_BindGPUFragmentSamplers(pass, 0, textures, 10);
                     memcpy(bound.textures, textures, sizeof(textures));
                     bound.texturesSet = true;
                 }

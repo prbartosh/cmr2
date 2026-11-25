@@ -22,6 +22,7 @@ layout(set = 2, binding = 5) uniform sampler2D native0;
 layout(set = 2, binding = 6) uniform sampler2D native1;
 layout(set = 2, binding = 7) uniform sampler2D normalMap0;
 layout(set = 2, binding = 8) uniform sampler2D specMap0;
+layout(set = 2, binding = 9) uniform sampler2D shadowMapTex;
 
 layout(std140, set = 3, binding = 0) uniform FragmentUniforms {
     ivec4 stage0;       // colour op, colour arg1, colour arg2, alpha op
@@ -62,6 +63,9 @@ layout(std140, set = 3, binding = 1) uniform FragmentLightingUniforms {
     ivec4 texCoordIndex;    // stage 0, stage 1, texture transform 0, texture transform 1
     vec4 viewUp;            // world up in eye space
     vec4 enhanceParams;     // x: perPixelLighting, y: hemisphereAmbient, z: carFresnelStrength, w: visualOverhaul
+    mat4 eyeToLightClip;    // eye space -> sun shadow clip space
+    vec4 shadowParams;      // x: enabled (0/1), y: strength, z: invMapSize, w: receiveShadows (0/1)
+    vec4 sunDirEye;         // xyz: direction toward sun in eye space, w: unused
 };
 
 const int TOP_DISABLE = 1, TOP_SELECTARG1 = 2, TOP_SELECTARG2 = 3, TOP_MODULATE = 4, TOP_MODULATE2X = 5,
@@ -245,13 +249,49 @@ vec3 PerturbNormal(vec3 N, vec3 eyePos, vec2 uv, vec3 mapSample, float strength)
     return normalize(tbn * normalize(tn));
 }
 
+// 9-tap PCF directional sun shadow sampling with normal-offset bias and frustum edge fade.
+// Returns 1.0 when fully lit, 0.0 when occluded by shadow casters.
+float SampleSunShadow(vec3 eyePos, vec3 geomN, bool hasNormal)
+{
+    if (shadowParams.x < 0.5 || fogParams.z < 0.5 || enhanceParams.w < 0.5)
+        return 1.0;
+    vec3 offsetPos = eyePos + (hasNormal ? geomN * 0.07 : vec3(0.0));
+    vec4 lc = eyeToLightClip * vec4(offsetPos, 1.0);
+    if (abs(lc.w) < 1e-5)
+        return 1.0;
+    vec3 proj = lc.xyz / lc.w;
+    vec2 suv = vec2(proj.x * 0.5 + 0.5, 0.5 - proj.y * 0.5);
+    if (suv.x <= 0.002 || suv.x >= 0.998 || suv.y <= 0.002 || suv.y >= 0.998 ||
+        proj.z <= 0.0 || proj.z >= 1.0)
+        return 1.0;
+    float edge = max(abs(proj.x), abs(proj.y));
+    float fade = 1.0 - smoothstep(0.78, 0.98, edge);
+    if (fade <= 0.0)
+        return 1.0;
+    float ndl = hasNormal ? max(dot(geomN, sunDirEye.xyz), 0.0) : 0.5;
+    float bias = mix(0.0026, 0.0007, ndl);
+    float invSize = shadowParams.z;
+    float vis = 0.0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            float d = texture(shadowMapTex, suv + vec2(float(dx), float(dy)) * invSize).r;
+            vis += (proj.z - bias <= d) ? 1.0 : 0.0;
+        }
+    }
+    vis /= 9.0;
+    return mix(1.0, vis, fade);
+}
+
 void main()
 {
     bool hasNormal = dot(inEyeNormal, inEyeNormal) > 1e-6;
-    vec3 N = hasNormal ? normalize(inEyeNormal) : vec3(0.0, 1.0, 0.0);
+    vec3 geomN = hasNormal ? normalize(inEyeNormal) : vec3(0.0, 1.0, 0.0);
+    vec3 N = geomN;
     vec3 V = length(inEyePosition) > 1e-5 ? normalize(-inEyePosition) : vec3(0.0, 0.0, -1.0);
     bool isCubePass = (stage0.x != TOP_DISABLE && stage0b.z == 2) ||
                       (stage0.x != TOP_DISABLE && stage1.x != TOP_DISABLE && stage1b.z == 2);
+    float sunVis = SampleSunShadow(inEyePosition, geomN, hasNormal);
+    float sunDirectShadow = mix(1.0 - shadowParams.y, 1.0, sunVis);
 
     bool useNormalMap = enhanceParams.w > 0.5 && alphaTest.z != 0 && hasNormal &&
                         stage0.x != TOP_DISABLE && stage0b.z == 1;
@@ -317,16 +357,17 @@ void main()
             }
             float scale = atten * spotFactor;
             ambient += l.ambient.rgb * scale;
+            float directScale = (type == 3) ? (scale * sunDirectShadow) : scale;
             float nDotL = max(dot(N, L), 0.0);
-            diffuseSum += l.diffuse.rgb * nDotL * scale;
+            diffuseSum += l.diffuse.rgb * nDotL * directScale;
             if (nDotL > 0.0) {
                 vec3 h = normalize(toEye + L);
                 if (lightFlags.z != 0)
-                    specularSum += l.specular.rgb * pow(max(dot(N, h), 0.0), max(globalAmbient.w, 1.0)) * scale * specMask;
+                    specularSum += l.specular.rgb * pow(max(dot(N, h), 0.0), max(globalAmbient.w, 1.0)) * directScale * specMask;
                 if (isCubePass && enhanceParams.z > 0.0 && type == 3)
-                    clearcoatSpec += l.diffuse.rgb * pow(max(dot(N, h), 0.0), 48.0) * (0.28 * enhanceParams.z * coatFresnel * specMask) * scale;
+                    clearcoatSpec += l.diffuse.rgb * pow(max(dot(N, h), 0.0), 48.0) * (0.28 * enhanceParams.z * coatFresnel * specMask) * directScale;
                 else if (useSpecMap && type == 3 && specMask > 0.05)
-                    clearcoatSpec += l.diffuse.rgb * pow(max(dot(N, h), 0.0), 28.0) * (0.18 * specMask) * scale;
+                    clearcoatSpec += l.diffuse.rgb * pow(max(dot(N, h), 0.0), 28.0) * (0.18 * specMask) * directScale;
             }
         }
         litDiffuse = vec4(clamp(matEmissive.rgb + ambient * matAmbient.rgb + diffuseSum * matDiffuse.rgb, 0.0, 1.0),
@@ -397,6 +438,13 @@ void main()
 
     if (alphaTest.x != 0 && !Compare(alphaTest.y, floor(current.a * 255.0 + 0.5), floor(alphaRef.x * 255.0 + 0.5)))
         discard;
+
+    // Apply real-time sun shadows to vertex-lit 3D scenery (track/terrain sectors).
+    if (lightFlags.x == 0 && shadowParams.x > 0.5 && fogParams.z > 0.5 && enhanceParams.w > 0.5) {
+        float shadowDark = mix(1.0 - shadowParams.y * 0.78, 1.0, sunVis);
+        vec3 coolTint = mix(vec3(0.90, 0.94, 1.02), vec3(1.0), sunVis);
+        current.rgb *= shadowDark * coolTint;
+    }
 
     if (fogMode.x != 0) {
         float f = inFog;

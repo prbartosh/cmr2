@@ -1,3 +1,4 @@
+#include "port/sys.h"
 #include <stdlib.h>
 #include "FloatToInt.h"
 #include <stdio.h>
@@ -2359,6 +2360,8 @@ void Scene_DrawShadowBatches(unsigned int view)
     BYTE mask;
 
     if ((unsigned int)g_shadowVertexCount <= 0)
+        return;
+    if (Sys_IsVisualOverhaulEnabled() && Sys_GetOption("video.shadow_map", 1) != 0)
         return;
     CGraphics::SetZWriteEnable(0);
     CGraphics::SetCullMode(1);
