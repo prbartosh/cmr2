@@ -150,7 +150,9 @@ struct GpuTexture {
     // directly broke the whole picture on the Adreno 840 (#46).
     SDL_GPUTexture *faces[6] = {};
     SDL_GPUTextureFormat format;
-    bool cpuDecode = false;                // BC data decoded on the CPU (no BC support)
+    bool cpuDecode = false;                // BC data decoded on the CPU (no BC support or compressed_mipmaps)
+    int mipLevels = 1;                     // actual mip levels created on the GPU
+    bool generatedMips = false;            // mip levels 1..N generated on upload from decoded level 0
 };
 
 // The GPU copy of a GfxVertexBuffer, as of a version of it.
@@ -182,7 +184,7 @@ SDL_PropertiesID DeviceProperties()
     SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_DEPTH_CLAMPING_BOOLEAN, false);
     SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_INDIRECT_DRAW_FIRST_INSTANCE_BOOLEAN, false);
     SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_ANISOTROPY_BOOLEAN,
-                           Platform_GetSettingInt("video.anisotropy", 1) > 1);
+                           Platform_GetSettingInt("video.anisotropy", 16) > 1);
     return props;
 }
 
@@ -204,7 +206,8 @@ struct Executor : GfxExecutor {
     std::unordered_map<uint32_t, SDL_GPUSampler *> samplers;
     bool bcSupported = true;
     bool presentModeVsync = true;
-    int anisotropy = 1, smoothScaling = 1;    // video.anisotropy, video.smooth_scaling
+    int anisotropy = 16, smoothScaling = 1;   // video.anisotropy, video.smooth_scaling
+    bool compressedMipmaps = true;            // video.compressed_mipmaps
     Uint32 presentWidth = 0, presentHeight = 0; // the window's pixels, as last logged
     // Back buffer reads of recently presented frames (the lens flare test).
     // The game gets the newest one the GPU has finished, a frame or two old:
@@ -301,8 +304,9 @@ struct Executor : GfxExecutor {
             Sys_Log("gfx: no window");
             return false;
         }
-        anisotropy = Platform_GetSettingInt("video.anisotropy", 1);
+        anisotropy = std::clamp(Platform_GetSettingInt("video.anisotropy", 16), 1, 16);
         smoothScaling = Platform_GetSettingInt("video.smooth_scaling", 1);
+        compressedMipmaps = Platform_GetSettingInt("video.compressed_mipmaps", 1) != 0;
         SDL_PropertiesID props = DeviceProperties();
         device = SDL_CreateGPUDeviceWithProperties(props);
         SDL_DestroyProperties(props);
@@ -422,6 +426,39 @@ struct Executor : GfxExecutor {
         }
     }
 
+    static void DownsampleBGRA(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh)
+    {
+        for (int y = 0; y < dh; y++) {
+            for (int x = 0; x < dw; x++) {
+                int weighted[3] = { 0, 0, 0 };
+                int sum[4] = { 0, 0, 0, 0 };
+                int alphaSum = 0;
+                for (int dy = 0; dy < 2; dy++) {
+                    for (int dx = 0; dx < 2; dx++) {
+                        int sx = std::min(sw - 1, x * 2 + dx);
+                        int sy = std::min(sh - 1, y * 2 + dy);
+                        const uint8_t *p = src + ((size_t)sy * sw + sx) * 4;
+                        int a = p[3];
+                        alphaSum += a;
+                        for (int c = 0; c < 4; c++)
+                            sum[c] += p[c];
+                        for (int c = 0; c < 3; c++)
+                            weighted[c] += p[c] * a;
+                    }
+                }
+                uint8_t *q = dst + ((size_t)y * dw + x) * 4;
+                if (alphaSum > 0) {
+                    for (int c = 0; c < 3; c++)
+                        q[c] = (uint8_t)((weighted[c] + alphaSum / 2) / alphaSum);
+                    q[3] = (uint8_t)((sum[3] + 2) / 4);
+                } else {
+                    for (int c = 0; c < 4; c++)
+                        q[c] = (uint8_t)((sum[c] + 2) / 4);
+                }
+            }
+        }
+    }
+
     GpuTexture *Ensure(GfxTexture *t)
     {
         if (t->gpu != NULL)
@@ -430,6 +467,19 @@ struct Executor : GfxExecutor {
         g->format = GpuFormat(t->format, g->cpuDecode);
         bool cube = (t->flags & GFX_TEXTURE_CUBE) != 0;
         bool target = (t->flags & GFX_TEXTURE_RENDER_TARGET) != 0;
+        bool isCompressed = (t->format == GFX_FORMAT_BC1 || t->format == GFX_FORMAT_BC3);
+        g->mipLevels = t->mipLevels;
+        g->generatedMips = false;
+        if (compressedMipmaps && isCompressed && !cube && !target && !(t->flags & GFX_TEXTURE_STAGING) &&
+            t->width >= 4 && t->height >= 4) {
+            g->cpuDecode = true;
+            g->format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+            int mips = 1;
+            while ((t->width >> mips) > 0 || (t->height >> mips) > 0)
+                mips++;
+            g->mipLevels = std::min(mips, 16);
+            g->generatedMips = g->mipLevels > 1;
+        }
         SDL_GPUTextureUsageFlags usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
         if (target)
             usage |= SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
@@ -440,7 +490,7 @@ struct Executor : GfxExecutor {
                                             SDL_GPU_TEXTUREUSAGE_COLOR_TARGET);
         }
         g->texture = CreateTexture(cube ? SDL_GPU_TEXTURETYPE_CUBE : SDL_GPU_TEXTURETYPE_2D, g->format, t->width,
-                                   t->height, cube ? 6 : 1, t->mipLevels, usage);
+                                   t->height, cube ? 6 : 1, g->mipLevels, usage);
         if (target)
             g->depth = CreateTexture(SDL_GPU_TEXTURETYPE_2D, depthFormat, t->width, t->height, 1, 1,
                                      SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
@@ -510,7 +560,7 @@ struct Executor : GfxExecutor {
             }
             int faces = (t->flags & GFX_TEXTURE_CUBE) ? 6 : 1;
             for (int f = 0; f < faces; f++)
-                for (int m = 0; m < t->mipLevels; m++)
+                for (int m = 0; m < g->mipLevels; m++)
                     total += UploadSize(t, g, std::max(1, t->width >> m), std::max(1, t->height >> m));
         }
         if (total == 0)
@@ -531,10 +581,19 @@ struct Executor : GfxExecutor {
             GpuTexture *g = (GpuTexture *)t->gpu;
             int faces = (t->flags & GFX_TEXTURE_CUBE) ? 6 : 1;
             for (int f = 0; f < faces; f++) {
-                for (int m = 0; m < t->mipLevels; m++) {
+                size_t prevOffset = offset;
+                int prevW = t->width, prevH = t->height;
+                for (int m = 0; m < g->mipLevels; m++) {
                     int w = std::max(1, t->width >> m), h = std::max(1, t->height >> m);
-                    ConvertLevel(t, g, t->levels[f][m].data(), w, h, map + offset);
+                    if (g->generatedMips && m > 0) {
+                        DownsampleBGRA(map + prevOffset, prevW, prevH, map + offset, w, h);
+                    } else {
+                        ConvertLevel(t, g, t->levels[f][m].data(), w, h, map + offset);
+                    }
                     pending.push_back({ g->texture, f, m, w, h, offset });
+                    prevOffset = offset;
+                    prevW = w;
+                    prevH = h;
                     offset += UploadSize(t, g, w, h);
                 }
             }
@@ -721,7 +780,7 @@ struct Executor : GfxExecutor {
 
     SDL_GPUSampler *Sampler(const GfxStageState &stage)
     {
-        int aniso = anisotropy;
+        int aniso = Platform_IsVisualOverhaulEnabled() ? anisotropy : 1;
         uint32_t key = (uint32_t)(stage.minFilter & 3) | (uint32_t)(stage.magFilter & 3) << 2 |
                        (uint32_t)(stage.mipFilter & 3) << 4 | (uint32_t)(stage.address & 3) << 6 |
                        (uint32_t)(aniso & 31) << 8;
@@ -926,20 +985,30 @@ struct Executor : GfxExecutor {
     }
 
     // The stages' textures (2D and cube for each), then the backdrop.
-    void TextureBindings(const GfxDrawState &s, SDL_GPUTextureSamplerBinding bindings[7])
+    void TextureBindings(const GfxDrawState &s, bool is3D, SDL_GPUTextureSamplerBinding bindings[7])
     {
+        bool overhaul = Platform_IsVisualOverhaulEnabled();
         for (int i = 0; i < 2; i++) {
             const GfxStageState &stage = s.stages[i];
             GfxTexture *t = Gfx_DrawnTexture(stage.texture);
             GpuTexture *g = t != NULL ? Ensure(t) : NULL;
             GfxStageState sampled = stage;
-            if (ScaledPoint(stage) || TextureKind(stage) == 5 || TextureKind(stage) == 6)
+            int kind = TextureKind(stage);
+            if (ScaledPoint(stage) || kind == 5 || kind == 6)
                 sampled.minFilter = sampled.magFilter = GFX_FILTER_LINEAR;
             // A distance field is read between its texels, and from its mip
             // levels where it is drawn smaller.
-            if (TextureKind(stage) == 4) {
+            if (kind == 4) {
                 sampled.minFilter = sampled.magFilter = GFX_FILTER_LINEAR;
                 sampled.mipFilter = GFX_MIPFILTER_LINEAR;
+            }
+            if (is3D && kind == 1 && g != NULL && g->mipLevels > 1) {
+                if (overhaul) {
+                    sampled.minFilter = sampled.magFilter = GFX_FILTER_LINEAR;
+                    sampled.mipFilter = GFX_MIPFILTER_LINEAR;
+                } else if (g->generatedMips) {
+                    sampled.mipFilter = GFX_MIPFILTER_NONE;
+                }
             }
             SDL_GPUSampler *sampler = Sampler(sampled);
             bool cube = t != NULL && (t->flags & GFX_TEXTURE_CUBE);
@@ -1299,7 +1368,7 @@ struct Executor : GfxExecutor {
                     fragmentUniformsSet = true;
                 }
                 SDL_GPUTextureSamplerBinding textures[7];
-                TextureBindings(s, textures);
+                TextureBindings(s, !c.transformed, textures);
                 if (!bound.texturesSet || memcmp(textures, bound.textures, sizeof(textures)) != 0) {
                     SDL_BindGPUFragmentSamplers(pass, 0, textures, 7);
                     memcpy(bound.textures, textures, sizeof(textures));

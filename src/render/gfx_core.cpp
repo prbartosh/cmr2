@@ -1011,16 +1011,28 @@ extern "C" void Gfx_GenerateMipmaps(GfxTexture *texture)
         for (int y = 0; y < dh; y++) {
             for (int x = 0; x < dw; x++) {
                 int sum[4] = { 0, 0, 0, 0 };
+                int weighted[3] = { 0, 0, 0 };
+                int alphaSum = 0;
                 for (int dy = 0; dy < 2; dy++)
                     for (int dx = 0; dx < 2; dx++) {
                         int sx = std::min(sw - 1, x * 2 + dx), sy = std::min(sh - 1, y * 2 + dy);
                         const uint8_t *p = src + ((size_t)sy * sw + sx) * 4;
                         for (int c = 0; c < 4; c++)
                             sum[c] += p[c];
+                        int a = texture->format == GFX_FORMAT_BGRA8 ? p[3] : 255;
+                        alphaSum += a;
+                        for (int c = 0; c < 3; c++)
+                            weighted[c] += p[c] * a;
                     }
                 uint8_t *q = dst + ((size_t)y * dw + x) * 4;
-                for (int c = 0; c < 4; c++)
-                    q[c] = (uint8_t)((sum[c] + 2) / 4);
+                if (texture->format == GFX_FORMAT_BGRA8 && alphaSum > 0) {
+                    for (int c = 0; c < 3; c++)
+                        q[c] = (uint8_t)((weighted[c] + alphaSum / 2) / alphaSum);
+                    q[3] = (uint8_t)((sum[3] + 2) / 4);
+                } else {
+                    for (int c = 0; c < 4; c++)
+                        q[c] = (uint8_t)((sum[c] + 2) / 4);
+                }
             }
         }
     }
