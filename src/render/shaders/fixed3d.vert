@@ -16,6 +16,9 @@ layout(location = 3) out vec4 outTex1;
 layout(location = 4) out float outFog;
 layout(location = 5) out float outEyeDepth;
 layout(location = 6) out vec3 outEyePosition;  // for the distance fade's range
+layout(location = 7) out vec3 outEyeNormal;
+layout(location = 8) out vec4 outRawColor1;
+layout(location = 9) out vec4 outRawColor2;
 
 vec4 MaterialColor(int source, vec4 material, vec4 color1, vec4 color2)
 {
@@ -114,6 +117,9 @@ void main()
     outTex1 = TexCoord(1, eye.xyz, n);
     outEyeDepth = eye.z;
     outEyePosition = eye.xyz;
+    outEyeNormal = n;
+    outRawColor1 = color1;
+    outRawColor2 = color2;
     outFog = fogFlags.z != 0 ? color2.a : 1.0;
     if (fogFlags.x == 3) {
         float range = fogParams.y - fogParams.x;

@@ -59,6 +59,18 @@ struct FragmentUniforms {
     float distanceFade[4];
 };
 
+struct FragmentLightingUniforms {
+    float textureMatrix[2][16];
+    float materialDiffuse[4], materialAmbient[4], materialSpecular[4], materialEmissive[4];
+    float globalAmbient[4];
+    LightUniform lights[8];
+    int32_t lightFlags[4];
+    int32_t sources[4];
+    int32_t texCoordIndex[4];
+    float viewUp[4];
+    float enhanceParams[4];
+};
+
 struct ClearUniforms {
     float color[4];
     float depth[4];
@@ -359,7 +371,7 @@ struct Executor : GfxExecutor {
 
         vs3d = Shader(SHADER_CODE(fixed3d_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         vsTL = Shader(SHADER_CODE(fixedtl_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
-        fs = Shader(SHADER_CODE(fixed_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 7, 1);
+        fs = Shader(SHADER_CODE(fixed_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 7, 2);
         vsClear = Shader(SHADER_CODE(clear_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         fsClear = Shader(SHADER_CODE(clear_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1);
         if (!vs3d || !vsTL || !fs || !vsClear || !fsClear)
@@ -998,6 +1010,30 @@ struct Executor : GfxExecutor {
         return (kind == 1 || kind == 6) && stage.magFilter == GFX_FILTER_POINT && stage.mipFilter == GFX_MIPFILTER_NONE;
     }
 
+    void FillFragmentLightingUniforms(const GfxDrawState &s, const VertexUniforms &vu, bool overhaul,
+                                      bool perPixel, bool hemisphere, float fresnelStrength,
+                                      FragmentLightingUniforms &fl)
+    {
+        memset(&fl, 0, sizeof(fl));
+        memcpy(fl.textureMatrix, vu.textureMatrix, sizeof(fl.textureMatrix));
+        memcpy(fl.materialDiffuse, vu.materialDiffuse, sizeof(fl.materialDiffuse));
+        memcpy(fl.materialAmbient, vu.materialAmbient, sizeof(fl.materialAmbient));
+        memcpy(fl.materialSpecular, vu.materialSpecular, sizeof(fl.materialSpecular));
+        memcpy(fl.materialEmissive, vu.materialEmissive, sizeof(fl.materialEmissive));
+        memcpy(fl.globalAmbient, vu.globalAmbient, sizeof(fl.globalAmbient));
+        memcpy(fl.lights, vu.lights, sizeof(fl.lights));
+        memcpy(fl.lightFlags, vu.lightFlags, sizeof(fl.lightFlags));
+        memcpy(fl.sources, vu.sources, sizeof(fl.sources));
+        memcpy(fl.texCoordIndex, vu.texCoordIndex, sizeof(fl.texCoordIndex));
+        GfxVector worldUp = { 0.0f, 1.0f, 0.0f };
+        TransformPoint(worldUp, 0.0f, s.view, fl.viewUp);
+        fl.viewUp[3] = 0.0f;
+        fl.enhanceParams[0] = perPixel ? 1.0f : 0.0f;
+        fl.enhanceParams[1] = hemisphere ? 1.0f : 0.0f;
+        fl.enhanceParams[2] = fresnelStrength;
+        fl.enhanceParams[3] = overhaul ? 1.0f : 0.0f;
+    }
+
     // fade: the draw is a 3D one into the back buffer, which the distance
     // fade applies to.
     void FillFragmentUniforms(const GfxDrawState &s, bool fade, FragmentUniforms &u)
@@ -1326,8 +1362,14 @@ struct Executor : GfxExecutor {
         // scenery after such a split in some sessions (#46). Nothing drawn
         // on the back buffer is read by the drawing into textures.
         GfxTexture *passTarget = NULL;
+        const bool overhaul = Platform_IsVisualOverhaulEnabled();
+        const bool perPixel = overhaul && Platform_GetSettingInt("video.per_pixel_lighting", 1) != 0;
+        const bool hemisphere = overhaul && Platform_GetSettingInt("video.hemisphere_ambient", 1) != 0;
+        const bool carFresnel = overhaul && Platform_GetSettingInt("video.car_fresnel", 1) != 0;
+        const float fresnelStrength =
+            carFresnel ? std::clamp(Platform_GetSettingFloat("video.car_fresnel_strength", 0.65f), 0.0f, 1.0f) : 0.0f;
         SDL_GPUSampleCount backSamples =
-            (msaaSamples != SDL_GPU_SAMPLECOUNT_1 && backColorMsaa != NULL && Platform_IsVisualOverhaulEnabled())
+            (msaaSamples != SDL_GPU_SAMPLECOUNT_1 && backColorMsaa != NULL && overhaul)
                 ? msaaSamples
                 : SDL_GPU_SAMPLECOUNT_1;
         for (int phase = 0; phase < 2; phase++) {
@@ -1423,6 +1465,9 @@ struct Executor : GfxExecutor {
                     VertexUniforms vu;
                     FillVertexUniforms(c, s, targetW, targetH, viewport, scaled, vu);
                     SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof(vu));
+                    FragmentLightingUniforms fl;
+                    FillFragmentLightingUniforms(s, vu, overhaul, perPixel, hemisphere, fresnelStrength, fl);
+                    SDL_PushGPUFragmentUniformData(cmd, 1, &fl, sizeof(fl));
                     vertexUniformState = &s;
                     vertexUniformW = targetW;
                     vertexUniformH = targetH;

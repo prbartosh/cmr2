@@ -14,6 +14,9 @@ layout(location = 3) out vec4 outTex1;
 layout(location = 4) out float outFog;
 layout(location = 5) out float outEyeDepth;
 layout(location = 6) out vec3 outEyePosition;
+layout(location = 7) out vec3 outEyeNormal;
+layout(location = 8) out vec4 outRawColor1;
+layout(location = 9) out vec4 outRawColor2;
 
 void main()
 {
@@ -31,4 +34,7 @@ void main()
     outFog = inSpecular.w;
     outEyeDepth = w;
     outEyePosition = vec3(0.0, 0.0, w);   // no distance fade for these
+    outEyeNormal = vec3(0.0);
+    outRawColor1 = outDiffuse;
+    outRawColor2 = outSpecular;
 }
