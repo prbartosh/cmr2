@@ -21,6 +21,9 @@ bool Platform_SaveFile(const char *path, const void *data, size_t size);
 // OpenCMR2 settings (opencmr2.ini in the user directory): "section.key".
 const char *Platform_GetSetting(const char *key, const char *fallback);
 int Platform_GetSettingInt(const char *key, int fallback);
+float Platform_GetSettingFloat(const char *key, float fallback);
+bool Platform_IsVisualOverhaulEnabled(void);
+void Platform_SetVisualOverhaulEnabled(bool enabled);
 
 // DirectInput scan codes (DIK_*), the game's key codes.
 int Keys_FromScancode(SDL_Scancode scancode);

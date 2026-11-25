@@ -22,7 +22,11 @@ extern "C" DWORD Sys_GetTicks() { return 0; }
 extern "C" void Sys_GetDesktopSize(int *w, int *h) { *w = 640; *h = 480; }
 extern "C" void Sys_Log(const char *, ...) {}
 extern "C" int Sys_GetOption(const char *, int fallback) { return fallback; }
+extern "C" float Sys_GetOptionFloat(const char *, float fallback) { return fallback; }
+extern "C" BOOL Sys_IsVisualOverhaulEnabled(void) { return FALSE; }
 int Platform_GetSettingInt(const char *, int value) { return value; }
+float Platform_GetSettingFloat(const char *, float value) { return value; }
+bool Platform_IsVisualOverhaulEnabled(void) { return false; }
 const char *Platform_GetSetting(const char *, const char *value) { return value; }
 extern "C" AudioStream *Audio_CreateStream(DWORD, int) { return nullptr; }
 extern "C" BOOL Audio_QueueStream(AudioStream *, const float *, DWORD) { return FALSE; }

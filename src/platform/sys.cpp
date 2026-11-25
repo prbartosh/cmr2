@@ -43,6 +43,7 @@ FILE *s_logFile;
 const PlatformTestClock *s_testClock;
 const PlatformTestDialogs *s_testDialogs;
 bool s_setupCanceled;
+bool s_visualOverhaul = true;
 std::string s_lastMissingFile;  // game path of the last file that could not be read
 
 FILE *OpenHostFile(const char *path, const char *mode)
@@ -365,6 +366,9 @@ const char s_defaultSettings[] =
     "; 1 = every car with the player's model and textures (at high car detail),\n"
     "; 0 = the original's lower detail for the other cars.\n"
     "; car_detail = 1\n"
+    "; 1 = enable visual overhaul enhancements (F10 toggles live in-game),\n"
+    "; 0 = original look.\n"
+    "visual_overhaul = 1\n"
     "\n"
     "[input]\n"
     "; Milliseconds before a key held in the menus repeats, and between repeats.\n"
@@ -687,6 +691,7 @@ bool Platform_Init(int argc, char **argv)
         SDL_SaveFile(settingsFile.c_str(), s_defaultSettings, sizeof(s_defaultSettings) - 1);
     }
     LoadSettings(settingsFile);
+    s_visualOverhaul = Platform_GetSettingInt("video.visual_overhaul", 1) != 0;
 
     std::string dataDir;
     for (int i = 1; i < argc; i++) {
@@ -796,6 +801,26 @@ int Platform_GetSettingInt(const char *key, int fallback)
 {
     const char *value = Platform_GetSetting(key, NULL);
     return value != NULL ? (int)strtol(value, NULL, 0) : fallback;
+}
+
+float Platform_GetSettingFloat(const char *key, float fallback)
+{
+    const char *value = Platform_GetSetting(key, NULL);
+    if (value == NULL || *value == '\0')
+        return fallback;
+    char *end = NULL;
+    float parsed = strtof(value, &end);
+    return end != value ? parsed : fallback;
+}
+
+bool Platform_IsVisualOverhaulEnabled(void)
+{
+    return s_visualOverhaul;
+}
+
+void Platform_SetVisualOverhaulEnabled(bool enabled)
+{
+    s_visualOverhaul = enabled;
 }
 
 // ---- time ----------------------------------------------------------------------
@@ -910,6 +935,20 @@ bool Translate(const SDL_Event &e, SysEvent *out)
             Input_HoldBackKey(e.key.scancode);
             out->type = SYS_EVENT_TOGGLE_FULLSCREEN;
             return !e.key.repeat;
+        }
+        // F10 toggles visual overhaul features live for instant before/after comparison.
+        if (e.key.scancode == SDL_SCANCODE_F10) {
+            Input_HoldBackKey(e.key.scancode);
+            if (!e.key.repeat) {
+                s_visualOverhaul = !s_visualOverhaul;
+                Sys_Log("video: visual overhaul %s (F10)", s_visualOverhaul ? "ON" : "OFF");
+                if (s_window != NULL) {
+                    SDL_SetWindowTitle(s_window, s_visualOverhaul
+                                                     ? "Colin McRae Rally 2.0 (OpenCMR2 — Visual Overhaul)"
+                                                     : "Colin McRae Rally 2.0 (OpenCMR2 — Original)");
+                }
+            }
+            return false;
         }
         // Windows also gave these keys to the game as characters (WM_CHAR),
         // which its text entries read: Backspace deletes, Enter sends the
@@ -1546,9 +1585,19 @@ extern "C" int Sys_GetOption(const char *name, int fallback)
     return Platform_GetSettingInt(name, fallback);
 }
 
+extern "C" float Sys_GetOptionFloat(const char *name, float fallback)
+{
+    return Platform_GetSettingFloat(name, fallback);
+}
+
 extern "C" const char *Sys_GetOptionText(const char *name, const char *fallback)
 {
     return Platform_GetSetting(name, fallback);
+}
+
+extern "C" BOOL Sys_IsVisualOverhaulEnabled(void)
+{
+    return s_visualOverhaul ? TRUE : FALSE;
 }
 
 extern "C" BOOL Sys_SetOption(const char *name, int value)

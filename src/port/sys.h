@@ -160,11 +160,16 @@ const char *Sys_GetInstallSetting(const char *name);
 
 /* OpenCMR2 options (opencmr2.ini, "section.key", e.g. "video.fullscreen"). */
 int Sys_GetOption(const char *name, int fallback);
+/* Floating-point option from opencmr2.ini, or fallback when unset. */
+float Sys_GetOptionFloat(const char *name, float fallback);
 /* The option's text, or fallback when it is not set. */
 const char *Sys_GetOptionText(const char *name, const char *fallback);
 /* Changes an option and saves it to opencmr2.ini, keeping the rest of the
    file. Returns 0 if it could not be saved (the new value still applies). */
 BOOL Sys_SetOption(const char *name, int value);
+/* Master toggle for visual overhaul features (opencmr2.ini video.visual_overhaul,
+   toggled live at runtime with F10 for instant before/after comparison). */
+BOOL Sys_IsVisualOverhaulEnabled(void);
 
 #ifdef __cplusplus
 }
