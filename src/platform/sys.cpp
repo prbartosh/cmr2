@@ -366,6 +366,8 @@ const char s_defaultSettings[] =
     "; 1 = generate full alpha-aware mipmap chains for compressed DDS (BC1/BC3)\n"
     "; textures to eliminate distant shimmering, 0 = original single-level DDS.\n"
     "compressed_mipmaps = 1\n"
+    "; Hardware multisample anti-aliasing: 1 (off), 2, 4 or 8.\n"
+    "msaa = 4\n"
     "; 1 = every car with the player's model and textures (at high car detail),\n"
     "; 0 = the original's lower detail for the other cars.\n"
     "; car_detail = 1\n"

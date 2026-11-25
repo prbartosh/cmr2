@@ -193,8 +193,10 @@ struct Executor : GfxExecutor {
     SDL_Window *window = nullptr;
     SDL_GPUShader *vs3d = nullptr, *vsTL = nullptr, *fs = nullptr, *vsClear = nullptr, *fsClear = nullptr;
     SDL_GPUTexture *backColor = nullptr, *backDepth = nullptr;
+    SDL_GPUTexture *backColorMsaa = nullptr, *backDepthMsaa = nullptr;
     SDL_GPUTexture *backdrop = nullptr;    // the copy of backColor the distance fade reads
     int backWidth = 0, backHeight = 0;
+    SDL_GPUSampleCount msaaSamples = SDL_GPU_SAMPLECOUNT_1;
     SDL_GPUTextureFormat colorFormat = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
     SDL_GPUTextureFormat depthFormat = SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT;
     SDL_GPUBuffer *vertexBuffer = nullptr, *indexBuffer = nullptr;
@@ -238,6 +240,8 @@ struct Executor : GfxExecutor {
             SDL_ReleaseGPUSampler(device, s.second);
         SDL_ReleaseGPUTexture(device, backColor);
         SDL_ReleaseGPUTexture(device, backDepth);
+        SDL_ReleaseGPUTexture(device, backColorMsaa);
+        SDL_ReleaseGPUTexture(device, backDepthMsaa);
         SDL_ReleaseGPUTexture(device, backdrop);
         SDL_ReleaseGPUTexture(device, white2D);
         SDL_ReleaseGPUTexture(device, whiteCube);
@@ -280,7 +284,8 @@ struct Executor : GfxExecutor {
     }
 
     SDL_GPUTexture *CreateTexture(SDL_GPUTextureType type, SDL_GPUTextureFormat format, int w, int h, int layers,
-                                  int levels, SDL_GPUTextureUsageFlags usage)
+                                  int levels, SDL_GPUTextureUsageFlags usage,
+                                  SDL_GPUSampleCount sampleCount = SDL_GPU_SAMPLECOUNT_1)
     {
         SDL_GPUTextureCreateInfo info = {};
         info.type = type;
@@ -290,11 +295,31 @@ struct Executor : GfxExecutor {
         info.height = h;
         info.layer_count_or_depth = layers;
         info.num_levels = levels;
-        info.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        info.sample_count = sampleCount;
         SDL_GPUTexture *t = SDL_CreateGPUTexture(device, &info);
         if (t == NULL)
             Sys_Log("gfx: texture %dx%d: %s", w, h, SDL_GetError());
         return t;
+    }
+
+    SDL_GPUSampleCount ChooseMsaaSamples(int requested)
+    {
+        static const struct {
+            int count;
+            SDL_GPUSampleCount flag;
+        } levels[] = {
+            { 8, SDL_GPU_SAMPLECOUNT_8 },
+            { 4, SDL_GPU_SAMPLECOUNT_4 },
+            { 2, SDL_GPU_SAMPLECOUNT_2 },
+        };
+        for (const auto &level : levels) {
+            if (requested >= level.count &&
+                SDL_GPUTextureSupportsSampleCount(device, colorFormat, level.flag) &&
+                SDL_GPUTextureSupportsSampleCount(device, depthFormat, level.flag)) {
+                return level.flag;
+            }
+        }
+        return SDL_GPU_SAMPLECOUNT_1;
     }
 
     bool CreateDevice()
@@ -324,6 +349,11 @@ struct Executor : GfxExecutor {
         if (!SDL_GPUTextureSupportsFormat(device, depthFormat, SDL_GPU_TEXTURETYPE_2D,
                                           SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET))
             depthFormat = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+        msaaSamples = ChooseMsaaSamples(Platform_GetSettingInt("video.msaa", 4));
+        if (msaaSamples != SDL_GPU_SAMPLECOUNT_1) {
+            int count = msaaSamples == SDL_GPU_SAMPLECOUNT_8 ? 8 : msaaSamples == SDL_GPU_SAMPLECOUNT_4 ? 4 : 2;
+            Sys_Log("gfx: MSAA %dx enabled", count);
+        }
         bcSupported = SDL_GPUTextureSupportsFormat(device, SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM,
                                                    SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_SAMPLER);
 
@@ -365,10 +395,16 @@ struct Executor : GfxExecutor {
             0x001a0459, 0x001a045b, 0x001a04b9, 0x001a0cb8, 0x001a0cb9, 0x001a0cbb, 0x001a2458, 0x001a2cb8,
             0x001a64b8, 0x001a6ca8, 0x001a6cb4, 0x001a6cb8, 0x000a2458, 0x000a2cb8, 0x000a6ca8, 0x000a6cb8,
         };
-        for (uint32_t key : common)
+        for (uint32_t key : common) {
             Pipeline(key);
-        for (int clear = 1; clear < 4; clear++)
-            ClearPipeline((clear & 1) != 0, (clear & 2) != 0);
+            if (msaaSamples != SDL_GPU_SAMPLECOUNT_1)
+                Pipeline(key | ((uint32_t)msaaSamples << 21));
+        }
+        for (int clear = 1; clear < 4; clear++) {
+            ClearPipeline((clear & 1) != 0, (clear & 2) != 0, SDL_GPU_SAMPLECOUNT_1);
+            if (msaaSamples != SDL_GPU_SAMPLECOUNT_1)
+                ClearPipeline((clear & 1) != 0, (clear & 2) != 0, msaaSamples);
+        }
         return true;
     }
 
@@ -380,11 +416,27 @@ struct Executor : GfxExecutor {
             SDL_WaitForGPUIdle(device);
             SDL_ReleaseGPUTexture(device, backColor);
             SDL_ReleaseGPUTexture(device, backDepth);
+            SDL_ReleaseGPUTexture(device, backColorMsaa);
+            SDL_ReleaseGPUTexture(device, backDepthMsaa);
             SDL_ReleaseGPUTexture(device, backdrop);
+            backColorMsaa = nullptr;
+            backDepthMsaa = nullptr;
             backColor = CreateTexture(SDL_GPU_TEXTURETYPE_2D, colorFormat, width, height, 1, 1,
                                       SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
             backDepth = CreateTexture(SDL_GPU_TEXTURETYPE_2D, depthFormat, width, height, 1, 1,
                                       SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
+            if (msaaSamples != SDL_GPU_SAMPLECOUNT_1) {
+                backColorMsaa = CreateTexture(SDL_GPU_TEXTURETYPE_2D, colorFormat, width, height, 1, 1,
+                                              SDL_GPU_TEXTUREUSAGE_COLOR_TARGET, msaaSamples);
+                backDepthMsaa = CreateTexture(SDL_GPU_TEXTURETYPE_2D, depthFormat, width, height, 1, 1,
+                                              SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET, msaaSamples);
+                if (backColorMsaa == NULL || backDepthMsaa == NULL) {
+                    SDL_ReleaseGPUTexture(device, backColorMsaa);
+                    SDL_ReleaseGPUTexture(device, backDepthMsaa);
+                    backColorMsaa = backDepthMsaa = nullptr;
+                    msaaSamples = SDL_GPU_SAMPLECOUNT_1;
+                }
+            }
             backdrop = CreateTexture(SDL_GPU_TEXTURETYPE_2D, colorFormat, width, height, 1, 1,
                                      SDL_GPU_TEXTUREUSAGE_SAMPLER);
             backWidth = width;
@@ -664,13 +716,14 @@ struct Executor : GfxExecutor {
     // ---- pipelines and samplers ----
 
     // A draw's pipeline: everything of it the state can change.
-    static uint32_t PipelineKey(const GfxCommand &cmd, const GfxDrawState &s)
+    static uint32_t PipelineKey(const GfxCommand &cmd, const GfxDrawState &s,
+                                SDL_GPUSampleCount samples = SDL_GPU_SAMPLECOUNT_1)
     {
         bool depthTest = s.depthTest;
         return (cmd.transformed ? 1u : 0u) | (uint32_t)(cmd.primitive & 7) << 1 | (s.alphaBlend ? 1u : 0u) << 4 |
                (uint32_t)(s.srcBlend & 15) << 5 | (uint32_t)(s.destBlend & 15) << 9 | (depthTest ? 1u : 0u) << 13 |
                ((depthTest && s.depthWrite) ? 1u : 0u) << 14 | (uint32_t)(s.depthFunc & 15) << 15 |
-               (uint32_t)(s.cull & 3) << 19;
+               (uint32_t)(s.cull & 3) << 19 | (uint32_t)(samples & 3) << 21;
     }
 
     SDL_GPUGraphicsPipeline *Pipeline(uint32_t key)
@@ -682,6 +735,7 @@ struct Executor : GfxExecutor {
         bool depthWrite = (key >> 14 & 1) != 0;
         int primitive = key >> 1 & 7, srcBlend = key >> 5 & 15, destBlend = key >> 9 & 15, depthFunc = key >> 15 & 15;
         int cull = key >> 19 & 3;
+        SDL_GPUSampleCount samples = (SDL_GPUSampleCount)((key >> 21) & 3);
 
         SDL_GPUVertexBufferDescription vb = {};
         vb.slot = 0;
@@ -735,6 +789,7 @@ struct Executor : GfxExecutor {
         info.depth_stencil_state.enable_depth_test = depthTest;
         info.depth_stencil_state.enable_depth_write = depthTest && depthWrite;
         info.depth_stencil_state.compare_op = CompareOp(depthFunc);
+        info.multisample_state.sample_count = samples;
         info.target_info.color_target_descriptions = &color;
         info.target_info.num_color_targets = 1;
         info.target_info.depth_stencil_format = depthFormat;
@@ -746,9 +801,9 @@ struct Executor : GfxExecutor {
         return p;
     }
 
-    SDL_GPUGraphicsPipeline *ClearPipeline(bool color, bool depth)
+    SDL_GPUGraphicsPipeline *ClearPipeline(bool color, bool depth, SDL_GPUSampleCount samples = SDL_GPU_SAMPLECOUNT_1)
     {
-        uint32_t key = 0x80000000u | (color ? 1u : 0u) | (depth ? 2u : 0u);
+        uint32_t key = 0x80000000u | (color ? 1u : 0u) | (depth ? 2u : 0u) | (uint32_t)(samples & 3) << 2;
         auto it = pipelines.find(key);
         if (it != pipelines.end())
             return it->second;
@@ -764,6 +819,7 @@ struct Executor : GfxExecutor {
         info.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
         // CreateDevice leaves depth clamping off, which needs depth clipping.
         info.rasterizer_state.enable_depth_clip = true;
+        info.multisample_state.sample_count = samples;
         info.depth_stencil_state.enable_depth_test = depth;
         info.depth_stencil_state.enable_depth_write = depth;
         info.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_ALWAYS;
@@ -1147,8 +1203,8 @@ struct Executor : GfxExecutor {
     // Begins a pass on the target at commands[first]. Clears of the whole
     // target there, before any draw, become the pass's load operations (the
     // GPU's fast clears) instead of drawn quads; *cleared counts them.
-    SDL_GPURenderPass *BeginPass(SDL_GPUCommandBuffer *cmd, GfxTexture *target, int &w, int &h,
-                                 const std::vector<GfxCommand> &commands, size_t first, size_t *cleared)
+    SDL_GPURenderPass *BeginPass(SDL_GPUCommandBuffer *cmd, GfxTexture *target, SDL_GPUSampleCount passSamples,
+                                 int &w, int &h, const std::vector<GfxCommand> &commands, size_t first, size_t *cleared)
     {
         SDL_GPUColorTargetInfo color = {};
         SDL_GPUDepthStencilTargetInfo depth = {};
@@ -1161,8 +1217,15 @@ struct Executor : GfxExecutor {
         depth.stencil_load_op = SDL_GPU_LOADOP_LOAD;
         depth.stencil_store_op = SDL_GPU_STOREOP_STORE;
         if (target == NULL) {
-            color.texture = backColor;
-            depth.texture = backDepth;
+            if (passSamples != SDL_GPU_SAMPLECOUNT_1 && backColorMsaa != NULL) {
+                color.texture = backColorMsaa;
+                color.resolve_texture = backColor;
+                color.store_op = SDL_GPU_STOREOP_RESOLVE_AND_STORE;
+                depth.texture = backDepthMsaa;
+            } else {
+                color.texture = backColor;
+                depth.texture = backDepth;
+            }
             w = backWidth;
             h = backHeight;
         } else {
@@ -1263,6 +1326,10 @@ struct Executor : GfxExecutor {
         // scenery after such a split in some sessions (#46). Nothing drawn
         // on the back buffer is read by the drawing into textures.
         GfxTexture *passTarget = NULL;
+        SDL_GPUSampleCount backSamples =
+            (msaaSamples != SDL_GPU_SAMPLECOUNT_1 && backColorMsaa != NULL && Platform_IsVisualOverhaulEnabled())
+                ? msaaSamples
+                : SDL_GPU_SAMPLECOUNT_1;
         for (int phase = 0; phase < 2; phase++) {
             target = NULL;
             for (size_t i = 0; i < frame.commands.size(); i++) {
@@ -1279,6 +1346,7 @@ struct Executor : GfxExecutor {
                 }
                 if ((target != NULL) != (phase == 0))
                     continue;
+                SDL_GPUSampleCount passSamples = target == NULL ? backSamples : SDL_GPU_SAMPLECOUNT_1;
                 if (c.type == GFX_CMD_BACKDROP) {
                     // A copy pass between render passes; the next draw starts a
                     // render pass that loads the back buffer as it is.
@@ -1298,7 +1366,7 @@ struct Executor : GfxExecutor {
                 }
                 if (pass == NULL) {
                     size_t cleared;
-                    pass = BeginPass(cmd, target, targetW, targetH, frame.commands, i, &cleared);
+                    pass = BeginPass(cmd, target, passSamples, targetW, targetH, frame.commands, i, &cleared);
                     passTarget = target;
                     bound = PassBindings();
                     if (cleared > 0) {
@@ -1311,7 +1379,7 @@ struct Executor : GfxExecutor {
                     bool depthClear = (c.clearFlags & GFX_CLEAR_ZBUFFER) != 0;
                     if (!colorClear && !depthClear)
                         continue;
-                    SDL_GPUGraphicsPipeline *pipeline = ClearPipeline(colorClear, depthClear);
+                    SDL_GPUGraphicsPipeline *pipeline = ClearPipeline(colorClear, depthClear, passSamples);
                     if (pipeline != bound.pipeline) {
                         SDL_BindGPUGraphicsPipeline(pass, pipeline);
                         bound.pipeline = pipeline;
@@ -1332,7 +1400,7 @@ struct Executor : GfxExecutor {
                     continue;
                 }
                 const GfxDrawState &s = frame.states[c.state];
-                SDL_GPUGraphicsPipeline *pipeline = Pipeline(PipelineKey(c, s));
+                SDL_GPUGraphicsPipeline *pipeline = Pipeline(PipelineKey(c, s, passSamples));
                 if (pipeline == NULL)
                     continue;
                 if (pipeline != bound.pipeline) {
