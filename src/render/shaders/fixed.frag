@@ -346,9 +346,11 @@ void main()
     }
 
     if (fogMode.z != 0)
-        current.rgb = clamp(current.rgb + litSpecular.rgb, 0.0, 1.0);
+        current.rgb = fogMode.w != 0 ? clamp(current.rgb + litSpecular.rgb, 0.0, 4.0)
+                                     : clamp(current.rgb + litSpecular.rgb, 0.0, 1.0);
     if (clearcoatSpec.r + clearcoatSpec.g + clearcoatSpec.b > 0.0)
-        current.rgb = clamp(current.rgb + clearcoatSpec, 0.0, 1.0);
+        current.rgb = fogMode.w != 0 ? clamp(current.rgb + clearcoatSpec, 0.0, 4.0)
+                                     : clamp(current.rgb + clearcoatSpec, 0.0, 1.0);
 
     if (alphaTest.x != 0 && !Compare(alphaTest.y, floor(current.a * 255.0 + 0.5), floor(alphaRef.x * 255.0 + 0.5)))
         discard;
