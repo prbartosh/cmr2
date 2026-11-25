@@ -20,6 +20,8 @@ layout(set = 2, binding = 3) uniform samplerCube cube1;
 layout(set = 2, binding = 4) uniform sampler2D backdrop;   // Gfx_CaptureBackdrop
 layout(set = 2, binding = 5) uniform sampler2D native0;
 layout(set = 2, binding = 6) uniform sampler2D native1;
+layout(set = 2, binding = 7) uniform sampler2D normalMap0;
+layout(set = 2, binding = 8) uniform sampler2D specMap0;
 
 layout(std140, set = 3, binding = 0) uniform FragmentUniforms {
     ivec4 stage0;       // colour op, colour arg1, colour arg2, alpha op
@@ -222,6 +224,27 @@ vec4 ComputeStageCoord(int stage, vec4 fallbackCoord, vec3 eyePos, vec3 eyeN, bo
     return fallbackCoord;
 }
 
+// Screen-space cotangent frame (MikkTSpace/Schuler): derives TBN from eye-space
+// position and UV derivatives without requiring precomputed vertex tangents.
+vec3 PerturbNormal(vec3 N, vec3 eyePos, vec2 uv, vec3 mapSample, float strength)
+{
+    vec3 dp1 = dFdx(eyePos);
+    vec3 dp2 = dFdy(eyePos);
+    vec2 duv1 = dFdx(uv);
+    vec2 duv2 = dFdy(uv);
+    vec3 dp2perp = cross(dp2, N);
+    vec3 dp1perp = cross(N, dp1);
+    vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    float invMax = max(dot(T, T), dot(B, B));
+    if (invMax < 1e-10)
+        return N;
+    float s = inversesqrt(invMax);
+    mat3 tbn = mat3(T * s, B * s, N);
+    vec3 tn = vec3((mapSample.xy * 2.0 - 1.0) * strength, max(mapSample.z * 2.0 - 1.0, 0.05));
+    return normalize(tbn * normalize(tn));
+}
+
 void main()
 {
     bool hasNormal = dot(inEyeNormal, inEyeNormal) > 1e-6;
@@ -229,6 +252,22 @@ void main()
     vec3 V = length(inEyePosition) > 1e-5 ? normalize(-inEyePosition) : vec3(0.0, 0.0, -1.0);
     bool isCubePass = (stage0.x != TOP_DISABLE && stage0b.z == 2) ||
                       (stage0.x != TOP_DISABLE && stage1.x != TOP_DISABLE && stage1b.z == 2);
+
+    bool useNormalMap = enhanceParams.w > 0.5 && alphaTest.z != 0 && hasNormal &&
+                        stage0.x != TOP_DISABLE && stage0b.z == 1;
+    bool useSpecMap = enhanceParams.w > 0.5 && alphaTest.w != 0 &&
+                      stage0.x != TOP_DISABLE && stage0b.z == 1;
+    if (useNormalMap) {
+        vec3 mapN = texture(normalMap0, inTex0.xy).rgb;
+        N = PerturbNormal(N, inEyePosition, inTex0.xy, mapN, distanceFade.w);
+    }
+    float specMask = 1.0;
+    float reflMask = 1.0;
+    if (useSpecMap) {
+        vec4 sm = texture(specMap0, inTex0.xy);
+        specMask = sm.r;
+        reflMask = sm.g;
+    }
 
     vec4 litDiffuse = inDiffuse;
     vec4 litSpecular = inSpecular;
@@ -283,9 +322,11 @@ void main()
             if (nDotL > 0.0) {
                 vec3 h = normalize(toEye + L);
                 if (lightFlags.z != 0)
-                    specularSum += l.specular.rgb * pow(max(dot(N, h), 0.0), max(globalAmbient.w, 1.0)) * scale;
+                    specularSum += l.specular.rgb * pow(max(dot(N, h), 0.0), max(globalAmbient.w, 1.0)) * scale * specMask;
                 if (isCubePass && enhanceParams.z > 0.0 && type == 3)
-                    clearcoatSpec += l.diffuse.rgb * pow(max(dot(N, h), 0.0), 48.0) * (0.28 * enhanceParams.z * coatFresnel) * scale;
+                    clearcoatSpec += l.diffuse.rgb * pow(max(dot(N, h), 0.0), 48.0) * (0.28 * enhanceParams.z * coatFresnel * specMask) * scale;
+                else if (useSpecMap && type == 3 && specMask > 0.05)
+                    clearcoatSpec += l.diffuse.rgb * pow(max(dot(N, h), 0.0), 28.0) * (0.18 * specMask) * scale;
             }
         }
         litDiffuse = vec4(clamp(matEmissive.rgb + ambient * matAmbient.rgb + diffuseSum * matDiffuse.rgb, 0.0, 1.0),
@@ -301,7 +342,9 @@ void main()
     if (enhanceParams.w > 0.5 && enhanceParams.z > 0.0 && hasNormal) {
         float ndotv = clamp(dot(N, V), 0.0, 1.0);
         float f = mix(0.28, 1.35, pow(1.0 - ndotv, 3.2));
-        cubeFresnel = mix(1.0, f, enhanceParams.z);
+        cubeFresnel = mix(1.0, f, enhanceParams.z) * reflMask;
+    } else if (useSpecMap) {
+        cubeFresnel = reflMask;
     }
 
     // Stage 0.

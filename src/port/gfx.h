@@ -387,7 +387,8 @@ enum GfxTextureFlags {
     GFX_TEXTURE_DISTANCE_FIELD = 16,  /* alpha is a signed distance to the edge, 0.5 on it: drawn with
                                          an edge of one pixel at any scale */
     GFX_TEXTURE_MENU_DOT = 32,       /* the original large menu dot, drawn as a circle when enlarged */
-    GFX_TEXTURE_VECTOR_ICON = 64     /* traced colour/alpha fields, with native source bound separately */
+    GFX_TEXTURE_VECTOR_ICON = 64,    /* traced colour/alpha fields, with native source bound separately */
+    GFX_TEXTURE_OVERRIDE = 128       /* external HD texture override (toggled live by F10) */
 };
 
 /* mipLevels counts the top level (1 = no mipmaps). */
@@ -410,6 +411,9 @@ void Gfx_UnlockTexture(GfxTexture *texture, int face, int mip);
 /* Draws replacement wherever texture is drawn (NULL: texture itself), with
    the same texture coordinates; it is destroyed with texture. */
 void Gfx_SetTextureReplacement(GfxTexture *texture, GfxTexture *replacement);
+/* Attaches optional companion tangent-space normal map (*_n.png) and
+   specular/reflection mask (*_s.png) to texture; destroyed with texture. */
+void Gfx_SetTextureMaterialMaps(GfxTexture *texture, GfxTexture *normalMap, GfxTexture *specularMap);
 /* Texels of the distance field texture is drawn from (its replacement) per
    texel of its own, or 0 if it is drawn from its own pixels. */
 int Gfx_GetDistanceFieldScale(GfxTexture *texture);

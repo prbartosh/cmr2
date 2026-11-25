@@ -251,6 +251,7 @@ target_sources(opencmr2_platform PRIVATE
     render/outline_font.cpp
     render/distance_field.cpp
     render/vector_sprite.cpp
+    render/texture_override.cpp
     ${SHADER_HEADER}
     ${FONTS_HEADER}
     ${ICON_HEADER}

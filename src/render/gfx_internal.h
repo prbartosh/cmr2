@@ -26,14 +26,20 @@ struct GfxTexture {
     bool renderedTo;            // the GPU copy is newer (render targets)
     void *gpu;                  // executor's object
     GfxTexture *replacement;    // drawn instead (Gfx_SetTextureReplacement)
+    GfxTexture *normalMap;      // optional companion tangent-space normal map (*_n)
+    GfxTexture *specularMap;    // optional companion specular/reflection mask (*_s)
 };
 
 // The texture a draw reads for t: its cube, or its replacement.
-inline GfxTexture *Gfx_DrawnTexture(GfxTexture *t)
+inline GfxTexture *Gfx_DrawnTexture(GfxTexture *t, bool allowOverrides = true)
 {
     if (t != nullptr && t->cube != nullptr)
         t = t->cube;
-    return t != nullptr && t->replacement != nullptr ? t->replacement : t;
+    if (t != nullptr && t->replacement != nullptr) {
+        if (allowOverrides || !(t->replacement->flags & GFX_TEXTURE_OVERRIDE))
+            return t->replacement;
+    }
+    return t;
 }
 
 // A vertex buffer the game fills through Lock/Unlock. Draws from one that

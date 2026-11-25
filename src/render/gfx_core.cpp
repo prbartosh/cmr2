@@ -770,6 +770,8 @@ extern "C" GfxTexture *Gfx_CreateTexture(int width, int height, int format, int 
     t->renderedTo = false;
     t->gpu = NULL;
     t->replacement = NULL;
+    t->normalMap = NULL;
+    t->specularMap = NULL;
     int faces = (flags & GFX_TEXTURE_CUBE) ? 6 : 1;
     for (int f = 0; f < faces; f++) {
         for (int m = 0; m < mipLevels; m++) {
@@ -807,19 +809,28 @@ extern "C" void Gfx_DestroyTexture(GfxTexture *texture)
             s_state.stages[i].texture = NULL;
     // Draws recorded this frame may still use it: flush them first.
     for (const GfxDrawState &state : s_frame.states)
-        for (const GfxStageState &stage : state.stages)
-            if (Root(stage.texture) == texture ||
-                (Root(stage.texture) != NULL && Root(stage.texture)->replacement == texture)) {
+        for (const GfxStageState &stage : state.stages) {
+            GfxTexture *root = Root(stage.texture);
+            if (root == texture ||
+                (root != NULL &&
+                 (root->replacement == texture || root->normalMap == texture || root->specularMap == texture))) {
                 Flush();
                 goto flushed;
             }
+        }
 flushed:
-    // Shutdown may visit a replacement before its owner. Detach it so the
-    // owner cannot destroy it a second time (also applies to font fields).
-    for (GfxTexture *owner : s_textures)
+    // Shutdown may visit a replacement or material map before its owner.
+    for (GfxTexture *owner : s_textures) {
         if (owner->replacement == texture)
             owner->replacement = NULL;
+        if (owner->normalMap == texture)
+            owner->normalMap = NULL;
+        if (owner->specularMap == texture)
+            owner->specularMap = NULL;
+    }
     Gfx_DestroyTexture(texture->replacement);
+    Gfx_DestroyTexture(texture->normalMap);
+    Gfx_DestroyTexture(texture->specularMap);
     if (s_executor != NULL)
         s_executor->DestroyTexture(texture);
     s_textures.erase(std::remove(s_textures.begin(), s_textures.end(), texture), s_textures.end());
@@ -837,6 +848,24 @@ extern "C" void Gfx_SetTextureReplacement(GfxTexture *texture, GfxTexture *repla
     Flush();
     Gfx_DestroyTexture(texture->replacement);
     texture->replacement = replacement;
+}
+
+extern "C" void Gfx_SetTextureMaterialMaps(GfxTexture *texture, GfxTexture *normalMap, GfxTexture *specularMap)
+{
+    texture = Root(texture);
+    if (texture == NULL)
+        return;
+    if (texture->normalMap == normalMap && texture->specularMap == specularMap)
+        return;
+    Flush();
+    if (texture->normalMap != normalMap) {
+        Gfx_DestroyTexture(texture->normalMap);
+        texture->normalMap = normalMap;
+    }
+    if (texture->specularMap != specularMap) {
+        Gfx_DestroyTexture(texture->specularMap);
+        texture->specularMap = specularMap;
+    }
 }
 
 extern "C" int Gfx_GetDistanceFieldScale(GfxTexture *texture)

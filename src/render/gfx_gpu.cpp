@@ -229,7 +229,7 @@ struct Executor : GfxExecutor {
     uint32_t vertexCapacity = 0, indexCapacity = 0;
     SDL_GPUTransferBuffer *uploadBuffer = nullptr;  // the frame's vertices and indices
     uint32_t uploadCapacity = 0;
-    SDL_GPUTexture *white2D = nullptr, *whiteCube = nullptr;
+    SDL_GPUTexture *white2D = nullptr, *whiteCube = nullptr, *flatNormal2D = nullptr;
     std::unordered_map<uint32_t, SDL_GPUGraphicsPipeline *> pipelines;
     std::unordered_map<uint32_t, SDL_GPUSampler *> samplers;
     bool bcSupported = true;
@@ -282,6 +282,7 @@ struct Executor : GfxExecutor {
         SDL_ReleaseGPUSampler(device, postSampler);
         SDL_ReleaseGPUTexture(device, white2D);
         SDL_ReleaseGPUTexture(device, whiteCube);
+        SDL_ReleaseGPUTexture(device, flatNormal2D);
         SDL_ReleaseGPUBuffer(device, vertexBuffer);
         SDL_ReleaseGPUBuffer(device, indexBuffer);
         SDL_ReleaseGPUTransferBuffer(device, uploadBuffer);
@@ -400,7 +401,7 @@ struct Executor : GfxExecutor {
 
         vs3d = Shader(SHADER_CODE(fixed3d_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         vsTL = Shader(SHADER_CODE(fixedtl_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
-        fs = Shader(SHADER_CODE(fixed_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 7, 2);
+        fs = Shader(SHADER_CODE(fixed_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 9, 2);
         vsClear = Shader(SHADER_CODE(clear_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         fsClear = Shader(SHADER_CODE(clear_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1);
         if (!vs3d || !vsTL || !fs || !vsClear || !fsClear)
@@ -440,17 +441,22 @@ struct Executor : GfxExecutor {
                                 SDL_GPU_TEXTUREUSAGE_SAMPLER);
         whiteCube = CreateTexture(SDL_GPU_TEXTURETYPE_CUBE, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, 1, 1, 6, 1,
                                   SDL_GPU_TEXTUREUSAGE_SAMPLER);
-        uint32_t white[6] = { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff };
+        flatNormal2D = CreateTexture(SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, 1, 1, 1, 1,
+                                     SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        // BGRA8: white = (255,255,255,255), neutral tangent normal (128,128,255) = B=255,G=128,R=128,A=255 = 0xff8080ff.
+        uint32_t defaults[8] = {
+            0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xff8080ff
+        };
         SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(device);
-        SDL_GPUTransferBufferCreateInfo tbi = { SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, sizeof(white), 0 };
+        SDL_GPUTransferBufferCreateInfo tbi = { SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, sizeof(defaults), 0 };
         SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(device, &tbi);
-        memcpy(SDL_MapGPUTransferBuffer(device, tb, false), white, sizeof(white));
+        memcpy(SDL_MapGPUTransferBuffer(device, tb, false), defaults, sizeof(defaults));
         SDL_UnmapGPUTransferBuffer(device, tb);
         SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
-        for (int layer = 0; layer < 7; layer++) {
-            SDL_GPUTextureTransferInfo src = { tb, (Uint32)(layer < 6 ? layer * 4 : 0), 0, 0 };
+        for (int layer = 0; layer < 8; layer++) {
+            SDL_GPUTextureTransferInfo src = { tb, (Uint32)(layer * 4), 0, 0 };
             SDL_GPUTextureRegion dst = {};
-            dst.texture = layer < 6 ? whiteCube : white2D;
+            dst.texture = layer < 6 ? whiteCube : (layer == 6 ? white2D : flatNormal2D);
             dst.layer = layer < 6 ? layer : 0;
             dst.w = dst.h = dst.d = 1;
             SDL_UploadToGPUTexture(copy, &src, &dst, false);
@@ -1122,7 +1128,7 @@ struct Executor : GfxExecutor {
 
     int TextureKind(const GfxStageState &stage)
     {
-        GfxTexture *t = Gfx_DrawnTexture(stage.texture);
+        GfxTexture *t = Gfx_DrawnTexture(stage.texture, Platform_IsVisualOverhaulEnabled());
         if (t == NULL)
             return 0;
         if (t->flags & GFX_TEXTURE_CUBE)
@@ -1175,7 +1181,7 @@ struct Executor : GfxExecutor {
 
     // fade: the draw is a 3D one into the back buffer, which the distance
     // fade applies to.
-    void FillFragmentUniforms(const GfxDrawState &s, bool fade, bool hdr, FragmentUniforms &u)
+    void FillFragmentUniforms(const GfxDrawState &s, bool fade, bool hdr, bool materialMaps, FragmentUniforms &u)
     {
         memset(&u, 0, sizeof(u));
         const GfxStageState &a = s.stages[0], &b = s.stages[1];
@@ -1198,6 +1204,9 @@ struct Executor : GfxExecutor {
         Color(s.textureFactor, u.textureFactor);
         u.alphaTest[0] = s.alphaTest;
         u.alphaTest[1] = s.alphaFunc;
+        GfxTexture *root0 = a.texture != NULL && a.texture->cube != NULL ? a.texture->cube : a.texture;
+        u.alphaTest[2] = (materialMaps && root0 != NULL && root0->normalMap != NULL) ? 1 : 0;
+        u.alphaTest[3] = (materialMaps && root0 != NULL && root0->specularMap != NULL) ? 1 : 0;
         u.alphaRef[0] = (s.alphaRef & 0xff) / 255.0f;
         Color(s.fogColor, u.fogColor);
         u.fogMode[0] = s.fog;
@@ -1214,15 +1223,18 @@ struct Executor : GfxExecutor {
             u.distanceFade[1] = s.fadeEnd;
             u.distanceFade[2] = 1.0f;
         }
+        u.distanceFade[3] = 0.85f;
     }
 
-    // The stages' textures (2D and cube for each), then the backdrop.
-    void TextureBindings(const GfxDrawState &s, bool is3D, bool hdr, SDL_GPUTextureSamplerBinding bindings[7])
+    // The stages' textures (2D and cube for each), backdrop, native icons, and material maps.
+    void TextureBindings(const GfxDrawState &s, bool is3D, bool hdr, bool materialMaps,
+                         SDL_GPUTextureSamplerBinding bindings[9])
     {
         bool overhaul = Platform_IsVisualOverhaulEnabled();
+        SDL_GPUSampler *stage0Sampler = NULL;
         for (int i = 0; i < 2; i++) {
             const GfxStageState &stage = s.stages[i];
-            GfxTexture *t = Gfx_DrawnTexture(stage.texture);
+            GfxTexture *t = Gfx_DrawnTexture(stage.texture, overhaul);
             GpuTexture *g = t != NULL ? Ensure(t) : NULL;
             GfxStageState sampled = stage;
             int kind = TextureKind(stage);
@@ -1243,6 +1255,8 @@ struct Executor : GfxExecutor {
                 }
             }
             SDL_GPUSampler *sampler = Sampler(sampled);
+            if (i == 0)
+                stage0Sampler = sampler;
             bool cube = t != NULL && (t->flags & GFX_TEXTURE_CUBE);
             SDL_GPUTexture *texture = g != NULL ? g->texture : NULL;
             bindings[i * 2] = { (texture != NULL && !cube) ? texture : white2D, sampler };
@@ -1253,6 +1267,17 @@ struct Executor : GfxExecutor {
             bindings[5 + i] = { native != NULL ? native->texture : white2D, Sampler(source) };
         }
         bindings[4] = { (hdr && hdrBackdrop != NULL) ? hdrBackdrop : backdrop, Sampler(GfxStageState()) };
+        GfxTexture *root0 = s.stages[0].texture != NULL && s.stages[0].texture->cube != NULL
+                                ? s.stages[0].texture->cube
+                                : s.stages[0].texture;
+        GpuTexture *normGpu = (materialMaps && root0 != NULL && root0->normalMap != NULL) ? Ensure(root0->normalMap)
+                                                                                           : NULL;
+        GpuTexture *specGpu = (materialMaps && root0 != NULL && root0->specularMap != NULL)
+                                  ? Ensure(root0->specularMap)
+                                  : NULL;
+        SDL_GPUSampler *matSampler = stage0Sampler != NULL ? stage0Sampler : Sampler(GfxStageState());
+        bindings[7] = { (normGpu != NULL && normGpu->texture != NULL) ? normGpu->texture : flatNormal2D, matSampler };
+        bindings[8] = { (specGpu != NULL && specGpu->texture != NULL) ? specGpu->texture : white2D, matSampler };
     }
 
     // What a render pass has bound: each draw sets only what differs from the
@@ -1262,7 +1287,7 @@ struct Executor : GfxExecutor {
         bool viewportSet = false, texturesSet = false, indicesSet = false;
         SDL_GPUViewport viewport = {};
         SDL_Rect scissor = {};
-        SDL_GPUTextureSamplerBinding textures[7] = {};
+        SDL_GPUTextureSamplerBinding textures[9] = {};
         SDL_GPUBuffer *vertices = nullptr;
     };
 
@@ -1542,10 +1567,17 @@ struct Executor : GfxExecutor {
             return;
         }
         // Textures used by this frame must exist before the passes start.
+        const bool overhaulInit = Platform_IsVisualOverhaulEnabled();
         for (const GfxDrawState &s : frame.states)
             for (const GfxStageState &stage : s.stages)
-                if (stage.texture != NULL)
-                    Ensure(Gfx_DrawnTexture(stage.texture));
+                if (stage.texture != NULL) {
+                    Ensure(Gfx_DrawnTexture(stage.texture, overhaulInit));
+                    GfxTexture *root = stage.texture->cube != NULL ? stage.texture->cube : stage.texture;
+                    if (root->normalMap != NULL)
+                        Ensure(root->normalMap);
+                    if (root->specularMap != NULL)
+                        Ensure(root->specularMap);
+                }
         for (const GfxCommand &c : frame.commands)
             if (c.type == GFX_CMD_TARGET && c.target != NULL)
                 Ensure(c.target->cube != NULL ? c.target->cube : c.target);
@@ -1576,6 +1608,7 @@ struct Executor : GfxExecutor {
         const bool perPixel = overhaul && Platform_GetSettingInt("video.per_pixel_lighting", 1) != 0;
         const bool hemisphere = overhaul && Platform_GetSettingInt("video.hemisphere_ambient", 1) != 0;
         const bool carFresnel = overhaul && Platform_GetSettingInt("video.car_fresnel", 1) != 0;
+        const bool materialMaps = overhaul && Platform_GetSettingInt("video.override_material_maps", 1) != 0;
         const float fresnelStrength =
             carFresnel ? std::clamp(Platform_GetSettingFloat("video.car_fresnel_strength", 0.65f), 0.0f, 1.0f) : 0.0f;
         size_t last3D = SIZE_MAX;
@@ -1712,16 +1745,17 @@ struct Executor : GfxExecutor {
                     vertexUniformScaled = scaled;
                 }
                 FragmentUniforms fu;
-                FillFragmentUniforms(s, target == NULL && !c.transformed, inHdr3D && !c.transformed, fu);
+                FillFragmentUniforms(s, target == NULL && !c.transformed, inHdr3D && !c.transformed,
+                                     materialMaps && !c.transformed, fu);
                 if (!fragmentUniformsSet || memcmp(&fu, &fragmentUniforms, sizeof(fu)) != 0) {
                     SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
                     fragmentUniforms = fu;
                     fragmentUniformsSet = true;
                 }
-                SDL_GPUTextureSamplerBinding textures[7];
-                TextureBindings(s, !c.transformed, inHdr3D, textures);
+                SDL_GPUTextureSamplerBinding textures[9];
+                TextureBindings(s, !c.transformed, inHdr3D, materialMaps && !c.transformed, textures);
                 if (!bound.texturesSet || memcmp(textures, bound.textures, sizeof(textures)) != 0) {
-                    SDL_BindGPUFragmentSamplers(pass, 0, textures, 7);
+                    SDL_BindGPUFragmentSamplers(pass, 0, textures, 9);
                     memcpy(bound.textures, textures, sizeof(textures));
                     bound.texturesSet = true;
                 }

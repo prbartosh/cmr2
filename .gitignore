@@ -2,6 +2,8 @@
 /.flatpak-builder/
 /out/
 /dist/
+/overrides/
+/dumped_textures/
 # Local CMake overrides and Python caches.
 /CMakeUserPresets.json
 *.swp
