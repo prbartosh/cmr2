@@ -2664,7 +2664,16 @@ GfxMatrix *FixMatrix_ToFloat(GfxMatrix *pOut, FixMatrix *pIn);
 static void Game_BeginDistanceFade(void)
 {
     int end = CGraphics::m_farPlaneFixed;
-    int start = FixMul(end, 0xd99a);
+    int startFactor = 0xd99a;
+    if (Sys_IsVisualOverhaulEnabled()) {
+        float fadeStart = Sys_GetOptionFloat("video.distance_fade_start", 0.78f);
+        if (fadeStart < 0.50f)
+            fadeStart = 0.50f;
+        if (fadeStart > 0.95f)
+            fadeStart = 0.95f;
+        startFactor = (int)(fadeStart * 65536.0f + 0.5f);
+    }
+    int start = FixMul(end, startFactor);
 
     Gfx_CaptureBackdrop();
     Gfx_SetDistanceFade(X87S_MUL(X87S_FILD(float, start), CGraphics::m_oneOver65536),

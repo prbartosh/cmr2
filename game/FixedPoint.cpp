@@ -742,6 +742,17 @@ void View_ResetShownFarPlane(BYTE view)
 static int View_GetShownFarPlane(BYTE view)
 {
     int target = g_viewFarPlanes[view];
+    if (Sys_IsVisualOverhaulEnabled() && target > 0) {
+        float scale = Sys_GetOptionFloat("video.draw_distance_scale", 1.4f);
+        if (scale < 1.0f)
+            scale = 1.0f;
+        if (scale > 2.5f)
+            scale = 2.5f;
+        long long scaled = ((long long)target * (long long)(scale * 65536.0f + 0.5f)) >> 16;
+        if (scaled > 0x3200000)
+            scaled = 0x3200000;
+        target = (int)scaled;
+    }
     int now = CMain::GetFrameTime();
     int elapsed = now - g_viewFarPlaneTimes[view];
 

@@ -2512,7 +2512,22 @@ int Graphics_RenderNodeCubeMapFaces(SceneNode *pNode, int bit)
         Graphics_SetRenderTarget(&CGraphics::m_pTextureManager->textureBuffer2[cubeIndex][i]);
         Gfx_Clear(GFX_CLEAR_ZBUFFER, 0xff000000, 1.0f);
         Gfx_BeginScene();
-        CGraphics::SetProjection(0x20000, 0x20000, 0x780000, 0x1999);
+        int cubeObjDist = 0x140000;
+        int cubeTerrainFar = 0x500000;
+        int cubeSkyFar = 0x780000;
+        if (Sys_IsVisualOverhaulEnabled()) {
+            int metres = Sys_GetOption("video.cubemap_object_distance", 60);
+            if (metres < 20)
+                metres = 20;
+            if (metres > 160)
+                metres = 160;
+            cubeObjDist = metres << 16;
+            if (metres * 2 > 80)
+                cubeTerrainFar = (metres * 2) << 16;
+            if (metres * 3 > 120)
+                cubeSkyFar = (metres * 3) << 16;
+        }
+        CGraphics::SetProjection(0x20000, 0x20000, cubeSkyFar, 0x1999);
         CGraphics::SetZEnable(0);
         CGraphics::SetZWriteEnable(0);
         for (sectorIndex = 0; sectorIndex < (unsigned int)g_sectorCullEnabled; sectorIndex++) {
@@ -2525,7 +2540,7 @@ int Graphics_RenderNodeCubeMapFaces(SceneNode *pNode, int bit)
         }
         CGraphics::SetZEnable(1);
         CGraphics::SetZWriteEnable(1);
-        CGraphics::SetProjection(0x20000, 0x20000, 0x500000, 0x1999);
+        CGraphics::SetProjection(0x20000, 0x20000, cubeTerrainFar, 0x1999);
         for (sectorIndex = 0; sectorIndex < (unsigned int)g_sectorCullEnabled; sectorIndex++) {
             pSector = g_sectors[(unsigned short)g_visibleSectorIndices[sectorIndex]];
             pMesh = (Mesh *)pSector->pMesh;
@@ -2534,7 +2549,7 @@ int Graphics_RenderNodeCubeMapFaces(SceneNode *pNode, int bit)
                 Gfx_SetTransform(GFX_TRANSFORM_WORLD, &g_identityWorldMatrix);
                 Graphics_DrawMeshLOD(pMesh, 1, 0, 0);
                 while (pObject != NULL) {
-                    // PORT: the camera-facing objects within 20 m of the cube,
+                    // PORT: the camera-facing objects within cubeObjDist of the cube,
                     // each by its own distance; the original read the one kept
                     // in their shared mesh (Game_DrawDeferredObjects).
                     if ((pObject->pMesh->flags & 2) != 0) {
@@ -2546,7 +2561,7 @@ int Graphics_RenderNodeCubeMapFaces(SceneNode *pNode, int bit)
                     } else {
                         objectDistance = pObject->pMesh->field_0x114;
                     }
-                    if (objectDistance < 0x140000) {
+                    if (objectDistance < cubeObjDist) {
                         if ((pObject->pMesh->flags & 2) != 0) {
                             float scale;
 
@@ -6647,6 +6662,17 @@ int Graphics_ReserveCubeMapsAndLoadEnvironment(char *name, int count, GenericFil
     unsigned int *pId;
     unsigned short *pTexture;
 
+    if (Sys_IsVisualOverhaulEnabled()) {
+        int configured = Sys_GetOption("video.cubemap_size", 256);
+        if (configured >= 512)
+            size = 512;
+        else if (configured >= 256)
+            size = 256;
+        else if (configured >= 128)
+            size = 128;
+        else if (configured >= 64)
+            size = 64;
+    }
     CGraphics::m_cubeMapSize = size;
     memset(g_carReflectionCubeMaps, 0xff, sizeof(g_carReflectionCubeMaps));
     if ((*(BYTE *)&g_pGraphics->field913_0x3bc & 0x80) != 0 && count > 0) {
