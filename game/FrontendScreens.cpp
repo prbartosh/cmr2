@@ -12075,12 +12075,14 @@ void FrontendMenu_DrawNetworkSessionSetup(Menu *pMenu)
 // opencmr2.ini setting.
 
 Menu g_screenOptionsMenu;
+Menu g_visualOptionsMenu;
 
 enum ScreenOptionsItem {
     SCREEN_ITEM_HUD,
     SCREEN_ITEM_MENU,
     SCREEN_ITEM_VSYNC,
     SCREEN_ITEM_FULLSCREEN,
+    SCREEN_ITEM_VISUAL,
     SCREEN_ITEM_OK = 0xe
 };
 
@@ -12090,19 +12092,274 @@ enum ScreenOptionsText {
     SCREEN_TEXT_MENU,
     SCREEN_TEXT_VSYNC,
     SCREEN_TEXT_FULLSCREEN,
+    SCREEN_TEXT_VISUAL,
     SCREEN_TEXT_COUNT
 };
 
 // In the game's character set (Windows-1252; Polish letters in place of
 // some symbols: 0xb1 is l with a stroke).
 static const char *const g_screenOptionsText[6][SCREEN_TEXT_COUNT] = {
-    { "Screen", "HUD Size", "Menu Size", "Vertical Sync", "Full Screen" },
-    { "\xc9" "cran", "Taille du HUD", "Taille des menus", "Synchro verticale", "Plein \xe9" "cran" },
-    { "Pantalla", "Tama\xf1o del HUD", "Tama\xf1o de los men\xfas", "Sincronizaci\xf3n vertical", "Pantalla completa" },
-    { "Schermo", "Dimensione HUD", "Dimensione menu", "Sincronia verticale", "Schermo intero" },
-    { "Bildschirm", "HUD-Gr\xf6\xdf" "e", "Men\xfcgr\xf6\xdf" "e", "VSync", "Vollbild" },
-    { "Ekran", "Rozmiar HUD", "Rozmiar menu", "Synchronizacja pionowa", "Pe\xb1ny ekran" },
+    { "Screen", "HUD Size", "Menu Size", "Vertical Sync", "Full Screen", "Visual Overhaul" },
+    { "\xc9" "cran", "Taille du HUD", "Taille des menus", "Synchro verticale", "Plein \xe9" "cran", "Graphismes HD" },
+    { "Pantalla", "Tama\xf1o del HUD", "Tama\xf1o de los men\xfas", "Sincronizaci\xf3n vertical", "Pantalla completa", "Gr\xe1" "ficos HD" },
+    { "Schermo", "Dimensione HUD", "Dimensione menu", "Sincronia verticale", "Schermo intero", "Grafica HD" },
+    { "Bildschirm", "HUD-Gr\xf6\xdf" "e", "Men\xfcgr\xf6\xdf" "e", "VSync", "Vollbild", "HD-Grafik" },
+    { "Ekran", "Rozmiar HUD", "Rozmiar menu", "Synchronizacja pionowa", "Pe\xb1ny ekran", "Grafika HD" },
 };
+
+enum VisualOptionsItem {
+    VISUAL_ITEM_MASTER,
+    VISUAL_ITEM_MSAA,
+    VISUAL_ITEM_LIGHTING,
+    VISUAL_ITEM_REFLECTIONS,
+    VISUAL_ITEM_SHADOWS,
+    VISUAL_ITEM_POST,
+    VISUAL_ITEM_DRAW_DIST,
+    VISUAL_ITEM_OVERRIDES,
+    VISUAL_ITEM_COUNT,
+    VISUAL_ITEM_OK = 0xe
+};
+
+enum VisualOptionsText {
+    VISUAL_TEXT_TITLE,
+    VISUAL_TEXT_MASTER,
+    VISUAL_TEXT_MSAA,
+    VISUAL_TEXT_LIGHTING,
+    VISUAL_TEXT_REFLECTIONS,
+    VISUAL_TEXT_SHADOWS,
+    VISUAL_TEXT_POST,
+    VISUAL_TEXT_DRAW_DIST,
+    VISUAL_TEXT_OVERRIDES,
+    VISUAL_TEXT_OFF,
+    VISUAL_TEXT_COUNT
+};
+
+static const char *const g_visualOptionsText[6][VISUAL_TEXT_COUNT] = {
+    { "Visual Overhaul", "Overhaul (F10)", "Anti-Aliasing", "Per-Pixel Lighting", "Reflections",
+      "Dynamic Shadows", "HDR Post-Process", "Draw Distance", "HD Textures", "Off" },
+    { "Graphismes HD", "Am\xe9liorations (F10)", "Anticr\xe9nelage", "\xc9" "clairage Pixel", "Reflets",
+      "Ombres dynamiques", "Post-traitement HDR", "Distance d'affichage", "Textures HD", "Non" },
+    { "Gr\xe1" "ficos HD", "Mejoras (F10)", "Antialiasing", "Iluminaci\xf3n Pixel", "Reflejos",
+      "Sombras din\xe1micas", "Posproceso HDR", "Distancia de visi\xf3n", "Texturas HD", "No" },
+    { "Grafica HD", "Miglioramenti (F10)", "Antialiasing", "Luce Per-Pixel", "Riflessi",
+      "Ombre dinamiche", "Post-processo HDR", "Distanza visiva", "Texture HD", "No" },
+    { "HD-Grafik", "Verbesserungen (F10)", "Kantengl\xe4ttung", "Per-Pixel-Licht", "Reflexionen",
+      "Dynamische Schatten", "HDR-Nachbearbeitung", "Sichtweite", "HD-Texturen", "Aus" },
+    { "Grafika HD", "Odswiezenie (F10)", "Antyaliasing (MSAA)", "Oswietlenie Per-Pixel", "Jakosc odbic",
+      "Cienie dynamiczne", "Post-processing HDR", "Zasieg rysowania", "Tekstury HD", "Wyl." },
+};
+
+static const int g_visualMsaaValues[4] = { 1, 2, 4, 8 };
+static const int g_visualCubeValues[4] = { 64, 128, 256, 512 };
+static const float g_visualDrawDistValues[6] = { 1.0f, 1.2f, 1.4f, 1.8f, 2.2f, 2.5f };
+
+static char *VisualOptions_Text(int text)
+{
+    int language = CGameInfo::GetGameRegion() == 3 ? 5 : CFrontend::m_textLanguage;
+    if (language > 5)
+        language = 0;
+    return (char *)g_visualOptionsText[language][text];
+}
+
+static BYTE VisualOptions_IndexForInt(int value, const int *table, int count)
+{
+    int best = 0;
+    int bestDiff = abs(value - table[0]);
+    for (int i = 1; i < count; i++) {
+        int diff = abs(value - table[i]);
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            best = i;
+        }
+    }
+    return (BYTE)best;
+}
+
+static BYTE VisualOptions_IndexForFloat(float value, const float *table, int count)
+{
+    int best = 0;
+    float bestDiff = fabsf(value - table[0]);
+    for (int i = 1; i < count; i++) {
+        float diff = fabsf(value - table[i]);
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            best = i;
+        }
+    }
+    return (BYTE)best;
+}
+
+static BYTE g_visualOptionsShown[VISUAL_ITEM_COUNT];
+
+void FrontendMenu_EnterVisualOptions(Menu *pMenu, int param)
+{
+    (void)param;
+    pMenu->text = VisualOptions_Text(VISUAL_TEXT_TITLE);
+    Menu_GetItem(pMenu, VISUAL_ITEM_MASTER)->max = Sys_IsVisualOverhaulEnabled() ? 0 : 1;
+    Menu_GetItem(pMenu, VISUAL_ITEM_MSAA)->max = VisualOptions_IndexForInt(Sys_GetOption("video.msaa", 4), g_visualMsaaValues, 4);
+    Menu_GetItem(pMenu, VISUAL_ITEM_LIGHTING)->max = Sys_GetOption("video.per_pixel_lighting", 1) != 0 ? 0 : 1;
+    Menu_GetItem(pMenu, VISUAL_ITEM_REFLECTIONS)->max = VisualOptions_IndexForInt(Sys_GetOption("video.cubemap_size", 256), g_visualCubeValues, 4);
+    Menu_GetItem(pMenu, VISUAL_ITEM_SHADOWS)->max = Sys_GetOption("video.shadow_map", 1) != 0 ? 0 : 1;
+    Menu_GetItem(pMenu, VISUAL_ITEM_POST)->max = Sys_GetOption("video.post_process", 1) != 0 ? 0 : 1;
+    Menu_GetItem(pMenu, VISUAL_ITEM_DRAW_DIST)->max = VisualOptions_IndexForFloat(Sys_GetOptionFloat("video.draw_distance_scale", 1.4f), g_visualDrawDistValues, 6);
+    Menu_GetItem(pMenu, VISUAL_ITEM_OVERRIDES)->max = Sys_GetOption("video.texture_overrides", 1) != 0 ? 0 : 1;
+    for (int i = 0; i < VISUAL_ITEM_COUNT; i++)
+        g_visualOptionsShown[i] = Menu_GetItem(pMenu, i)->max;
+}
+
+void FrontendMenu_ApplyVisualOptions(Menu *pMenu, MenuItem *pItem)
+{
+    (void)pItem;
+    BYTE value;
+
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_MASTER)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_MASTER]) {
+        BOOL on = value == 0 ? TRUE : FALSE;
+        Sys_SetVisualOverhaulEnabled(on);
+        Sys_SetOption("video.visual_overhaul", on ? 1 : 0);
+    }
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_MSAA)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_MSAA] && value < 4)
+        Sys_SetOption("video.msaa", g_visualMsaaValues[value]);
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_LIGHTING)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_LIGHTING]) {
+        int on = value == 0 ? 1 : 0;
+        Sys_SetOption("video.per_pixel_lighting", on);
+        Sys_SetOption("video.hemisphere_ambient", on);
+    }
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_REFLECTIONS)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_REFLECTIONS] && value < 4) {
+        int size = g_visualCubeValues[value];
+        Sys_SetOption("video.cubemap_size", size);
+        Sys_SetOption("video.car_fresnel", size > 64 ? 1 : 0);
+    }
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_SHADOWS)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_SHADOWS])
+        Sys_SetOption("video.shadow_map", value == 0 ? 1 : 0);
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_POST)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_POST])
+        Sys_SetOption("video.post_process", value == 0 ? 1 : 0);
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_DRAW_DIST)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_DRAW_DIST] && value < 6)
+        Sys_SetOptionFloat("video.draw_distance_scale", g_visualDrawDistValues[value]);
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_OVERRIDES)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_OVERRIDES]) {
+        int on = value == 0 ? 1 : 0;
+        Sys_SetOption("video.texture_overrides", on);
+        Sys_SetOption("video.override_material_maps", on);
+    }
+}
+
+void FrontendMenu_DrawVisualOptions(Menu *pMenu)
+{
+    short rect[4];
+    MenuItem *pItem;
+    BYTE *pColour;
+    BYTE *pSelColour;
+    BYTE *pUnselColour;
+    BYTE *pLineColour;
+    BYTE *pLineShadow;
+    int textY;
+    int x;
+    int y;
+    int rowH;
+    int i;
+    int j;
+
+    rowH = (int)(g_pGraphics->resY * 32) / 480;
+    rect[0] = (int)(g_pGraphics->resX * 100) / 640;
+    rect[2] = CFrontend::m_pAr640ATexture->width;
+    rect[3] = CFrontend::m_pAr640ATexture->height;
+    y = ((int)(g_pGraphics->resY * 8) / 480 + (int)(g_pGraphics->resY * 38) / 480 +
+         (int)(g_pGraphics->resY * 384) / 480) / 2 -
+        (rowH * pMenu->itemCount) / 2;
+    pMenu->text = VisualOptions_Text(VISUAL_TEXT_TITLE);
+    FrontendDraw_PlayTime();
+    FrontendDraw_MenuPath(pMenu, PATH_X(), PATH_Y(), 1, 2, NULL, -1);
+    pLineColour = pMenu->cursor == 0 ? g_colourWhite0x00524968 : g_colourText0x0052496c;
+    pLineShadow = pMenu->cursor == 0 ? g_colourShadowWhite0x00524974 : g_colourShadowText0x00524978;
+    g_frontendDrawRect[0] = (int)(g_pGraphics->resX * 99) / 640;
+    g_frontendDrawRect[1] = y;
+    g_frontendDrawRect[2] = (int)(g_pGraphics->resX * 360) / 640;
+    g_frontendDrawRect[3] = 1;
+    Sprite_FillRect(&g_pGraphics->field309_0x150, g_frontendDrawRect, pLineShadow, 1);
+    g_frontendDrawRect[1]++;
+    Sprite_FillRect(&g_pGraphics->field309_0x150, g_frontendDrawRect, pLineColour, 1);
+    pItem = pMenu->items;
+    for (i = 0; i < pMenu->itemCount; i++, pItem++) {
+        rect[1] = y + (int)(g_pGraphics->resY * 2) / 480 + rowH / 2 +
+                  (rowH * i - CFrontend::m_pAr640ATexture->height / 2);
+        if (pMenu->cursor == i) {
+            pColour = pSelColour = g_colourWhite0x00524968;
+            pUnselColour = g_colourText0x0052496c;
+            Sprite_Queue((SpriteRect *)&CFrontend::m_pAr640ATexture->field_0x11c, (SpriteRect *)rect,
+                         CFrontend::m_pAr640ATexture, 1, 0, 0, NULL, pColour, 8);
+        } else {
+            pColour = pUnselColour = g_colourText0x0052496c;
+            pSelColour = g_colourWhite0x00524968;
+            Sprite_Queue((SpriteRect *)&CFrontend::m_pAr640DTexture->field_0x11c, (SpriteRect *)rect,
+                         CFrontend::m_pAr640DTexture, 1, 0, 0, NULL, pColour, 8);
+        }
+        x = (int)(g_pGraphics->resX * 122) / 640;
+        textY = (int)(g_pGraphics->resY * 21) / 480 + g_frontendDrawRect[1];
+        switch (pItem->value) {
+        case VISUAL_ITEM_MSAA:
+            if (pItem->max == 0)
+                sprintf(CFrontend::m_stringDest, "%s  < %s >", VisualOptions_Text(VISUAL_TEXT_MSAA),
+                        VisualOptions_Text(VISUAL_TEXT_OFF));
+            else
+                sprintf(CFrontend::m_stringDest, "%s  < %dx >", VisualOptions_Text(VISUAL_TEXT_MSAA),
+                        g_visualMsaaValues[pItem->max < 4 ? pItem->max : 2]);
+            Font_DrawText(1, CFrontend::m_stringDest, x, textY, (int *)pColour, 0x11);
+            break;
+        case VISUAL_ITEM_REFLECTIONS:
+            sprintf(CFrontend::m_stringDest, "%s  < %d >", VisualOptions_Text(VISUAL_TEXT_REFLECTIONS),
+                    g_visualCubeValues[pItem->max < 4 ? pItem->max : 2]);
+            Font_DrawText(1, CFrontend::m_stringDest, x, textY, (int *)pColour, 0x11);
+            break;
+        case VISUAL_ITEM_DRAW_DIST:
+            sprintf(CFrontend::m_stringDest, "%s  < %.1fx >", VisualOptions_Text(VISUAL_TEXT_DRAW_DIST),
+                    g_visualDrawDistValues[pItem->max < 6 ? pItem->max : 2]);
+            Font_DrawText(1, CFrontend::m_stringDest, x, textY, (int *)pColour, 0x11);
+            break;
+        case VISUAL_ITEM_MASTER:
+        case VISUAL_ITEM_LIGHTING:
+        case VISUAL_ITEM_SHADOWS:
+        case VISUAL_ITEM_POST:
+        case VISUAL_ITEM_OVERRIDES: {
+            int txtId = pItem->value == VISUAL_ITEM_MASTER     ? VISUAL_TEXT_MASTER
+                        : pItem->value == VISUAL_ITEM_LIGHTING ? VISUAL_TEXT_LIGHTING
+                        : pItem->value == VISUAL_ITEM_SHADOWS  ? VISUAL_TEXT_SHADOWS
+                        : pItem->value == VISUAL_ITEM_POST     ? VISUAL_TEXT_POST
+                                                               : VISUAL_TEXT_OVERRIDES;
+            strcpy(CFrontend::m_stringDest, VisualOptions_Text(txtId));
+            Font_DrawText(1, CFrontend::m_stringDest, x, textY, (int *)pColour, 0x11);
+            for (j = 0; j < pItem->min; j++) {
+                x += (int)(g_pGraphics->resX * 10) / 640 + Font_GetTextWidth(1, (BYTE *)CFrontend::m_stringDest);
+                strcpy(CFrontend::m_stringDest, CFrontend::GetTextString(j == 0 ? 0x134 : 0x133));
+                Font_DrawText(1, CFrontend::m_stringDest, x, textY,
+                              (int *)(pItem->max == j ? pSelColour : pUnselColour), 0x11);
+            }
+            break;
+        }
+        default:
+            Font_DrawText(1, CFrontend::GetTextString(pItem->id), x, textY, (int *)pColour, 0x11);
+            break;
+        }
+        if (pMenu->cursor == i + 1 || pMenu->cursor == i) {
+            pLineColour = g_colourWhite0x00524968;
+            pLineShadow = g_colourShadowWhite0x00524974;
+        } else {
+            pLineColour = g_colourText0x0052496c;
+            pLineShadow = g_colourShadowText0x00524978;
+        }
+        g_frontendDrawRect[1] = rowH * (i + 1) + y;
+        Sprite_FillRect(&g_pGraphics->field309_0x150, g_frontendDrawRect, pLineShadow, 1);
+        g_frontendDrawRect[1]++;
+        Sprite_FillRect(&g_pGraphics->field309_0x150, g_frontendDrawRect, pLineColour, 1);
+    }
+    FrontendDraw_Carousel(FrontendMenu_GetMain(), 0, NULL);
+}
 
 // Sizes offered, in percent.
 #define SCREEN_SIZE_MIN 50
@@ -12255,6 +12512,10 @@ void FrontendMenu_DrawScreenOptions(Menu *pMenu)
                               (int *)(pItem->max == j ? pSelColour : pUnselColour), 0x11);
             }
             break;
+        case SCREEN_ITEM_VISUAL:
+            sprintf(CFrontend::m_stringDest, g_strEllipsisFormat, ScreenOptions_Text(SCREEN_TEXT_VISUAL));
+            Font_DrawText(1, CFrontend::m_stringDest, x, textY, (int *)pColour, 0x11);
+            break;
         default:
             Font_DrawText(1, CFrontend::GetTextString(pItem->id), x, textY, (int *)pColour, 0x11);
             break;
@@ -12278,6 +12539,20 @@ extern Menu g_menu0x008210f8;
 
 void FrontendMenu_BuildScreenOptions(void)
 {
+    Menu_Init(&g_visualOptionsMenu, VisualOptions_Text(VISUAL_TEXT_TITLE), -1, 0, &g_screenOptionsMenu, NULL, 1, 0, 1);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_MASTER);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 4, 0, 0, 0, 0, VISUAL_ITEM_MSAA);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_LIGHTING);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 4, 0, 0, 0, 0, VISUAL_ITEM_REFLECTIONS);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_SHADOWS);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_POST);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 6, 0, 0, 0, 0, VISUAL_ITEM_DRAW_DIST);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_OVERRIDES);
+    Menu_AddItemType1(&g_visualOptionsMenu, 0, 0x67, (MenuItemAction)FrontendMenu_ApplyVisualOptions, VISUAL_ITEM_OK);
+    Menu_SetCallbacks(&g_visualOptionsMenu, FrontendMenu_EnterVisualOptions, NULL,
+                      (MenuCallback)FrontendMenu_DrawVisualOptions, NULL);
+    Menu_ValidateCursor(&g_visualOptionsMenu, 0);
+
     Menu_Init(&g_screenOptionsMenu, ScreenOptions_Text(SCREEN_TEXT_TITLE), -1, 0, &g_menu0x008210f8, NULL, 1, 0, 1);
     Menu_AddItemType3(&g_screenOptionsMenu, 0, -1, ScreenOptions_SizeCount(SCREEN_SIZE_MAX), 0, 0, 0, 0,
                       SCREEN_ITEM_HUD);
@@ -12285,6 +12560,7 @@ void FrontendMenu_BuildScreenOptions(void)
                       SCREEN_ITEM_MENU);
     Menu_AddItemType3(&g_screenOptionsMenu, 0, -1, 2, 0, 0, 0, 0, SCREEN_ITEM_VSYNC);
     Menu_AddItemType3(&g_screenOptionsMenu, 0, -1, 2, 0, 0, 0, 0, SCREEN_ITEM_FULLSCREEN);
+    Menu_AddItemType2(&g_screenOptionsMenu, 0, -1, &g_visualOptionsMenu, 0, SCREEN_ITEM_VISUAL);
     Menu_AddItemType1(&g_screenOptionsMenu, 0, 0x67, (MenuItemAction)FrontendMenu_ApplyScreenOptions, SCREEN_ITEM_OK);
     Menu_SetCallbacks(&g_screenOptionsMenu, FrontendMenu_EnterScreenOptions, NULL,
                       (MenuCallback)FrontendMenu_DrawScreenOptions, NULL);

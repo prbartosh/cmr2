@@ -1645,6 +1645,11 @@ extern "C" BOOL Sys_IsVisualOverhaulEnabled(void)
     return s_visualOverhaul ? TRUE : FALSE;
 }
 
+extern "C" void Sys_SetVisualOverhaulEnabled(BOOL enabled)
+{
+    Platform_SetVisualOverhaulEnabled(enabled != 0);
+}
+
 extern "C" BOOL Sys_SetOption(const char *name, int value)
 {
     std::string key = Lower(name);
@@ -1652,6 +1657,27 @@ extern "C" BOOL Sys_SetOption(const char *name, int value)
     if (dot == std::string::npos)
         return FALSE;
     std::string text = std::to_string(value);
+    if (!SaveSetting(s_userDir + "opencmr2.ini", key.substr(0, dot), key.substr(dot + 1), text)) {
+        Sys_Log("could not save %s = %s: %s", name, text.c_str(), SDL_GetError());
+        s_settings[key] = text;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+extern "C" BOOL Sys_SetOptionFloat(const char *name, float value)
+{
+    std::string key = Lower(name);
+    size_t dot = key.find('.');
+    if (dot == std::string::npos)
+        return FALSE;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.2f", value);
+    // Strip trailing zeroes after decimal point, keeping at least one digit (e.g. "1.40" -> "1.4", "2.00" -> "2.0").
+    size_t len = strlen(buf);
+    if (len >= 2 && buf[len - 1] == '0' && buf[len - 2] != '.')
+        buf[len - 1] = '\0';
+    std::string text(buf);
     if (!SaveSetting(s_userDir + "opencmr2.ini", key.substr(0, dot), key.substr(dot + 1), text)) {
         Sys_Log("could not save %s = %s: %s", name, text.c_str(), SDL_GetError());
         s_settings[key] = text;

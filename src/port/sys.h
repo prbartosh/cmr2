@@ -167,9 +167,12 @@ const char *Sys_GetOptionText(const char *name, const char *fallback);
 /* Changes an option and saves it to opencmr2.ini, keeping the rest of the
    file. Returns 0 if it could not be saved (the new value still applies). */
 BOOL Sys_SetOption(const char *name, int value);
+/* Changes a floating-point option and saves it to opencmr2.ini. */
+BOOL Sys_SetOptionFloat(const char *name, float value);
 /* Master toggle for visual overhaul features (opencmr2.ini video.visual_overhaul,
    toggled live at runtime with F10 for instant before/after comparison). */
 BOOL Sys_IsVisualOverhaulEnabled(void);
+void Sys_SetVisualOverhaulEnabled(BOOL enabled);
 
 #ifdef __cplusplus
 }
