@@ -1,6 +1,7 @@
 #include "net/join_code.h"
 #include "net/lobby_wire.h"
 #include "net/net_session.h"
+#include "net/net_wire.h"
 #include "net/rendezvous.h"
 
 #include "net/enet_platform.h"
@@ -269,30 +270,34 @@ void TestLobbyUnreachable()
 {
     Harness h;
     h.rv.Host(kInstance);
-    for (uint32_t t = 1000; t <= 5000; t += 1000)
+    for (uint32_t t = 1000; t <= 30000; t += 1000)
         h.rv.Tick(t);
     CHECK(h.sent.empty());
     CHECK(HostStatus(h) == NET_CODE_CONTACTING);
-    h.rv.Tick(6000);
+    h.rv.LobbyUnresolved();
     CHECK(HostStatus(h) == NET_CODE_LOBBY_UNREACHABLE);
+    CHECK(h.rv.LobbyUnreachable());
+    h.rv.Tick(31000);
+    CHECK(h.sent.empty());
 
     h.rv.SetLobby(kLobby, kLocal);
     CHECK(HostStatus(h) == NET_CODE_CONTACTING);
     std::set<uint32_t> nonces;
     size_t count = 0;
-    for (uint32_t t = 6001; t <= 11001; t += 1000) {
+    for (uint32_t t = 31001; t <= 36001; t += 1000) {
         h.rv.Tick(t);
         for (const auto &r : h.Take<lobby::Register>()) {
             nonces.insert(r.second.nonce);
             count++;
         }
+        h.rv.LobbyUnresolved();
     }
     CHECK(count == 6);
     CHECK(nonces.size() == 1);
     CHECK(HostStatus(h) == NET_CODE_LOBBY_UNREACHABLE);
-    h.rv.Tick(16000);
+    h.rv.Tick(41000);
     CHECK(h.Take<lobby::Register>().empty());
-    h.rv.Tick(16001);
+    h.rv.Tick(41001);
     auto registers = h.Take<lobby::Register>();
     CHECK(registers.size() == 1);
     if (registers.size() == 1) {
@@ -300,8 +305,9 @@ void TestLobbyUnreachable()
         reply.nonce = registers[0].second.nonce;
         reply.code = kCode;
         reply.secret = MakeKey(3);
-        CHECK(h.Deliver(reply, kLobby, 16050));
+        CHECK(h.Deliver(reply, kLobby, 41050));
         CHECK(HostStatus(h) == NET_CODE_READY);
+        CHECK(!h.rv.LobbyUnreachable());
     }
 
     Harness full;
@@ -366,6 +372,20 @@ void TestCandidateFilter()
     CHECK(!net::IsPrivateAddress(At(127, 0, 0, 1, 0).address));
     CHECK(net::IsLoopbackAddress(At(127, 0, 0, 1, 0).address));
     CHECK(!net::IsLoopbackAddress(At(10, 0, 0, 1, 0).address));
+    CHECK(net::IsPublicAddress(At(8, 8, 8, 8, 0).address));
+    CHECK(net::IsPublicAddress(At(203, 0, 113, 5, 0).address));
+    CHECK(!net::IsPublicAddress(At(10, 1, 2, 3, 0).address));
+    CHECK(!net::IsPublicAddress(At(172, 20, 0, 1, 0).address));
+    CHECK(net::IsPublicAddress(At(172, 32, 0, 1, 0).address));
+    CHECK(!net::IsPublicAddress(At(192, 168, 1, 1, 0).address));
+    CHECK(!net::IsPublicAddress(At(127, 0, 0, 1, 0).address));
+    CHECK(!net::IsPublicAddress(At(169, 254, 3, 4, 0).address));
+    CHECK(net::IsPublicAddress(At(169, 253, 3, 4, 0).address));
+    CHECK(!net::IsPublicAddress(At(100, 64, 0, 1, 0).address));
+    CHECK(!net::IsPublicAddress(At(100, 101, 102, 103, 0).address));
+    CHECK(!net::IsPublicAddress(At(100, 127, 255, 255, 0).address));
+    CHECK(net::IsPublicAddress(At(100, 63, 255, 255, 0).address));
+    CHECK(net::IsPublicAddress(At(100, 128, 0, 0, 0).address));
 
     Harness h;
     h.rv.SetLobby(kLobby, kLocal);
@@ -858,7 +878,7 @@ void TestGarbage()
             data[j] = (uint8_t)rng();
         if (n >= 6) {
             memcpy(data, lobby::kMagic, 4);
-            data[4] = (uint8_t)(lobby::KIND_REGISTER + rng() % 15);
+            data[4] = (uint8_t)(lobby::KIND_REGISTER + rng() % 16);
             data[5] = lobby::kVersion;
         }
         h.rv.Handle(data, n, i % 2 ? kLobby : At(203, 0, 113, 5, (uint16_t)(40000 + i % 4)), 1100);
@@ -871,6 +891,420 @@ void TestGarbage()
     h.rv.Tick(1200);
     CHECK(h.Take<lobby::Punch>().empty());
     CHECK(h.Take<lobby::Bind>().empty());
+}
+
+void TestElapsed()
+{
+    CHECK(net::Elapsed(1000, 0, 1000));
+    CHECK(!net::Elapsed(999, 0, 1000));
+    CHECK(net::Elapsed(1000, 1000, 0));
+    CHECK(net::Elapsed(5, 0xFFFFFFF0u, 21));
+    CHECK(!net::Elapsed(5, 0xFFFFFFF0u, 22));
+    CHECK(!net::Elapsed(0xFFFFFFF0u, 5, 10));
+    CHECK(!net::Elapsed(1000, 1001, 0));
+    CHECK(!net::Elapsed(1000, 1001, 15000));
+}
+
+void TestStaleNow()
+{
+    Harness g;
+    g.rv.SetLobby(kLobby, kLocal);
+    g.rv.Find(kCode);
+    g.rv.Tick(1000);
+    auto resolves = g.Take<lobby::Resolve>();
+    CHECK(resolves.size() == 1);
+    if (resolves.size() == 1) {
+        lobby::Resolved reply;
+        reply.nonce = resolves[0].second.nonce;
+        reply.instance = kInstance;
+        reply.hostPublic = kHostPublic;
+        CHECK(g.Deliver(reply, kLobby, 1001));
+        g.rv.Tick(1000);
+        CHECK(FindStatus(g) == NET_CODE_CONNECTING);
+        g.rv.Tick(1001);
+        CHECK(FindStatus(g) == NET_CODE_CONNECTING);
+        CHECK(g.Take<lobby::Relay>().empty());
+    }
+
+    Harness r(net::RelayMode::Always);
+    r.rv.SetLobby(kLobby, kLocal);
+    r.rv.Find(kCode);
+    r.rv.Tick(1000);
+    resolves = r.Take<lobby::Resolve>();
+    CHECK(resolves.size() == 1);
+    if (resolves.size() == 1) {
+        lobby::Resolved reply;
+        reply.nonce = resolves[0].second.nonce;
+        reply.instance = kInstance;
+        reply.hostPublic = kHostPublic;
+        CHECK(r.Deliver(reply, kLobby, 1001));
+        CHECK(r.Take<lobby::Relay>().size() == 1);
+        r.rv.Tick(1000);
+        CHECK(r.Take<lobby::Relay>().empty());
+        CHECK(FindStatus(r) == NET_CODE_RELAYING);
+    }
+
+    Harness h;
+    h.rv.SetLobby(kLobby, kLocal);
+    h.rv.Host(kInstance);
+    h.rv.Tick(1000);
+    auto registers = h.Take<lobby::Register>();
+    CHECK(registers.size() == 1);
+    if (registers.size() == 1) {
+        lobby::Registered reply;
+        reply.nonce = registers[0].second.nonce;
+        reply.code = kCode;
+        reply.secret = MakeKey(1);
+        CHECK(h.Deliver(reply, kLobby, 1001));
+        h.rv.Tick(1000);
+        CHECK(h.Take<lobby::Refresh>().empty());
+        CHECK(HostStatus(h) == NET_CODE_READY);
+    }
+}
+
+void TestChallenge()
+{
+    Harness h;
+    h.rv.SetLobby(kLobby, kLocal);
+    h.rv.Host(kInstance);
+    h.rv.Tick(1000);
+    auto registers = h.Take<lobby::Register>();
+    CHECK(registers.size() == 1);
+    if (registers.size() != 1)
+        return;
+    CHECK(registers[0].second.cookie == lobby::Key{});
+    uint32_t nonce = registers[0].second.nonce;
+    lobby::Challenge challenge;
+    challenge.nonce = nonce;
+    challenge.cookie = MakeKey(30);
+    CHECK(!h.Deliver(challenge, kHostPublic, 1010));
+    CHECK(!h.Deliver(challenge, At(203, 0, 113, 5, 28631), 1010));
+    lobby::Challenge wrongNonce = challenge;
+    wrongNonce.nonce ^= 2;
+    CHECK(!h.Deliver(wrongNonce, kLobby, 1010));
+    lobby::Challenge zero = challenge;
+    zero.nonce = 0;
+    CHECK(!h.Deliver(zero, kLobby, 1010));
+    CHECK(h.sent.empty());
+    for (int i = 0; i < 3; i++) {
+        challenge.cookie = MakeKey((uint8_t)(30 + i));
+        CHECK(h.Deliver(challenge, kLobby, (uint32_t)(1010 + i)));
+        registers = h.Take<lobby::Register>();
+        CHECK(registers.size() == 1);
+        if (registers.size() == 1) {
+            CHECK(registers[0].second.nonce == nonce);
+            CHECK(registers[0].second.cookie == MakeKey((uint8_t)(30 + i)));
+        }
+        CHECK(HostStatus(h) == NET_CODE_CONTACTING);
+    }
+    challenge.cookie = MakeKey(40);
+    CHECK(h.Deliver(challenge, kLobby, 1020));
+    CHECK(h.sent.empty());
+    CHECK(HostStatus(h) == NET_CODE_LOBBY_UNREACHABLE);
+    h.rv.Tick(7000);
+    registers = h.Take<lobby::Register>();
+    CHECK(registers.size() == 1);
+    if (registers.size() != 1)
+        return;
+    CHECK(registers[0].second.nonce == nonce);
+    CHECK(registers[0].second.cookie == MakeKey(40));
+    challenge.cookie = MakeKey(41);
+    CHECK(h.Deliver(challenge, kLobby, 7010));
+    registers = h.Take<lobby::Register>();
+    CHECK(registers.size() == 1 && registers[0].second.cookie == MakeKey(41));
+    lobby::Registered registered;
+    registered.nonce = nonce;
+    registered.code = kCode;
+    registered.secret = MakeKey(1);
+    CHECK(h.Deliver(registered, kLobby, 7020));
+    CHECK(HostStatus(h) == NET_CODE_READY);
+    CHECK(!h.Deliver(challenge, kLobby, 7030));
+
+    h.rv.Tick(17020);
+    auto refreshes = h.Take<lobby::Refresh>();
+    CHECK(refreshes.size() == 1);
+    if (refreshes.size() != 1)
+        return;
+    CHECK(refreshes[0].second.cookie == MakeKey(41));
+    lobby::Challenge refreshChallenge;
+    refreshChallenge.nonce = refreshes[0].second.nonce;
+    refreshChallenge.cookie = MakeKey(50);
+    CHECK(h.Deliver(refreshChallenge, kLobby, 17030));
+    auto again = h.Take<lobby::Refresh>();
+    CHECK(again.size() == 1);
+    if (again.size() == 1) {
+        CHECK(again[0].second.nonce == refreshes[0].second.nonce);
+        CHECK(again[0].second.cookie == MakeKey(50));
+    }
+    lobby::Refreshed refreshed;
+    refreshed.nonce = refreshes[0].second.nonce;
+    CHECK(h.Deliver(refreshed, kLobby, 17040));
+    for (uint32_t t = 27020; t <= 57020; t += 10000)
+        h.rv.Tick(t);
+    CHECK(HostStatus(h) == NET_CODE_LOBBY_UNREACHABLE);
+
+    Harness g(net::RelayMode::Always);
+    g.rv.SetLobby(kLobby, kLocal);
+    g.rv.Find(kCode);
+    g.rv.Tick(1000);
+    auto resolves = g.Take<lobby::Resolve>();
+    CHECK(resolves.size() == 1);
+    if (resolves.size() != 1)
+        return;
+    CHECK(resolves[0].second.cookie == lobby::Key{});
+    challenge.nonce = resolves[0].second.nonce;
+    challenge.cookie = MakeKey(60);
+    CHECK(g.Deliver(challenge, kLobby, 1010));
+    resolves = g.Take<lobby::Resolve>();
+    CHECK(resolves.size() == 1);
+    if (resolves.size() != 1)
+        return;
+    CHECK(resolves[0].second.nonce == challenge.nonce);
+    CHECK(resolves[0].second.cookie == MakeKey(60));
+    lobby::Resolved reply;
+    reply.nonce = resolves[0].second.nonce;
+    reply.instance = kInstance;
+    reply.hostPublic = kHostPublic;
+    CHECK(g.Deliver(reply, kLobby, 1020));
+    auto relays = g.Take<lobby::Relay>();
+    CHECK(relays.size() == 1);
+    if (relays.size() != 1)
+        return;
+    CHECK(relays[0].second.cookie == MakeKey(60));
+    challenge.nonce = relays[0].second.nonce;
+    for (int i = 0; i < 3; i++) {
+        challenge.cookie = MakeKey((uint8_t)(70 + i));
+        CHECK(g.Deliver(challenge, kLobby, 1030));
+        relays = g.Take<lobby::Relay>();
+        CHECK(relays.size() == 1 && relays[0].second.nonce == challenge.nonce &&
+              relays[0].second.cookie == MakeKey((uint8_t)(70 + i)));
+    }
+    CHECK(FindStatus(g) == NET_CODE_RELAYING);
+    CHECK(g.Deliver(challenge, kLobby, 1040));
+    CHECK(g.Take<lobby::Relay>().empty());
+    CHECK(FindStatus(g) == NET_CODE_HOST_UNREACHABLE);
+
+    Harness f;
+    f.rv.SetLobby(kLobby, kLocal);
+    f.rv.Find(kCode);
+    f.rv.Tick(1000);
+    resolves = f.Take<lobby::Resolve>();
+    CHECK(resolves.size() == 1);
+    if (resolves.size() != 1)
+        return;
+    challenge.nonce = resolves[0].second.nonce;
+    for (int i = 0; i < 3; i++) {
+        CHECK(f.Deliver(challenge, kLobby, 1010));
+        CHECK(f.Take<lobby::Resolve>().size() == 1);
+    }
+    CHECK(f.Deliver(challenge, kLobby, 1020));
+    CHECK(f.sent.empty());
+    CHECK(FindStatus(f) == NET_CODE_LOBBY_UNREACHABLE);
+}
+
+void TestRefreshMisses()
+{
+    Harness h;
+    h.rv.SetLobby(kLobby, kLocal);
+    h.rv.Host(kInstance);
+    h.Register(1000, kCode, MakeKey(1));
+    lobby::Code code = {};
+    std::vector<uint32_t> nonces;
+    for (uint32_t t = 11000; t <= 31000; t += 10000) {
+        h.rv.Tick(t);
+        auto refreshes = h.Take<lobby::Refresh>();
+        CHECK(refreshes.size() == 1);
+        if (refreshes.size() == 1)
+            nonces.push_back(refreshes[0].second.nonce);
+        CHECK(HostStatus(h, &code) == NET_CODE_READY);
+        CHECK(!h.rv.LobbyUnreachable());
+    }
+    h.rv.Tick(41000);
+    CHECK(h.Take<lobby::Refresh>().size() == 1);
+    code = {};
+    CHECK(HostStatus(h, &code) == NET_CODE_LOBBY_UNREACHABLE);
+    CHECK(code == lobby::Code{});
+    CHECK(h.rv.LobbyUnreachable());
+    h.rv.Tick(51000);
+    auto refreshes = h.Take<lobby::Refresh>();
+    CHECK(refreshes.size() == 1);
+    if (refreshes.size() != 1)
+        return;
+    CHECK(refreshes[0].second.code == kCode);
+    CHECK(refreshes[0].second.secret == MakeKey(1));
+    CHECK(HostStatus(h) == NET_CODE_LOBBY_UNREACHABLE);
+    lobby::Refreshed stale;
+    stale.nonce = nonces[0];
+    CHECK(!h.Deliver(stale, kLobby, 51010));
+    CHECK(HostStatus(h) == NET_CODE_LOBBY_UNREACHABLE);
+    lobby::Refreshed refreshed;
+    refreshed.nonce = refreshes[0].second.nonce;
+    CHECK(h.Deliver(refreshed, kLobby, 51010));
+    CHECK(HostStatus(h, &code) == NET_CODE_READY);
+    CHECK(code == kCode);
+
+    h.rv.Tick(61000);
+    refreshes = h.Take<lobby::Refresh>();
+    CHECK(refreshes.size() == 1);
+    if (refreshes.size() != 1)
+        return;
+    lobby::Challenge challenge;
+    challenge.nonce = refreshes[0].second.nonce;
+    challenge.cookie = MakeKey(9);
+    for (int i = 0; i < 5; i++)
+        CHECK(h.Deliver(challenge, kLobby, 61010));
+    CHECK(h.Take<lobby::Refresh>().size() == 3);
+    CHECK(HostStatus(h) == NET_CODE_READY);
+    lobby::Failed rateLimited;
+    rateLimited.nonce = refreshes[0].second.nonce;
+    rateLimited.reason = lobby::FAILURE_RATE_LIMITED;
+    CHECK(h.Deliver(rateLimited, kLobby, 61020));
+    for (uint32_t t = 71000; t <= 91000; t += 10000)
+        h.rv.Tick(t);
+    CHECK(HostStatus(h) == NET_CODE_READY);
+}
+
+void TestLobbySwitch()
+{
+    const Endpoint other = At(203, 0, 113, 6, 28630);
+    Harness h;
+    h.rv.SetLobby(kLobby, kLocal);
+    h.rv.Host(kInstance);
+    h.Register(1000, kCode, MakeKey(1));
+    h.rv.SetLobby(other, kLocal);
+    h.rv.Tick(11000);
+    auto refreshes = h.Take<lobby::Refresh>();
+    CHECK(refreshes.size() == 1 && refreshes[0].first == kLobby);
+    lobby::Introduce introduce;
+    introduce.secret = MakeKey(1);
+    introduce.guestPublic = At(198, 51, 100, 7, 40000);
+    CHECK(!h.Deliver(introduce, other, 11010));
+    CHECK(h.Deliver(introduce, kLobby, 11010));
+    lobby::RelayOffer offer;
+    offer.secret = MakeKey(1);
+    offer.port = 40001;
+    offer.token = MakeKey(100);
+    CHECK(!h.Deliver(offer, other, 11010));
+    CHECK(h.Deliver(offer, kLobby, 11010));
+    h.sent.clear();
+    for (uint32_t t = 21000; t <= 41000; t += 10000) {
+        h.rv.Tick(t);
+        for (const auto &r : h.Take<lobby::Refresh>())
+            CHECK(r.first == kLobby);
+    }
+    CHECK(HostStatus(h) == NET_CODE_LOBBY_UNREACHABLE);
+    h.sent.clear();
+    h.rv.Tick(51000);
+    refreshes = h.Take<lobby::Refresh>();
+    CHECK(refreshes.size() == 1);
+    if (refreshes.size() != 1)
+        return;
+    CHECK(refreshes[0].first == other);
+    CHECK(refreshes[0].second.code == kCode);
+    CHECK(refreshes[0].second.cookie == lobby::Key{});
+    lobby::Refreshed refreshed;
+    refreshed.nonce = refreshes[0].second.nonce;
+    CHECK(!h.Deliver(refreshed, kLobby, 51010));
+    CHECK(h.Deliver(refreshed, other, 51010));
+    lobby::Code code = {};
+    CHECK(HostStatus(h, &code) == NET_CODE_READY);
+    CHECK(code == kCode);
+
+    Harness g(net::RelayMode::Auto);
+    g.rv.SetLobby(kLobby, kLocal);
+    g.rv.Find(kCode);
+    g.Resolve(1000, kHostPublic, Endpoint());
+    g.rv.SetLobby(other, kLocal);
+    g.rv.Tick(4000);
+    auto relays = g.Take<lobby::Relay>();
+    CHECK(relays.size() == 1 && relays[0].first == kLobby);
+    if (relays.size() != 1)
+        return;
+    lobby::Relayed assigned;
+    assigned.nonce = relays[0].second.nonce;
+    assigned.port = 40005;
+    assigned.token = MakeKey(70);
+    CHECK(!g.Deliver(assigned, other, 4010));
+    CHECK(g.Deliver(assigned, kLobby, 4010));
+    CHECK(g.rv.IsRelay(At(203, 0, 113, 5, 40005)));
+    g.rv.CancelFind();
+    g.rv.Tick(5000);
+    g.sent.clear();
+    g.rv.Find(kCode);
+    g.rv.Tick(5001);
+    auto resolves = g.Take<lobby::Resolve>();
+    CHECK(resolves.size() == 1 && resolves[0].first == other);
+
+    Harness c;
+    c.rv.SetLobby(kLobby, kLocal);
+    c.rv.Find(kCode);
+    c.rv.Tick(1000);
+    resolves = c.Take<lobby::Resolve>();
+    CHECK(resolves.size() == 1 && resolves[0].first == kLobby);
+    c.rv.SetLobby(other, kLocal);
+    c.rv.Tick(1001);
+    resolves = c.Take<lobby::Resolve>();
+    CHECK(resolves.size() == 1 && resolves[0].first == other);
+
+    Harness u;
+    u.rv.SetLobby(kLobby, kLocal);
+    u.rv.Host(kInstance);
+    u.rv.Tick(1000);
+    CHECK(u.Take<lobby::Register>().size() == 1);
+    u.rv.SetLobby(other, kLocal);
+    u.rv.Tick(1001);
+    auto registers = u.Take<lobby::Register>();
+    CHECK(registers.size() == 1 && registers[0].first == other);
+}
+
+void TestNoLobby()
+{
+    Harness g;
+    g.rv.Find(kCode);
+    CHECK(g.rv.NeedsLobby());
+    for (uint32_t t = 1000; t <= 10999; t += 1000) {
+        g.rv.Tick(t);
+        CHECK(FindStatus(g) == NET_CODE_CONTACTING);
+    }
+    CHECK(g.sent.empty());
+    g.rv.Tick(11000);
+    CHECK(FindStatus(g) == NET_CODE_LOBBY_UNREACHABLE);
+    CHECK(g.rv.LobbyUnreachable());
+    CHECK(!g.rv.NeedsLobby());
+
+    Harness f;
+    f.rv.Find(kCode);
+    f.rv.Tick(1000);
+    CHECK(FindStatus(f) == NET_CODE_CONTACTING);
+    f.rv.LobbyUnresolved();
+    CHECK(FindStatus(f) == NET_CODE_LOBBY_UNREACHABLE);
+    CHECK(f.sent.empty());
+
+    Harness s;
+    s.rv.Find(kCode);
+    for (uint32_t t = 1000; t <= 7000; t += 1000)
+        s.rv.Tick(t);
+    CHECK(s.sent.empty());
+    s.rv.SetLobby(kLobby, kLocal);
+    size_t resolves = 0;
+    for (uint32_t t = 7000; t <= 10999; t += 500) {
+        s.rv.Tick(t);
+        resolves += s.Take<lobby::Resolve>().size();
+        CHECK(FindStatus(s) == NET_CODE_CONTACTING);
+    }
+    CHECK(resolves == 4);
+    s.rv.Tick(11000);
+    CHECK(FindStatus(s) == NET_CODE_LOBBY_UNREACHABLE);
+
+    Harness v;
+    v.rv.SetLobby(kLobby, kLocal);
+    v.rv.Find(kCode);
+    v.rv.Tick(1000);
+    v.rv.LobbyUnresolved();
+    CHECK(FindStatus(v) == NET_CODE_CONTACTING);
+    v.rv.Host(kInstance);
+    v.rv.LobbyUnresolved();
+    CHECK(HostStatus(v) == NET_CODE_CONTACTING);
 }
 
 void TestPathPinning()
@@ -896,9 +1330,10 @@ bool WaitFor(const std::function<bool()> &condition, int ms = 5000)
 
 class FakeLobby {
 public:
-    std::atomic<int> registers{0}, unregisters{0}, resolves{0}, relays{0}, forwarded{0}, forwardedEnet{0};
+    std::atomic<int> registers{0}, unregisters{0}, resolves{0}, relays{0}, forwarded{0}, forwardedEnet{0},
+        forwardedRaw{0}, challenges{0};
 
-    FakeLobby()
+    explicit FakeLobby(bool challenging = false) : challenging(challenging)
     {
         lobbySocket = Open(&lobbyPort);
         relaySocket = Open(&relayPort);
@@ -972,6 +1407,26 @@ private:
         return true;
     }
 
+    static lobby::Key CookieFor(const Endpoint &from)
+    {
+        lobby::Key key = MakeKey(77);
+        key[0] ^= (uint8_t)from.port;
+        key[1] ^= (uint8_t)(from.port >> 8);
+        return key;
+    }
+
+    bool Challenged(const Endpoint &from, uint32_t nonce, const lobby::Key &cookie)
+    {
+        if (!challenging || cookie == CookieFor(from))
+            return false;
+        challenges++;
+        lobby::Challenge reply;
+        reply.nonce = nonce;
+        reply.cookie = CookieFor(from);
+        SendTo(lobbySocket, from, lobby::Encode(reply));
+        return true;
+    }
+
     void Lobby(const Endpoint &from, const uint8_t *data, size_t size)
     {
         lobby::Register reg;
@@ -980,6 +1435,8 @@ private:
         lobby::Resolve resolve;
         lobby::Relay relay;
         if (lobby::Decode(data, size, reg)) {
+            if (Challenged(from, reg.nonce, reg.cookie))
+                return;
             registers++;
             host = from;
             instance = reg.instance;
@@ -996,6 +1453,8 @@ private:
             if (unreg.code == kCode && unreg.secret == MakeKey(1))
                 unregisters++;
         } else if (lobby::Decode(data, size, resolve)) {
+            if (Challenged(from, resolve.nonce, resolve.cookie))
+                return;
             resolves++;
             if (!host.Valid() || resolve.code != kCode) {
                 lobby::Failed reply;
@@ -1015,6 +1474,8 @@ private:
             introduce.guestLocal = resolve.local;
             SendTo(lobbySocket, host, lobby::Encode(introduce));
         } else if (lobby::Decode(data, size, relay)) {
+            if (Challenged(from, relay.nonce, relay.cookie))
+                return;
             if (!host.Valid() || relay.code != kCode)
                 return;
             relays++;
@@ -1056,9 +1517,12 @@ private:
         forwarded++;
         if (size < 4 || memcmp(data, lobby::kMagic, 4) != 0)
             forwardedEnet++;
+        else
+            forwardedRaw++;
         SendTo(relaySocket, *to, std::vector<uint8_t>(data, data + size));
     }
 
+    bool challenging;
     ENetSocket lobbySocket, relaySocket;
     uint16_t lobbyPort = 0, relayPort = 0;
     std::atomic<bool> running{false};
@@ -1118,9 +1582,9 @@ bool Receives(net::Session &session, NetPlayerID from)
     }
 }
 
-void JoinByCode(net::RelayMode guestMode)
+void JoinByCode(net::RelayMode guestMode, bool challenging)
 {
-    FakeLobby fake;
+    FakeLobby fake(challenging);
     std::unique_ptr<net::Session> host = MakeSession(fake.Port(), net::RelayMode::Auto);
     std::unique_ptr<net::Session> guest = MakeSession(fake.Port(), guestMode);
 
@@ -1156,6 +1620,15 @@ void JoinByCode(net::RelayMode guestMode)
     join.lpszPasswordA = (char *)"pw";
     CHECK(guest->Open(&join, NET_OPEN_JOIN) == NET_OK);
     CHECK(guest->FindByCode("7K3M-9QX2") == NET_CODE_IDLE);
+    CHECK(guest->CodeSession(nullptr, nullptr) == NET_CODE_IDLE);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    int raw = fake.forwardedRaw;
+    for (int i = 0; i < 6; i++) {
+        Listed(*guest, hosted.guidInstance);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    CHECK(fake.forwardedRaw == raw);
+    CHECK(challenging == (fake.challenges > 0));
 
     NetName hostName = { sizeof(NetName), 0, (char *)"host", (char *)"host" };
     NetName guestName = { sizeof(NetName), 0, (char *)"guest", (char *)"guest" };
@@ -1292,11 +1765,265 @@ void SessionUnknownCode()
 {
     FakeLobby fake;
     std::unique_ptr<net::Session> guest = MakeSession(fake.Port(), net::RelayMode::Auto);
+    Listed(*guest, NetGuid());
     CHECK(guest->FindByCode("ZZZZ-ZZZZ") == NET_CODE_CONTACTING);
     CHECK(WaitFor([&] { return guest->CodeSession(nullptr, nullptr) == NET_CODE_NOT_FOUND; }));
     CHECK(guest->FindByCode("ABCD-EFGH") == NET_CODE_CONTACTING);
     guest->CancelFind();
     CHECK(guest->CodeSession(nullptr, nullptr) == NET_CODE_IDLE);
+    CHECK(guest->FindByCode("ABCD-EFGH") == NET_CODE_CONTACTING);
+    Host(*guest);
+    CHECK(guest->CodeSession(nullptr, nullptr) == NET_CODE_IDLE);
+}
+
+void FindWaitsForApplication()
+{
+    FakeLobby fake;
+    std::unique_ptr<net::Session> host = MakeSession(fake.Port(), net::RelayMode::Auto);
+    NetSessionDesc hosted = Host(*host);
+    std::string code;
+    CHECK(WaitFor([&] { return host->HostCode(&code) == NET_CODE_READY; }));
+    std::unique_ptr<net::Session> guest = MakeSession(fake.Port(), net::RelayMode::Auto);
+    CHECK(guest->FindByCode(code.c_str()) == NET_CODE_CONTACTING);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(fake.resolves == 0);
+    CHECK(guest->CodeSession(nullptr, nullptr) == NET_CODE_CONTACTING);
+    guest->CancelFind();
+    CHECK(guest->CodeSession(nullptr, nullptr) == NET_CODE_IDLE);
+    CHECK(guest->FindByCode(code.c_str()) == NET_CODE_CONTACTING);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(fake.resolves == 0);
+    CHECK(WaitFor([&] {
+        Listed(*guest, hosted.guidInstance);
+        return guest->CodeSession(nullptr, nullptr) == NET_CODE_FOUND;
+    }));
+    CHECK(fake.resolves == 1);
+    CHECK(WaitFor([&] { return Listed(*guest, hosted.guidInstance); }));
+    CHECK(Join(*guest, hosted.guidInstance) == NET_OK);
+}
+
+ENetSocket OpenRaw(uint16_t *port)
+{
+    ENetSocket s = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
+    ENetAddress address;
+    enet_address_set_host_ip(&address, "127.0.0.1");
+    address.port = 0;
+    CHECK(enet_socket_bind(s, &address) == 0);
+    enet_socket_set_option(s, ENET_SOCKOPT_NONBLOCK, 1);
+    ENetAddress bound;
+    CHECK(enet_socket_get_address(s, &bound) == 0);
+    *port = bound.port;
+    return s;
+}
+
+void SendRawTo(ENetSocket s, const ENetAddress &to, const std::vector<uint8_t> &data)
+{
+    ENetBuffer buffer;
+    buffer.data = (void *)data.data();
+    buffer.dataLength = data.size();
+    enet_socket_send(s, &to, &buffer, 1);
+}
+
+std::vector<uint8_t> ReceiveRaw(ENetSocket s, ENetAddress *from, const std::function<bool(const std::vector<uint8_t> &)> &wanted,
+                                int ms = 3000)
+{
+    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    uint8_t data[4096];
+    while (std::chrono::steady_clock::now() < end) {
+        ENetBuffer buffer;
+        buffer.data = data;
+        buffer.dataLength = sizeof(data);
+        int n = enet_socket_receive(s, from, &buffer, 1);
+        if (n > 0) {
+            std::vector<uint8_t> packet(data, data + n);
+            if (wanted(packet))
+                return packet;
+        } else {
+            enet_uint32 condition = ENET_SOCKET_WAIT_RECEIVE;
+            enet_socket_wait(s, &condition, 20);
+        }
+    }
+    return std::vector<uint8_t>();
+}
+
+bool IsQuery(const std::vector<uint8_t> &p)
+{
+    return p.size() >= 26 && memcmp(p.data(), lobby::kMagic, 4) == 0 && p[4] == 1 && p[5] == 1;
+}
+
+bool IsReply(const std::vector<uint8_t> &p)
+{
+    return p.size() >= 10 && memcmp(p.data(), lobby::kMagic, 4) == 0 && p[4] == 2 && p[5] == 1;
+}
+
+void StaleClockBurst()
+{
+    uint16_t lobbyPort = 0;
+    ENetSocket s = OpenRaw(&lobbyPort);
+    int early = 0;
+    for (int trial = 0; trial < 10; trial++) {
+        std::unique_ptr<net::Session> guest = MakeSession(lobbyPort, net::RelayMode::Auto);
+        Listed(*guest, NetGuid());
+        CHECK(guest->FindByCode("7K3M-9QX2") == NET_CODE_CONTACTING);
+        ENetAddress from;
+        lobby::Resolve request;
+        std::vector<uint8_t> packet = ReceiveRaw(s, &from, [&](const std::vector<uint8_t> &p) {
+            return lobby::Decode(p.data(), p.size(), request);
+        });
+        CHECK(!packet.empty());
+        if (packet.empty())
+            continue;
+        std::vector<uint8_t> junk = { 'C', 'M', 'R', '2', 2, 1, 0, 0, 0, 0 };
+        for (int i = 0; i < 200; i++)
+            SendRawTo(s, from, junk);
+        lobby::Resolved reply;
+        reply.nonce = request.nonce;
+        reply.instance = kInstance;
+        reply.hostPublic = At(127, 0, 0, 1, 9);
+        SendRawTo(s, from, lobby::Encode(reply));
+        auto stop = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+        bool connecting = false;
+        while (std::chrono::steady_clock::now() < stop) {
+            NetCodeStatus status = guest->CodeSession(nullptr, nullptr);
+            connecting = connecting || status == NET_CODE_CONNECTING;
+            if (status == NET_CODE_HOST_UNREACHABLE) {
+                early++;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(connecting);
+    }
+    CHECK(early == 0);
+    enet_socket_destroy(s);
+}
+
+std::vector<uint8_t> FakeReply(uint32_t nonce, uint8_t id)
+{
+    NetSessionDesc d = {};
+    d.guidApplication = kApp;
+    d.guidInstance.bytes[0] = 0xEE;
+    d.guidInstance.bytes[1] = id;
+    d.dwMaxPlayers = 4;
+    net::Writer w;
+    w.Bytes(lobby::kMagic, 4);
+    w.U8(2);
+    w.U8(1);
+    w.U32(nonce);
+    w.U32(d.dwFlags);
+    w.Bytes(d.guidInstance.bytes, 16);
+    w.Bytes(d.guidApplication.bytes, 16);
+    w.U32(d.dwMaxPlayers);
+    w.U32(0);
+    for (int i = 0; i < 6; i++)
+        w.U32(0);
+    w.Str("flood");
+    w.Str("");
+    w.U8(0);
+    return w.data;
+}
+
+size_t ListedCount(net::Session &session, uint8_t id, bool *seen)
+{
+    struct Context {
+        uint8_t id;
+        bool seen;
+        size_t count;
+    } context = { id, false, 0 };
+    session.EnumSessions(&kApp,
+                         [](const NetSessionDesc *d, void *p) -> BOOL {
+                             Context *c = (Context *)p;
+                             c->count++;
+                             if (d->guidInstance.bytes[0] == 0xEE && d->guidInstance.bytes[1] == c->id)
+                                 c->seen = true;
+                             return TRUE;
+                         },
+                         &context);
+    *seen = context.seen;
+    return context.count;
+}
+
+void FoundIsBounded()
+{
+    uint16_t peerPort = 0;
+    ENetSocket s = OpenRaw(&peerPort);
+    std::unique_ptr<net::Session> guest = MakeSession(0, net::RelayMode::Auto, peerPort);
+    bool seen = false;
+    ListedCount(*guest, 0, &seen);
+    ENetAddress from;
+    std::vector<uint8_t> query = ReceiveRaw(s, &from, IsQuery);
+    CHECK(!query.empty());
+    if (query.empty()) {
+        enet_socket_destroy(s);
+        return;
+    }
+    uint32_t nonce = (uint32_t)query[6] | (uint32_t)query[7] << 8 | (uint32_t)query[8] << 16 | (uint32_t)query[9] << 24;
+    for (int i = 0; i < 80; i++)
+        SendRawTo(s, from, FakeReply(nonce, (uint8_t)i));
+    CHECK(WaitFor([&] { return ListedCount(*guest, 0, &seen) == 64; }, 2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(ListedCount(*guest, 79, &seen) == 64);
+    CHECK(!seen);
+    ListedCount(*guest, 0, &seen);
+    CHECK(seen);
+    SendRawTo(s, from, FakeReply(nonce, 0));
+    SendRawTo(s, from, FakeReply(nonce, 100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(ListedCount(*guest, 100, &seen) == 64);
+    CHECK(!seen);
+    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(4500);
+    while (std::chrono::steady_clock::now() < end) {
+        ListedCount(*guest, 0, &seen);
+        for (;;) {
+            query = ReceiveRaw(s, &from, IsQuery, 1);
+            if (query.empty())
+                break;
+            nonce = (uint32_t)query[6] | (uint32_t)query[7] << 8 | (uint32_t)query[8] << 16 | (uint32_t)query[9] << 24;
+            SendRawTo(s, from, FakeReply(nonce, 0));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    CHECK(ListedCount(*guest, 0, &seen) == 1);
+    CHECK(seen);
+    enet_socket_destroy(s);
+}
+
+void QueryPadding()
+{
+    std::unique_ptr<net::Session> host = MakeSession(0, net::RelayMode::Auto);
+    NetSessionDesc desc = {};
+    desc.dwSize = sizeof(desc);
+    desc.guidApplication = kApp;
+    desc.dwMaxPlayers = 4;
+    std::string name(300, 'n');
+    desc.lpszSessionNameA = (char *)name.c_str();
+    desc.lpszPasswordA = (char *)"pw";
+    CHECK(host->Open(&desc, NET_OPEN_CREATE) == NET_OK);
+
+    uint16_t rawPort = 0;
+    ENetSocket s = OpenRaw(&rawPort);
+    net::Writer w;
+    w.Bytes(lobby::kMagic, 4);
+    w.U8(1);
+    w.U8(1);
+    w.U32(0x12345679);
+    w.Bytes(kApp.bytes, 16);
+    CHECK(w.data.size() == 26);
+    ENetAddress to;
+    enet_address_set_host_ip(&to, "127.0.0.1");
+    to.port = host->BoundPort();
+    SendRawTo(s, to, w.data);
+    ENetAddress from;
+    std::vector<uint8_t> reply = ReceiveRaw(s, &from, IsReply);
+    CHECK(reply.size() > 300);
+
+    std::unique_ptr<net::Session> guest = MakeSession(0, net::RelayMode::Auto, rawPort);
+    bool seen = false;
+    ListedCount(*guest, 0, &seen);
+    std::vector<uint8_t> query = ReceiveRaw(s, &from, IsQuery);
+    CHECK(!query.empty());
+    CHECK(query.size() >= reply.size());
+    enet_socket_destroy(s);
 }
 
 std::atomic<bool> s_resolverBlocked{false};
@@ -1442,6 +2169,58 @@ void LiteralLobbyAddress()
     CHECK(s_resolverCalls == 0);
 }
 
+void InvalidLobbyPort()
+{
+    FakeLobby fake;
+    std::string port = std::to_string(fake.Port());
+    const std::string settings[] = {
+        "127.0.0.1:" + std::to_string(fake.Port() + 65536),
+        "127.0.0.1:+" + port,
+        "127.0.0.1: " + port,
+        "127.0.0.1:" + port + " ",
+        "127.0.0.1:" + port + "x",
+        "127.0.0.1:-" + port,
+        "127.0.0.1:",
+        "127.0.0.1:0",
+        ":" + port,
+    };
+    for (const std::string &setting : settings) {
+        std::unique_ptr<net::Session> session = NamedLobbySession(setting.c_str(), nullptr);
+        Host(*session);
+        std::string code;
+        CHECK(WaitFor([&] { return session->HostCode(&code) == NET_CODE_LOBBY_UNREACHABLE; }, 2000));
+        session->Close();
+        Listed(*session, NetGuid());
+        CHECK(session->FindByCode("7K3M-9QX2") == NET_CODE_CONTACTING);
+        CHECK(WaitFor([&] { return session->CodeSession(nullptr, nullptr) == NET_CODE_LOBBY_UNREACHABLE; }, 2000));
+    }
+    CHECK(fake.registers == 0);
+    CHECK(fake.resolves == 0);
+}
+
+void UnresolvedLobbyFailsFast()
+{
+    s_resolverCalls = 0;
+    std::unique_ptr<net::Session> guest = NamedLobbySession("lobby.example", LiteralResolve);
+    Listed(*guest, NetGuid());
+    auto start = std::chrono::steady_clock::now();
+    CHECK(guest->FindByCode("7K3M-9QX2") == NET_CODE_CONTACTING);
+    CHECK(WaitFor([&] { return guest->CodeSession(nullptr, nullptr) == NET_CODE_LOBBY_UNREACHABLE; }, 3000));
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1500));
+    int calls = s_resolverCalls;
+    CHECK(calls >= 1);
+    CHECK(guest->FindByCode("7K3M-9QX2") == NET_CODE_CONTACTING);
+    CHECK(WaitFor([&] { return guest->CodeSession(nullptr, nullptr) == NET_CODE_LOBBY_UNREACHABLE; }, 3000));
+    CHECK(s_resolverCalls > calls);
+
+    std::unique_ptr<net::Session> host = NamedLobbySession("lobby.example", LiteralResolve);
+    start = std::chrono::steady_clock::now();
+    Host(*host);
+    std::string code;
+    CHECK(WaitFor([&] { return host->HostCode(&code) == NET_CODE_LOBBY_UNREACHABLE; }, 3000));
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1500));
+}
+
 }
 
 int main()
@@ -1460,6 +2239,12 @@ int main()
     TestHostUnreachable();
     TestGarbage();
     TestPathPinning();
+    TestElapsed();
+    TestStaleNow();
+    TestChallenge();
+    TestRefreshMisses();
+    TestLobbySwitch();
+    TestNoLobby();
 
     if (enet_initialize() != 0) {
         fprintf(stderr, "net_rendezvous: enet_initialize failed\n");
@@ -1467,15 +2252,23 @@ int main()
     }
     SessionWithoutLobby();
     SessionUnknownCode();
-    JoinByCode(net::RelayMode::Auto);
-    JoinByCode(net::RelayMode::Always);
+    JoinByCode(net::RelayMode::Auto, false);
+    JoinByCode(net::RelayMode::Always, false);
+    JoinByCode(net::RelayMode::Auto, true);
+    JoinByCode(net::RelayMode::Always, true);
     JoinPinned();
+    FindWaitsForApplication();
+    StaleClockBurst();
+    FoundIsBounded();
+    QueryPadding();
     AbandonIsSilent();
     MigrationRegisters();
     SlowLobbyResolution();
     ShutdownWhileResolving();
     AbandonWhileResolving();
     LiteralLobbyAddress();
+    InvalidLobbyPort();
+    UnresolvedLobbyFailsFast();
 
     if (s_failures != 0) {
         fprintf(stderr, "net_rendezvous: %d failures\n", s_failures);

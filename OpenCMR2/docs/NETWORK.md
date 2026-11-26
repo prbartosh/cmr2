@@ -52,7 +52,42 @@ they all elect the same host without talking.
 the game lists sessions, a query goes out every second (broadcast, `peers`,
 Tailscale) and `Net_EnumSessions` returns what has answered. Queries use the
 session port through ENet's intercept hook, so one UDP port does everything.
-Full sessions are not listed.
+Full sessions are not listed, and at most 64 sessions are kept.
+
+**Amplification.** A reply (up to 342 bytes) is larger than a bare query
+(26 bytes), so queries are padded to the largest reply. A host answers a
+query from a public address only if the query is at least as large as its
+reply; queries from private (RFC 1918), loopback, link-local (169.254/16)
+and shared (100.64/10, Tailscale) addresses are answered whatever their
+size, so older builds still find games on a LAN or a tailnet.
+
+**Join codes.** The lobby protocol and server are described in
+[LOBBY.md](LOBBY.md); the client side lives in `src/net/rendezvous.cpp`.
+
+- The `lobby` setting is `host` or `host:port`, with a port of 1 to 65535
+  in digits only. Anything else is logged once and reported as
+  `NET_CODE_LOBBY_UNREACHABLE`.
+- The lobby's name is resolved on its own thread, again every 10 minutes
+  (every 5 seconds while the lobby is unreachable or unresolved). Nothing is
+  sent, and no attempt is counted, before it resolves. A search by code
+  fails with `NET_CODE_LOBBY_UNREACHABLE` when the name does not resolve or
+  the lobby has not answered within 10 seconds; a host reports it and keeps
+  trying.
+- Every REGISTER, REFRESH, RESOLVE and RELAY carries the last cookie the
+  lobby handed out (zero at first). A CHALLENGE from the lobby that names an
+  outstanding request stores its cookie and sends that request again with
+  the same nonce, at most 3 times per attempt; this is not counted as a
+  failed attempt.
+- A registered host refreshes every 10 seconds; after 3 refreshes in a row
+  without an answer it reports `NET_CODE_LOBBY_UNREACHABLE`, keeps its code
+  and keeps refreshing, and is ready again at the next answer.
+- A new lobby address is not used while a registration or a search past
+  RESOLVED depends on the current one, unless the host's lobby is
+  unreachable; it is taken as soon as nothing depends on the old one.
+- The search by code queries the host with the application GUID of the
+  game's session list, so it starts only once the game has listed sessions
+  (`Net_EnumSessions`); until then it reports `NET_CODE_CONTACTING`. It is
+  cancelled when the game creates or joins a session.
 
 **Service thread.** A thread services the socket, as DirectPlay's did:
 connections stay up while the game loads a stage without polling.
@@ -75,8 +110,10 @@ game's buffer sizes (100 bytes for player names, which the game copies with
 
 Little-endian, version 1. The search, on the session port, outside ENet:
 
-    query  "CMR2" 1 version nonce:u32 application:guid
+    query  "CMR2" 1 version nonce:u32 application:guid padding
     reply  "CMR2" 2 version nonce:u32 description passwordRequired:u8
+
+Trailing bytes in a query are ignored, so the padding needs no new version.
 
 Sessions, over ENet; the first byte is the opcode:
 
