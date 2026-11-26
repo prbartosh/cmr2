@@ -23,9 +23,9 @@ and a C++17 compiler. It runs on Linux and macOS.
    (symmetric NAT, carrier-grade NAT), the guest asks for a relay. The lobby
    opens a UDP port from its relay range and gives each side a token. Both
    sides bind to the port with their token, and from then on the lobby
-   forwards datagrams between the two, unchanged. The game traffic (ENet) is
-   not inspected and cannot be read or changed by anyone who does not hold a
-   token, but it is not encrypted either.
+   forwards datagrams between the two, unchanged. The relay does not look
+   into the game traffic (ENet), and it is neither encrypted nor
+   authenticated: the lobby operator, or anyone on the path, can read it.
 
 The lobby never sees the game itself: once host and guest talk to each
 other (directly or through a relay), the lobby only keeps the registration
@@ -120,8 +120,9 @@ it cleanly. Logs go to stderr with UTC timestamps.
 | Relay idle timeout | 30 s without traffic |
 | Largest datagram | 4096 bytes |
 
-Over a limit the lobby answers `FULL` or `RATE_LIMITED`. The rate limit table holds at most 65536 addresses and forgets idle
-ones, so spoofed sources cannot grow it without bound.
+Over a limit the lobby answers `FULL` or `RATE_LIMITED`. The rate limit
+table holds at most 65536 addresses and forgets idle ones, so spoofed
+sources cannot grow it without bound.
 
 ## Security and privacy
 
@@ -131,9 +132,10 @@ ones, so spoofed sources cannot grow it without bound.
   years per address on average. A code only lets someone ask to join: the
   host's game still decides who plays.
 - **Secrets and tokens** (128 bits) prove that a request comes from the
-  host, or that a relay datagram comes from one of the two bound players.
-  They are compared in constant time. Datagrams from anyone else are
-  dropped without an answer.
+  host, and decide which addresses a relay port is bound to. They are
+  compared in constant time. After binding, a relay forwards by source
+  address: datagrams from any other address are dropped without an answer,
+  but a forged source address that matches a bound player is not detected.
 - **Malformed input** is dropped silently. The parser checks every length;
   the test suite sends it 20000 random datagrams.
 - **What is stored:** only in memory, for the lifetime of a session: the

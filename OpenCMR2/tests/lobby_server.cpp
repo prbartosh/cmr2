@@ -467,7 +467,7 @@ void TestRegisterResolve()
 void TestExpiry()
 {
     lobby::Options options = TestOptions();
-    options.sessionTtlMs = 300;
+    options.sessionTtlMs = 600;
     Running lobby(options);
     CHECK(lobby.started);
     if (!lobby.started)
@@ -476,7 +476,7 @@ void TestExpiry()
     Client host;
     Hosted hosted;
     CHECK(RegisterHost(host, port, 1, MakeGuid(3), wire::Endpoint(), hosted));
-    SleepMs(180);
+    SleepMs(300);
     wire::Refresh refresh;
     refresh.nonce = 2;
     refresh.code = hosted.code;
@@ -484,7 +484,7 @@ void TestExpiry()
     host.Send(port, refresh);
     wire::Refreshed refreshed;
     CHECK(host.AwaitReply(port, refreshed));
-    SleepMs(180);
+    SleepMs(300);
     CHECK(lobby.server.SessionCount() == 1);
     CHECK(WaitFor([&] { return lobby.server.SessionCount() == 0; }, 1000));
     Client guest;
@@ -777,6 +777,12 @@ void TestRelayLimits()
         CHECK(OpenRelay(host, guest, port, hosted, 2, relay));
         CHECK(BindRelay(host, relay.relayPort, relay.hostToken));
         CHECK(BindRelay(guest, relay.relayPort, relay.guestToken));
+        wire::Relay request;
+        request.nonce = 3;
+        request.code = hosted.code;
+        guest.Send(port, request);
+        CHECK(guest.AwaitFailure(port, 3, wire::FAILURE_FULL));
+
         std::vector<uint8_t> chunk = Payload(3000, 9);
         for (int i = 0; i < 6; i++)
             host.Send(relay.relayPort, chunk);
@@ -785,12 +791,6 @@ void TestRelayLimits()
         while (guest.Receive(d, 150))
             received++;
         CHECK(received >= 1 && received <= 3);
-
-        wire::Relay request;
-        request.nonce = 3;
-        request.code = hosted.code;
-        guest.Send(port, request);
-        CHECK(guest.AwaitFailure(port, 3, wire::FAILURE_FULL));
         CHECK(WaitFor([&] { return lobby.server.RelayCount() == 0; }, 2000));
         RelayPair again;
         CHECK(OpenRelay(host, guest, port, hosted, 4, again));

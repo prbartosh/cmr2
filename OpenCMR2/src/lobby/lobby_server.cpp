@@ -309,8 +309,6 @@ struct Server::State {
         auto it = buckets.find(address);
         if (it == buckets.end()) {
             if (buckets.size() >= kMaxBuckets)
-                PruneBuckets();
-            if (buckets.size() >= kMaxBuckets)
                 buckets.erase(buckets.begin());
             it = buckets.emplace(address, Bucket()).first;
             it->second.updated = now;
