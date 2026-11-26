@@ -12113,11 +12113,15 @@ enum VisualOptionsItem {
     VISUAL_ITEM_LIGHTING,
     VISUAL_ITEM_REFLECTIONS,
     VISUAL_ITEM_SHADOWS,
+    VISUAL_ITEM_SSAO,
+    VISUAL_ITEM_CAS,
+    VISUAL_ITEM_WET_ATMO,
+    VISUAL_ITEM_SOFT_A2C,
     VISUAL_ITEM_POST,
     VISUAL_ITEM_DRAW_DIST,
     VISUAL_ITEM_OVERRIDES,
     VISUAL_ITEM_COUNT,
-    VISUAL_ITEM_OK = 0xe
+    VISUAL_ITEM_OK = 0x10
 };
 
 enum VisualOptionsText {
@@ -12127,26 +12131,40 @@ enum VisualOptionsText {
     VISUAL_TEXT_LIGHTING,
     VISUAL_TEXT_REFLECTIONS,
     VISUAL_TEXT_SHADOWS,
+    VISUAL_TEXT_SSAO,
+    VISUAL_TEXT_CAS,
+    VISUAL_TEXT_WET_ATMO,
+    VISUAL_TEXT_SOFT_A2C,
     VISUAL_TEXT_POST,
     VISUAL_TEXT_DRAW_DIST,
     VISUAL_TEXT_OVERRIDES,
     VISUAL_TEXT_OFF,
+    VISUAL_TEXT_PHONG,
+    VISUAL_TEXT_PBR,
+    VISUAL_TEXT_CSM1,
+    VISUAL_TEXT_CSM2,
     VISUAL_TEXT_COUNT
 };
 
 static const char *const g_visualOptionsText[6][VISUAL_TEXT_COUNT] = {
-    { "Visual Overhaul", "Overhaul (F10)", "Anti-Aliasing", "Per-Pixel Lighting", "Reflections",
-      "Dynamic Shadows", "HDR Post-Process", "Draw Distance", "HD Textures", "Off" },
-    { "Graphismes HD", "Am\xe9liorations (F10)", "Anticr\xe9nelage", "\xc9" "clairage Pixel", "Reflets",
-      "Ombres dynamiques", "Post-traitement HDR", "Distance d'affichage", "Textures HD", "Non" },
-    { "Gr\xe1" "ficos HD", "Mejoras (F10)", "Antialiasing", "Iluminaci\xf3n Pixel", "Reflejos",
-      "Sombras din\xe1micas", "Posproceso HDR", "Distancia de visi\xf3n", "Texturas HD", "No" },
-    { "Grafica HD", "Miglioramenti (F10)", "Antialiasing", "Luce Per-Pixel", "Riflessi",
-      "Ombre dinamiche", "Post-processo HDR", "Distanza visiva", "Texture HD", "No" },
-    { "HD-Grafik", "Verbesserungen (F10)", "Kantengl\xe4ttung", "Per-Pixel-Licht", "Reflexionen",
-      "Dynamische Schatten", "HDR-Nachbearbeitung", "Sichtweite", "HD-Texturen", "Aus" },
-    { "Grafika HD", "Odswiezenie (F10)", "Antyaliasing (MSAA)", "Oswietlenie Per-Pixel", "Jakosc odbic",
-      "Cienie dynamiczne", "Post-processing HDR", "Zasieg rysowania", "Tekstury HD", "Wyl." },
+    { "Visual Overhaul", "Overhaul (F10)", "Anti-Aliasing", "Shading Model", "Reflections",
+      "Sun Shadows", "GTAO / SSAO", "FidelityFX CAS", "Wet & Atmo Fog", "A2C & Soft FX",
+      "HDR & Bloom", "Draw Distance", "HD Textures", "Off", "Phong", "PBR GGX", "1 CSM", "2 CSM" },
+    { "Graphismes HD", "Am\xe9liorations (F10)", "Anticr\xe9nelage", "\xc9" "clairage", "Reflets",
+      "Ombres Soleil", "GTAO / SSAO", "FidelityFX CAS", "Pluie & Brume", "A2C & Particules",
+      "HDR & Bloom", "Distance d'affichage", "Textures HD", "Non", "Phong", "PBR GGX", "1 CSM", "2 CSM" },
+    { "Gr\xe1" "ficos HD", "Mejoras (F10)", "Antialiasing", "Iluminaci\xf3n", "Reflejos",
+      "Sombras Sol", "GTAO / SSAO", "FidelityFX CAS", "Lluvia y Niebla", "A2C y Part\xed" "culas",
+      "HDR y Bloom", "Distancia de visi\xf3n", "Texturas HD", "No", "Phong", "PBR GGX", "1 CSM", "2 CSM" },
+    { "Grafica HD", "Miglioramenti (F10)", "Antialiasing", "Illuminazione", "Riflessi",
+      "Ombre Sole", "GTAO / SSAO", "FidelityFX CAS", "Pioggia e Nebbia", "A2C e Particelle",
+      "HDR e Bloom", "Distanza visiva", "Texture HD", "No", "Phong", "PBR GGX", "1 CSM", "2 CSM" },
+    { "HD-Grafik", "Verbesserungen (F10)", "Kantengl\xe4ttung", "Beleuchtung", "Reflexionen",
+      "Sonnenschatten", "GTAO / SSAO", "FidelityFX CAS", "N\xe4sse & Nebel", "A2C & Partikel",
+      "HDR & Bloom", "Sichtweite", "HD-Texturen", "Aus", "Phong", "PBR GGX", "1 CSM", "2 CSM" },
+    { "Grafika HD", "Odswiezenie (F10)", "Antyaliasing (MSAA)", "Cieniowanie", "Jakosc odbic",
+      "Cienie slonca", "GTAO / SSAO", "FidelityFX CAS", "Mokrosc i mgla", "A2C i Soft FX",
+      "HDR i Bloom", "Zasieg rysowania", "Tekstury HD", "Wyl.", "Phong", "PBR GGX", "1 CSM", "2 CSM" },
 };
 
 static const int g_visualMsaaValues[4] = { 1, 2, 4, 8 };
@@ -12197,9 +12215,19 @@ void FrontendMenu_EnterVisualOptions(Menu *pMenu, int param)
     pMenu->text = VisualOptions_Text(VISUAL_TEXT_TITLE);
     Menu_GetItem(pMenu, VISUAL_ITEM_MASTER)->max = Sys_IsVisualOverhaulEnabled() ? 0 : 1;
     Menu_GetItem(pMenu, VISUAL_ITEM_MSAA)->max = VisualOptions_IndexForInt(Sys_GetOption("video.msaa", 4), g_visualMsaaValues, 4);
-    Menu_GetItem(pMenu, VISUAL_ITEM_LIGHTING)->max = Sys_GetOption("video.per_pixel_lighting", 1) != 0 ? 0 : 1;
+    int perPixel = Sys_GetOption("video.per_pixel_lighting", 1) != 0;
+    int pbrOn = Sys_GetOption("video.pbr_shading", 1) != 0;
+    Menu_GetItem(pMenu, VISUAL_ITEM_LIGHTING)->max = !perPixel ? 0 : (pbrOn ? 2 : 1);
     Menu_GetItem(pMenu, VISUAL_ITEM_REFLECTIONS)->max = VisualOptions_IndexForInt(Sys_GetOption("video.cubemap_size", 256), g_visualCubeValues, 4);
-    Menu_GetItem(pMenu, VISUAL_ITEM_SHADOWS)->max = Sys_GetOption("video.shadow_map", 1) != 0 ? 0 : 1;
+    int shadowOn = Sys_GetOption("video.shadow_map", 1) != 0;
+    int shadowCasc = Sys_GetOption("video.shadow_cascades", 2);
+    Menu_GetItem(pMenu, VISUAL_ITEM_SHADOWS)->max = !shadowOn ? 0 : (shadowCasc >= 2 ? 2 : 1);
+    Menu_GetItem(pMenu, VISUAL_ITEM_SSAO)->max = Sys_GetOption("video.ssao", 1) != 0 ? 0 : 1;
+    Menu_GetItem(pMenu, VISUAL_ITEM_CAS)->max = Sys_GetOption("video.cas_sharpening", 1) != 0 ? 0 : 1;
+    int wetAtmo = Sys_GetOption("video.wet_surfaces", 1) != 0 || Sys_GetOption("video.atmospheric_fog", 1) != 0;
+    Menu_GetItem(pMenu, VISUAL_ITEM_WET_ATMO)->max = wetAtmo ? 0 : 1;
+    int softA2c = Sys_GetOption("video.alpha_to_coverage", 1) != 0 || Sys_GetOption("video.soft_particles", 1) != 0;
+    Menu_GetItem(pMenu, VISUAL_ITEM_SOFT_A2C)->max = softA2c ? 0 : 1;
     Menu_GetItem(pMenu, VISUAL_ITEM_POST)->max = Sys_GetOption("video.post_process", 1) != 0 ? 0 : 1;
     Menu_GetItem(pMenu, VISUAL_ITEM_DRAW_DIST)->max = VisualOptions_IndexForFloat(Sys_GetOptionFloat("video.draw_distance_scale", 1.4f), g_visualDrawDistValues, 6);
     Menu_GetItem(pMenu, VISUAL_ITEM_OVERRIDES)->max = Sys_GetOption("video.texture_overrides", 1) != 0 ? 0 : 1;
@@ -12223,9 +12251,11 @@ void FrontendMenu_ApplyVisualOptions(Menu *pMenu, MenuItem *pItem)
         Sys_SetOption("video.msaa", g_visualMsaaValues[value]);
     value = Menu_GetItem(pMenu, VISUAL_ITEM_LIGHTING)->max;
     if (value != g_visualOptionsShown[VISUAL_ITEM_LIGHTING]) {
-        int on = value == 0 ? 1 : 0;
-        Sys_SetOption("video.per_pixel_lighting", on);
-        Sys_SetOption("video.hemisphere_ambient", on);
+        int pp = value > 0 ? 1 : 0;
+        int pbr = value >= 2 ? 1 : 0;
+        Sys_SetOption("video.per_pixel_lighting", pp);
+        Sys_SetOption("video.hemisphere_ambient", pp);
+        Sys_SetOption("video.pbr_shading", pbr);
     }
     value = Menu_GetItem(pMenu, VISUAL_ITEM_REFLECTIONS)->max;
     if (value != g_visualOptionsShown[VISUAL_ITEM_REFLECTIONS] && value < 4) {
@@ -12234,8 +12264,29 @@ void FrontendMenu_ApplyVisualOptions(Menu *pMenu, MenuItem *pItem)
         Sys_SetOption("video.car_fresnel", size > 64 ? 1 : 0);
     }
     value = Menu_GetItem(pMenu, VISUAL_ITEM_SHADOWS)->max;
-    if (value != g_visualOptionsShown[VISUAL_ITEM_SHADOWS])
-        Sys_SetOption("video.shadow_map", value == 0 ? 1 : 0);
+    if (value != g_visualOptionsShown[VISUAL_ITEM_SHADOWS]) {
+        Sys_SetOption("video.shadow_map", value > 0 ? 1 : 0);
+        if (value > 0)
+            Sys_SetOption("video.shadow_cascades", value >= 2 ? 2 : 1);
+    }
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_SSAO)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_SSAO])
+        Sys_SetOption("video.ssao", value == 0 ? 1 : 0);
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_CAS)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_CAS])
+        Sys_SetOption("video.cas_sharpening", value == 0 ? 1 : 0);
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_WET_ATMO)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_WET_ATMO]) {
+        int on = value == 0 ? 1 : 0;
+        Sys_SetOption("video.wet_surfaces", on);
+        Sys_SetOption("video.atmospheric_fog", on);
+    }
+    value = Menu_GetItem(pMenu, VISUAL_ITEM_SOFT_A2C)->max;
+    if (value != g_visualOptionsShown[VISUAL_ITEM_SOFT_A2C]) {
+        int on = value == 0 ? 1 : 0;
+        Sys_SetOption("video.alpha_to_coverage", on);
+        Sys_SetOption("video.soft_particles", on);
+    }
     value = Menu_GetItem(pMenu, VISUAL_ITEM_POST)->max;
     if (value != g_visualOptionsShown[VISUAL_ITEM_POST])
         Sys_SetOption("video.post_process", value == 0 ? 1 : 0);
@@ -12266,7 +12317,8 @@ void FrontendMenu_DrawVisualOptions(Menu *pMenu)
     int i;
     int j;
 
-    rowH = (int)(g_pGraphics->resY * 32) / 480;
+    int rowPx = pMenu->itemCount > 10 ? 26 : 32;
+    rowH = (int)(g_pGraphics->resY * rowPx) / 480;
     rect[0] = (int)(g_pGraphics->resX * 100) / 640;
     rect[2] = CFrontend::m_pAr640ATexture->width;
     rect[3] = CFrontend::m_pAr640ATexture->height;
@@ -12301,7 +12353,7 @@ void FrontendMenu_DrawVisualOptions(Menu *pMenu)
                          CFrontend::m_pAr640DTexture, 1, 0, 0, NULL, pColour, 8);
         }
         x = (int)(g_pGraphics->resX * 122) / 640;
-        textY = (int)(g_pGraphics->resY * 21) / 480 + g_frontendDrawRect[1];
+        textY = (rowH * 21) / 32 + g_frontendDrawRect[1];
         switch (pItem->value) {
         case VISUAL_ITEM_MSAA:
             if (pItem->max == 0)
@@ -12312,24 +12364,42 @@ void FrontendMenu_DrawVisualOptions(Menu *pMenu)
                         g_visualMsaaValues[pItem->max < 4 ? pItem->max : 2]);
             Font_DrawText(1, CFrontend::m_stringDest, x, textY, (int *)pColour, 0x11);
             break;
+        case VISUAL_ITEM_LIGHTING: {
+            int modeTxt = pItem->max == 0 ? VISUAL_TEXT_OFF : (pItem->max == 1 ? VISUAL_TEXT_PHONG : VISUAL_TEXT_PBR);
+            sprintf(CFrontend::m_stringDest, "%s  < %s >", VisualOptions_Text(VISUAL_TEXT_LIGHTING),
+                    VisualOptions_Text(modeTxt));
+            Font_DrawText(1, CFrontend::m_stringDest, x, textY, (int *)pColour, 0x11);
+            break;
+        }
         case VISUAL_ITEM_REFLECTIONS:
             sprintf(CFrontend::m_stringDest, "%s  < %d >", VisualOptions_Text(VISUAL_TEXT_REFLECTIONS),
                     g_visualCubeValues[pItem->max < 4 ? pItem->max : 2]);
             Font_DrawText(1, CFrontend::m_stringDest, x, textY, (int *)pColour, 0x11);
             break;
+        case VISUAL_ITEM_SHADOWS: {
+            int shTxt = pItem->max == 0 ? VISUAL_TEXT_OFF : (pItem->max == 1 ? VISUAL_TEXT_CSM1 : VISUAL_TEXT_CSM2);
+            sprintf(CFrontend::m_stringDest, "%s  < %s >", VisualOptions_Text(VISUAL_TEXT_SHADOWS),
+                    VisualOptions_Text(shTxt));
+            Font_DrawText(1, CFrontend::m_stringDest, x, textY, (int *)pColour, 0x11);
+            break;
+        }
         case VISUAL_ITEM_DRAW_DIST:
             sprintf(CFrontend::m_stringDest, "%s  < %.1fx >", VisualOptions_Text(VISUAL_TEXT_DRAW_DIST),
                     g_visualDrawDistValues[pItem->max < 6 ? pItem->max : 2]);
             Font_DrawText(1, CFrontend::m_stringDest, x, textY, (int *)pColour, 0x11);
             break;
         case VISUAL_ITEM_MASTER:
-        case VISUAL_ITEM_LIGHTING:
-        case VISUAL_ITEM_SHADOWS:
+        case VISUAL_ITEM_SSAO:
+        case VISUAL_ITEM_CAS:
+        case VISUAL_ITEM_WET_ATMO:
+        case VISUAL_ITEM_SOFT_A2C:
         case VISUAL_ITEM_POST:
         case VISUAL_ITEM_OVERRIDES: {
             int txtId = pItem->value == VISUAL_ITEM_MASTER     ? VISUAL_TEXT_MASTER
-                        : pItem->value == VISUAL_ITEM_LIGHTING ? VISUAL_TEXT_LIGHTING
-                        : pItem->value == VISUAL_ITEM_SHADOWS  ? VISUAL_TEXT_SHADOWS
+                        : pItem->value == VISUAL_ITEM_SSAO     ? VISUAL_TEXT_SSAO
+                        : pItem->value == VISUAL_ITEM_CAS      ? VISUAL_TEXT_CAS
+                        : pItem->value == VISUAL_ITEM_WET_ATMO ? VISUAL_TEXT_WET_ATMO
+                        : pItem->value == VISUAL_ITEM_SOFT_A2C ? VISUAL_TEXT_SOFT_A2C
                         : pItem->value == VISUAL_ITEM_POST     ? VISUAL_TEXT_POST
                                                                : VISUAL_TEXT_OVERRIDES;
             strcpy(CFrontend::m_stringDest, VisualOptions_Text(txtId));
@@ -12542,9 +12612,13 @@ void FrontendMenu_BuildScreenOptions(void)
     Menu_Init(&g_visualOptionsMenu, VisualOptions_Text(VISUAL_TEXT_TITLE), -1, 0, &g_screenOptionsMenu, NULL, 1, 0, 1);
     Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_MASTER);
     Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 4, 0, 0, 0, 0, VISUAL_ITEM_MSAA);
-    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_LIGHTING);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 3, 0, 0, 0, 0, VISUAL_ITEM_LIGHTING);
     Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 4, 0, 0, 0, 0, VISUAL_ITEM_REFLECTIONS);
-    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_SHADOWS);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 3, 0, 0, 0, 0, VISUAL_ITEM_SHADOWS);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_SSAO);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_CAS);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_WET_ATMO);
+    Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_SOFT_A2C);
     Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_POST);
     Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 6, 0, 0, 0, 0, VISUAL_ITEM_DRAW_DIST);
     Menu_AddItemType3(&g_visualOptionsMenu, 0, -1, 2, 0, 0, 0, 0, VISUAL_ITEM_OVERRIDES);

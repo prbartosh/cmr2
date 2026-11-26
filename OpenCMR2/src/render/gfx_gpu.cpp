@@ -457,7 +457,7 @@ struct Executor : GfxExecutor {
     SDL_GPUTexture *backColorMsaa = nullptr, *backDepthMsaa = nullptr;
     SDL_GPUTexture *backdrop = nullptr;    // the copy of backColor the distance fade reads
     SDL_GPUTexture *hdrColor = nullptr, *hdrColorMsaa = nullptr, *hdrBackdrop = nullptr;
-    SDL_GPUTexture *hdrDepth = nullptr, *hdrDepthMsaa = nullptr;
+    SDL_GPUTexture *hdrDepth = nullptr, *hdrDepthMsaa = nullptr, *sceneDepthCopy = nullptr;
     SDL_GPUTexture *aoHalfA = nullptr, *aoHalfB = nullptr;
     SDL_GPUTexture *bloomHalfA = nullptr, *bloomHalfB = nullptr;
     SDL_GPUTexture *bloomQuarterA = nullptr, *bloomQuarterB = nullptr;
@@ -524,6 +524,7 @@ struct Executor : GfxExecutor {
         SDL_ReleaseGPUTexture(device, hdrBackdrop);
         SDL_ReleaseGPUTexture(device, hdrDepth);
         SDL_ReleaseGPUTexture(device, hdrDepthMsaa);
+        SDL_ReleaseGPUTexture(device, sceneDepthCopy);
         SDL_ReleaseGPUTexture(device, aoHalfA);
         SDL_ReleaseGPUTexture(device, aoHalfB);
         SDL_ReleaseGPUTexture(device, bloomHalfA);
@@ -672,7 +673,7 @@ struct Executor : GfxExecutor {
 
         vs3d = Shader(SHADER_CODE(fixed3d_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         vsTL = Shader(SHADER_CODE(fixedtl_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
-        fs = Shader(SHADER_CODE(fixed_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 10, 2);
+        fs = Shader(SHADER_CODE(fixed_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 11, 2);
         vsClear = Shader(SHADER_CODE(clear_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         fsClear = Shader(SHADER_CODE(clear_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1);
         if (!vs3d || !vsTL || !fs || !vsClear || !fsClear)
@@ -738,7 +739,7 @@ struct Executor : GfxExecutor {
                     aoFmtOk = true;
                 }
                 if (depthFmtOk && aoFmtOk) {
-                    fsMrt = Shader(SHADER_CODE(fixed_mrt_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 10, 2);
+                    fsMrt = Shader(SHADER_CODE(fixed_mrt_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 11, 2);
                     fsClearMrt = Shader(SHADER_CODE(clear_mrt_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1);
                     fsPostGtao = Shader(SHADER_CODE(post_gtao_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
                     fsPostAoBlur = Shader(SHADER_CODE(post_ao_blur_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
@@ -755,7 +756,7 @@ struct Executor : GfxExecutor {
                     }
                     if (postGtaoPipeline && postAoBlurPipeline) {
                         ssaoSupported = true;
-                        Sys_Log("gfx: Half-res GTAO + bilateral blur enabled");
+                        Sys_Log("gfx: Half-res GTAO + bilateral blur + Soft Particles + A2C enabled");
                     }
                 }
             } else {
@@ -873,6 +874,7 @@ struct Executor : GfxExecutor {
             SDL_ReleaseGPUTexture(device, hdrBackdrop);
             SDL_ReleaseGPUTexture(device, hdrDepth);
             SDL_ReleaseGPUTexture(device, hdrDepthMsaa);
+            SDL_ReleaseGPUTexture(device, sceneDepthCopy);
             SDL_ReleaseGPUTexture(device, aoHalfA);
             SDL_ReleaseGPUTexture(device, aoHalfB);
             SDL_ReleaseGPUTexture(device, bloomHalfA);
@@ -882,7 +884,7 @@ struct Executor : GfxExecutor {
             backColorMsaa = nullptr;
             backDepthMsaa = nullptr;
             hdrColor = hdrColorMsaa = hdrBackdrop = nullptr;
-            hdrDepth = hdrDepthMsaa = aoHalfA = aoHalfB = nullptr;
+            hdrDepth = hdrDepthMsaa = sceneDepthCopy = aoHalfA = aoHalfB = nullptr;
             bloomHalfA = bloomHalfB = bloomQuarterA = bloomQuarterB = nullptr;
             backColor = CreateTexture(SDL_GPU_TEXTURETYPE_2D, colorFormat, width, height, 1, 1,
                                       SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
@@ -941,6 +943,8 @@ struct Executor : GfxExecutor {
                 } else if (ssaoSupported) {
                     hdrDepth = CreateTexture(SDL_GPU_TEXTURETYPE_2D, linearDepthFormat, width, height, 1, 1,
                                              SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+                    sceneDepthCopy = CreateTexture(SDL_GPU_TEXTURETYPE_2D, linearDepthFormat, width, height, 1, 1,
+                                                   SDL_GPU_TEXTUREUSAGE_SAMPLER);
                     aoHalfA = CreateTexture(SDL_GPU_TEXTURETYPE_2D, aoFormat, bloomHalfW, bloomHalfH, 1, 1,
                                             SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
                     aoHalfB = CreateTexture(SDL_GPU_TEXTURETYPE_2D, aoFormat, bloomHalfW, bloomHalfH, 1, 1,
@@ -951,12 +955,13 @@ struct Executor : GfxExecutor {
                     }
                     bool msaaMismatch = (hdrMsaaSamples != SDL_GPU_SAMPLECOUNT_1 && hdrColorMsaa != NULL &&
                                          hdrDepthMsaa == NULL);
-                    if (!hdrDepth || !aoHalfA || !aoHalfB || msaaMismatch) {
+                    if (!hdrDepth || !sceneDepthCopy || !aoHalfA || !aoHalfB || msaaMismatch) {
                         SDL_ReleaseGPUTexture(device, hdrDepth);
                         SDL_ReleaseGPUTexture(device, hdrDepthMsaa);
+                        SDL_ReleaseGPUTexture(device, sceneDepthCopy);
                         SDL_ReleaseGPUTexture(device, aoHalfA);
                         SDL_ReleaseGPUTexture(device, aoHalfB);
-                        hdrDepth = hdrDepthMsaa = aoHalfA = aoHalfB = nullptr;
+                        hdrDepth = hdrDepthMsaa = sceneDepthCopy = aoHalfA = aoHalfB = nullptr;
                         ssaoSupported = false;
                     }
                 }
@@ -1387,14 +1392,14 @@ struct Executor : GfxExecutor {
     // A draw's pipeline: everything of it the state can change.
     static uint32_t PipelineKey(const GfxCommand &cmd, const GfxDrawState &s,
                                 SDL_GPUSampleCount samples = SDL_GPU_SAMPLECOUNT_1, bool hdr = false,
-                                bool mrtDepth = false)
+                                bool mrtDepth = false, bool alphaToCoverage = false)
     {
         bool depthTest = s.depthTest;
         return (cmd.transformed ? 1u : 0u) | (uint32_t)(cmd.primitive & 7) << 1 | (s.alphaBlend ? 1u : 0u) << 4 |
                (uint32_t)(s.srcBlend & 15) << 5 | (uint32_t)(s.destBlend & 15) << 9 | (depthTest ? 1u : 0u) << 13 |
                ((depthTest && s.depthWrite) ? 1u : 0u) << 14 | (uint32_t)(s.depthFunc & 15) << 15 |
                (uint32_t)(s.cull & 3) << 19 | (uint32_t)(samples & 3) << 21 | (hdr ? 1u : 0u) << 23 |
-               (mrtDepth ? 1u : 0u) << 24;
+               (mrtDepth ? 1u : 0u) << 24 | (alphaToCoverage ? 1u : 0u) << 25;
     }
 
     SDL_GPUGraphicsPipeline *Pipeline(uint32_t key)
@@ -1409,6 +1414,7 @@ struct Executor : GfxExecutor {
         SDL_GPUSampleCount samples = (SDL_GPUSampleCount)((key >> 21) & 3);
         bool hdr = (key >> 23 & 1) != 0;
         bool mrtDepth = (key >> 24 & 1) != 0;
+        bool alphaToCoverage = (key >> 25 & 1) != 0;
 
         SDL_GPUVertexBufferDescription vb = {};
         vb.slot = 0;
@@ -1469,6 +1475,7 @@ struct Executor : GfxExecutor {
         info.depth_stencil_state.enable_depth_write = depthTest && depthWrite;
         info.depth_stencil_state.compare_op = CompareOp(depthFunc);
         info.multisample_state.sample_count = samples;
+        info.multisample_state.enable_alpha_to_coverage = alphaToCoverage && (samples != SDL_GPU_SAMPLECOUNT_1);
         info.target_info.color_target_descriptions = targets;
         info.target_info.num_color_targets = mrtDepth ? 2 : 1;
         info.target_info.depth_stencil_format = depthFormat;
@@ -1773,6 +1780,7 @@ struct Executor : GfxExecutor {
     // fade: the draw is a 3D one into the back buffer, which the distance
     // fade applies to.
     void FillFragmentUniforms(const GfxDrawState &s, bool fade, bool hdr, bool materialMaps, bool receiveShadows,
+                              bool alphaToCoverage, float softParticleRange, int targetW, int targetH,
                               FragmentUniforms &u)
     {
         memset(&u, 0, sizeof(u));
@@ -1794,12 +1802,15 @@ struct Executor : GfxExecutor {
         u.stage1b[2] = TextureKind(b);
         u.stage1b[3] = ScaledPoint(b);
         Color(s.textureFactor, u.textureFactor);
-        u.alphaTest[0] = s.alphaTest;
+        u.alphaTest[0] = alphaToCoverage ? 2 : (s.alphaTest ? 1 : 0);
         u.alphaTest[1] = s.alphaFunc;
         GfxTexture *root0 = a.texture != NULL && a.texture->cube != NULL ? a.texture->cube : a.texture;
         u.alphaTest[2] = (materialMaps && root0 != NULL && root0->normalMap != NULL) ? 1 : 0;
         u.alphaTest[3] = (materialMaps && root0 != NULL && root0->specularMap != NULL) ? 1 : 0;
         u.alphaRef[0] = (s.alphaRef & 0xff) / 255.0f;
+        u.alphaRef[1] = softParticleRange;
+        u.alphaRef[2] = targetW > 0 ? 1.0f / (float)targetW : 0.0f;
+        u.alphaRef[3] = targetH > 0 ? 1.0f / (float)targetH : 0.0f;
         Color(s.fogColor, u.fogColor);
         u.fogMode[0] = s.fog;
         u.fogMode[1] = s.fogTableMode;
@@ -1819,9 +1830,9 @@ struct Executor : GfxExecutor {
         u.distanceFade[3] = 0.85f;
     }
 
-    // The stages' textures (2D and cube for each), backdrop, native icons, material maps, and shadow map.
-    void TextureBindings(const GfxDrawState &s, bool is3D, bool hdr, bool materialMaps,
-                         SDL_GPUTextureSamplerBinding bindings[10])
+    // The stages' textures (2D and cube for each), backdrop, native icons, material maps, shadow map, and scene depth.
+    void TextureBindings(const GfxDrawState &s, bool is3D, bool hdr, bool materialMaps, bool bindSoftDepth,
+                         SDL_GPUTextureSamplerBinding bindings[11])
     {
         bool overhaul = Platform_IsVisualOverhaulEnabled();
         SDL_GPUSampler *stage0Sampler = NULL;
@@ -1881,6 +1892,8 @@ struct Executor : GfxExecutor {
         bindings[8] = { (specGpu != NULL && specGpu->texture != NULL) ? specGpu->texture : white2D, matSampler };
         bindings[9] = { shadowMap != NULL ? shadowMap : white2D,
                         shadowSampler != NULL ? shadowSampler : Sampler(GfxStageState()) };
+        bindings[10] = { (bindSoftDepth && sceneDepthCopy != NULL) ? sceneDepthCopy : white2D,
+                         depthSampler != NULL ? depthSampler : Sampler(GfxStageState()) };
     }
 
     // What a render pass has bound: each draw sets only what differs from the
@@ -1890,7 +1903,7 @@ struct Executor : GfxExecutor {
         bool viewportSet = false, texturesSet = false, indicesSet = false;
         SDL_GPUViewport viewport = {};
         SDL_Rect scissor = {};
-        SDL_GPUTextureSamplerBinding textures[10] = {};
+        SDL_GPUTextureSamplerBinding textures[11] = {};
         SDL_GPUBuffer *vertices = nullptr;
     };
 
@@ -2558,10 +2571,15 @@ struct Executor : GfxExecutor {
         const bool casOn = overhaul && Platform_GetSettingInt("video.cas_sharpening", 1) != 0;
         const float casStrength =
             casOn ? std::clamp(Platform_GetSettingFloat("video.cas_strength", 0.40f), 0.0f, 1.0f) : 0.0f;
+        const bool alphaToCoverageOn = overhaul && Platform_GetSettingInt("video.alpha_to_coverage", 1) != 0;
+        const bool softParticlesOn = overhaul && ssaoSupported && hdrDepth != NULL && sceneDepthCopy != NULL &&
+                                     Platform_GetSettingInt("video.soft_particles", 1) != 0;
         const bool postEnabled = overhaul && hdrSupported && hdrColor != NULL &&
                                  Platform_GetSettingInt("video.post_process", 1) != 0 && last3D != SIZE_MAX &&
-                                 (toneMap || bloomIntensity > 0.0f || ssaoStrength > 0.001f || casStrength > 0.001f);
-        const bool useMrtDepth = postEnabled && ssaoOn && ssaoStrength > 0.001f && foundMainProj;
+                                 (toneMap || bloomIntensity > 0.0f || ssaoStrength > 0.001f || casStrength > 0.001f ||
+                                  softParticlesOn);
+        const bool useMrtDepth =
+            postEnabled && hdrDepth != NULL && ((ssaoOn && ssaoStrength > 0.001f && foundMainProj) || softParticlesOn);
         SDL_GPUSampleCount backSamples =
             (msaaSamples != SDL_GPU_SAMPLECOUNT_1 && backColorMsaa != NULL && overhaul)
                 ? msaaSamples
@@ -2576,6 +2594,7 @@ struct Executor : GfxExecutor {
             fragmentUniformsSet = false;
             bool inHdr3D = (phase == 1 && postEnabled);
             bool hdrDepthCleared = false;
+            bool depthSnapshotTaken = false;
             for (size_t i = 0; i < frame.commands.size(); i++) {
                 const GfxCommand &c = frame.commands[i];
                 if (c.type == GFX_CMD_TARGET) {
@@ -2651,7 +2670,33 @@ struct Executor : GfxExecutor {
                     continue;
                 }
                 const GfxDrawState &s = frame.states[c.state];
-                SDL_GPUGraphicsPipeline *pipeline = Pipeline(PipelineKey(c, s, passSamples, inHdr3D, passMrtDepth));
+                // Stage 14: Snapshot resolved linear depth once before the first soft-particle draw.
+                const bool isSoftParticle = passMrtDepth && softParticlesOn && !c.transformed && s.alphaBlend &&
+                                            s.depthTest && !s.depthWrite && !s.alphaTest &&
+                                            (backdropIndex == SIZE_MAX || i > backdropIndex);
+                if (isSoftParticle && !depthSnapshotTaken && hdrDepthCleared && sceneDepthCopy != NULL) {
+                    if (pass != NULL) {
+                        SDL_EndGPURenderPass(pass);
+                        pass = NULL;
+                    }
+                    SDL_GPUCopyPass *dcopy = SDL_BeginGPUCopyPass(cmd);
+                    SDL_GPUTextureLocation dsrc = {}, ddst = {};
+                    dsrc.texture = hdrDepth;
+                    ddst.texture = sceneDepthCopy;
+                    SDL_CopyGPUTextureToTexture(dcopy, &dsrc, &ddst, backWidth, backHeight, 1, false);
+                    SDL_EndGPUCopyPass(dcopy);
+                    depthSnapshotTaken = true;
+                    size_t clearedIgnored;
+                    pass = BeginPass(cmd, target, passSamples, inHdr3D, passMrtDepth, hdrDepthCleared, targetW, targetH,
+                                     frame.commands, i, &clearedIgnored);
+                    passTarget = target;
+                    bound = PassBindings();
+                }
+                const bool drawA2C = alphaToCoverageOn && passSamples != SDL_GPU_SAMPLECOUNT_1 && !c.transformed &&
+                                     !s.alphaBlend && s.alphaTest && s.depthTest && s.depthWrite &&
+                                     (s.alphaFunc == GFX_CMP_GREATER || s.alphaFunc == GFX_CMP_GREATEREQUAL);
+                SDL_GPUGraphicsPipeline *pipeline =
+                    Pipeline(PipelineKey(c, s, passSamples, inHdr3D, passMrtDepth, drawA2C));
                 if (pipeline == NULL)
                     continue;
                 if (pipeline != bound.pipeline) {
@@ -2688,18 +2733,23 @@ struct Executor : GfxExecutor {
                 const bool receiveShadows = shadowActive && target == NULL && !c.transformed && s.depthTest &&
                                             !(s.alphaBlend && s.destBlend == GFX_BLEND_ONE) &&
                                             (backdropIndex == SIZE_MAX || i > backdropIndex);
+                const float softRange = (isSoftParticle && depthSnapshotTaken)
+                                            ? (s.destBlend == GFX_BLEND_ONE ? -0.65f : 0.65f)
+                                            : 0.0f;
                 FragmentUniforms fu;
                 FillFragmentUniforms(s, target == NULL && !c.transformed, inHdr3D && !c.transformed,
-                                     materialMaps && !c.transformed, receiveShadows, fu);
+                                     materialMaps && !c.transformed, receiveShadows, drawA2C, softRange, targetW,
+                                     targetH, fu);
                 if (!fragmentUniformsSet || memcmp(&fu, &fragmentUniforms, sizeof(fu)) != 0) {
                     SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
                     fragmentUniforms = fu;
                     fragmentUniformsSet = true;
                 }
-                SDL_GPUTextureSamplerBinding textures[10];
-                TextureBindings(s, !c.transformed, inHdr3D, materialMaps && !c.transformed, textures);
+                SDL_GPUTextureSamplerBinding textures[11];
+                TextureBindings(s, !c.transformed, inHdr3D, materialMaps && !c.transformed,
+                                isSoftParticle && depthSnapshotTaken, textures);
                 if (!bound.texturesSet || memcmp(textures, bound.textures, sizeof(textures)) != 0) {
-                    SDL_BindGPUFragmentSamplers(pass, 0, textures, 10);
+                    SDL_BindGPUFragmentSamplers(pass, 0, textures, 11);
                     memcpy(bound.textures, textures, sizeof(textures));
                     bound.texturesSet = true;
                 }
@@ -2726,8 +2776,8 @@ struct Executor : GfxExecutor {
                         EndPass(cmd, pass, passTarget);
                         pass = NULL;
                     }
-                    RunPostProcess(cmd, toneMap, bloomOn, bloomIntensity, useMrtDepth, ssaoStrength, casOn, casStrength,
-                                   mainCamProj, foundMainProj);
+                    RunPostProcess(cmd, toneMap, bloomOn, bloomIntensity, ssaoOn && useMrtDepth, ssaoStrength, casOn,
+                                   casStrength, mainCamProj, foundMainProj);
                     vertexUniformState = NULL;
                     fragmentUniformsSet = false;
                     inHdr3D = false;

@@ -26,6 +26,7 @@ layout(set = 2, binding = 6) uniform sampler2D native1;
 layout(set = 2, binding = 7) uniform sampler2D normalMap0;
 layout(set = 2, binding = 8) uniform sampler2D specMap0;
 layout(set = 2, binding = 9) uniform sampler2D shadowMapTex;
+layout(set = 2, binding = 10) uniform sampler2D sceneDepthTex;
 
 layout(std140, set = 3, binding = 0) uniform FragmentUniforms {
     ivec4 stage0;       // colour op, colour arg1, colour arg2, alpha op
@@ -697,8 +698,16 @@ void main()
         current.rgb = fogMode.w != 0 ? clamp(current.rgb + clearcoatSpec, 0.0, 4.0)
                                      : clamp(current.rgb + clearcoatSpec, 0.0, 1.0);
 
-    if (alphaTest.x != 0 && !Compare(alphaTest.y, floor(current.a * 255.0 + 0.5), floor(alphaRef.x * 255.0 + 0.5)))
+    if (alphaTest.x == 2) {
+        // Stage 14: Hardware Alpha-to-Coverage MSAA for foliage, trees, and fences.
+        // Rescale alpha around alphaRef using screen-space derivative so silhouettes stay crisp at all mips.
+        float fw = max(fwidth(current.a), 0.0001);
+        current.a = clamp((current.a - alphaRef.x) / max(fw, 0.22) + 0.5, 0.0, 1.0);
+        if (current.a < 0.02)
+            discard;
+    } else if (alphaTest.x != 0 && !Compare(alphaTest.y, floor(current.a * 255.0 + 0.5), floor(alphaRef.x * 255.0 + 0.5))) {
         discard;
+    }
 
     // Apply real-time sun shadows to vertex-lit 3D scenery (track/terrain sectors).
     if (lightFlags.x == 0 && shadowParams.x > 0.5 && fogParams.z > 0.5 && enhanceParams.w > 0.5) {
@@ -754,6 +763,20 @@ void main()
         if (f > 0.0)
             current.rgb = mix(current.rgb, texelFetch(backdrop, ivec2(gl_FragCoord.xy), 0).rgb, f);
     }
+    // Stage 14: Soft Particles — smoothly feather dust/smoke/snow intersections against 3D scene depth.
+    if (enhanceParams.w > 0.5 && abs(alphaRef.y) > 0.001) {
+        vec2 spUV = clamp(gl_FragCoord.xy * alphaRef.zw, vec2(0.0), vec2(1.0));
+        float sceneZ = texture(sceneDepthTex, spUV).r;
+        if (sceneZ > 0.05 && sceneZ < 5000.0) {
+            float depthDelta = sceneZ - inEyeDepth;
+            float softFade = smoothstep(0.0, abs(alphaRef.y), depthDelta);
+            if (alphaRef.y < 0.0)
+                current.rgb *= softFade;
+            else
+                current.a *= softFade;
+        }
+    }
+
     outColor = current;
 #ifdef OPENCMR2_MRT_DEPTH
     outLinearDepth = inEyeDepth;
