@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "FrontendMenus.h"
+#include "FrontendJoinCode.h"
 #include "InstallInfo.h"
 #include "Sprite.h"
 #include "RegKey.h"
@@ -1481,6 +1482,7 @@ void FrontendMenu_BuildPagesAndSelectInitial(BYTE param1, BYTE back)
     FrontendMenu_BuildNetworkExtendedStageSetup();
     FrontendMenu_BuildNetworkMessage();
     FrontendMenu_BuildJoinPasswordEntry();
+    FrontendJoinCode_BuildMenu();
     FrontendMenu_BuildNetworkLeaderboard();
     FrontendMenu_BuildOptions();
     FrontendMenu_BuildGameOptions();
@@ -2093,6 +2095,7 @@ void FrontendMenu_EnterNetworkSessionBrowser(Menu *pMenu, char param)
     g_unk0x0081901c = 0;
     g_unk0x00819020 = 0;
     pMenu->items[0].id = 0x1ff;
+    FrontendJoinCode_LabelBrowserItem(pMenu);
     if (param == 0) {
         g_unk0x00818d04 = 0;
         return;
@@ -12064,6 +12067,7 @@ void FrontendMenu_DrawNetworkSessionSetup(Menu *pMenu)
         i = next;
         pItem++;
     }
+    FrontendJoinCode_DrawHostCode();
     FrontendDraw_Carousel(FrontendMenu_GetMain(), 0, NULL);
 }
 

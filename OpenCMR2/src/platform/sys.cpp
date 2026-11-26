@@ -452,7 +452,13 @@ const char s_defaultSettings[] =
     "; Also look at the Tailscale machines that are online (auto, 1 or 0).\n"
     "; tailscale = auto\n"
     "; Look on the local network.\n"
-    "; broadcast = 1\n";
+    "; broadcast = 1\n"
+    "; Server for join codes, with :port when not the default 28630\n"
+    "; (lobby = lobby.example.org:28630).\n"
+    "; lobby =\n"
+    "; Through the lobby's relay when a direct connection fails (auto),\n"
+    "; for every game (always) or never.\n"
+    "; relay = auto\n";
 
 std::string MissingGameData(const std::string &dir)
 {
@@ -962,8 +968,23 @@ int ToWindows1252(Uint32 cp)
     return 0;
 }
 
+std::string Utf8FromWindows1252(const std::string &text)
+{
+    std::string utf8;
+    for (unsigned char c : text) {
+        Uint32 cp = c >= 0x80 && c < 0xa0 ? kWindows1252High[c - 0x80] : c;
+        char bytes[5] = {};
+        if (cp != 0)
+            utf8 += std::string(bytes, SDL_UCS4ToUTF8(cp, bytes) - bytes);
+    }
+    return utf8;
+}
+
 // Text input can carry several characters; they are handed out one by one.
 std::vector<int> s_pendingText;
+bool s_pasteSwallow;
+
+void PasteClipboard();
 
 bool RunInBackground()
 {
@@ -994,6 +1015,7 @@ bool Translate(const SDL_Event &e, SysEvent *out)
         out->type = SYS_EVENT_RESTORED;
         return !RunInBackground();
     case SDL_EVENT_KEY_DOWN:
+        s_pasteSwallow = false;
         // Alt+Enter switches between fullscreen and a window. The game reads
         // the keyboard state too, so Enter is hidden from it until released
         // (it would also confirm the menu entry).
@@ -1021,7 +1043,12 @@ bool Translate(const SDL_Event &e, SysEvent *out)
         // which its text entries read: Backspace deletes, Enter sends the
         // chat line and Escape leaves it.
         if (s_window != NULL && SDL_TextInputActive(s_window)) {
-            if (e.key.scancode == SDL_SCANCODE_BACKSPACE)
+            if (e.key.key == SDLK_V && (e.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0 &&
+                (e.key.mod & SDL_KMOD_ALT) == 0) {
+                if (!e.key.repeat)
+                    PasteClipboard();
+                s_pasteSwallow = true;
+            } else if (e.key.scancode == SDL_SCANCODE_BACKSPACE)
                 s_pendingText.push_back(8);
             else if (e.key.scancode == SDL_SCANCODE_RETURN || e.key.scancode == SDL_SCANCODE_KP_ENTER)
                 s_pendingText.push_back(13);
@@ -1035,6 +1062,11 @@ bool Translate(const SDL_Event &e, SysEvent *out)
     case SDL_EVENT_TEXT_INPUT: {
         const char *text = e.text.text;
         Uint32 cp;
+        if (s_pasteSwallow) {
+            s_pasteSwallow = false;
+            if (text[0] != 0 && text[1] == 0 && (text[0] == 'v' || text[0] == 'V' || (unsigned char)text[0] < 0x20))
+                return false;
+        }
         while ((cp = SDL_StepUTF8(&text, NULL)) != 0) {
             int c = ToWindows1252(cp);
             if (c != 0)
@@ -1067,6 +1099,26 @@ bool TakePendingText(SysEvent *out)
 Uint64 s_textInputUntil;
 bool s_entryOffered;        // the entry waits to be chosen (Sys_OfferTextInput)
 bool s_textGiven;           // a character went to the game in this round of polls
+
+void PasteClipboard()
+{
+    if (SDL_GetTicks() >= s_textInputUntil || !SDL_HasClipboardText())
+        return;
+    char *text = SDL_GetClipboardText();
+    if (text == NULL)
+        return;
+    const char *p = text;
+    Uint32 cp;
+    int count = 0;
+    while (count < 64 && (cp = SDL_StepUTF8(&p, NULL)) != 0) {
+        int c = ToWindows1252(cp);
+        if (c >= 0x20 && c != 0x7f) {
+            s_pendingText.push_back(c);
+            count++;
+        }
+    }
+    SDL_free(text);
+}
 
 #ifdef __ANDROID__
 // Android without a physical keyboard: the entry is edited in a text bar
@@ -1113,18 +1165,6 @@ bool AndroidCall(const char *name, const char *signature, ...)
     env->DeleteLocalRef(type);
     env->DeleteLocalRef(activity);
     return result;
-}
-
-std::string Utf8FromWindows1252(const std::string &text)
-{
-    std::string utf8;
-    for (unsigned char c : text) {
-        Uint32 cp = c >= 0x80 && c < 0xa0 ? kWindows1252High[c - 0x80] : c;
-        char bytes[5] = {};
-        if (cp != 0)
-            utf8 += std::string(bytes, SDL_UCS4ToUTF8(cp, bytes) - bytes);
-    }
-    return utf8;
 }
 
 void OpenTextBar()
@@ -1320,6 +1360,37 @@ extern "C" int Sys_WaitEvent(SysEvent *event)
             return 1;
     }
     return 0;
+}
+
+extern "C" int Sys_GetClipboardText(char *buffer, int size)
+{
+    if (buffer == NULL || size <= 0)
+        return 0;
+    buffer[0] = 0;
+    if (!SDL_HasClipboardText())
+        return 0;
+    char *text = SDL_GetClipboardText();
+    if (text == NULL)
+        return 0;
+    const char *p = text;
+    Uint32 cp;
+    int length = 0;
+    while (length < size - 1 && (cp = SDL_StepUTF8(&p, NULL)) != 0) {
+        int c = ToWindows1252(cp);
+        if (c != 0)
+            buffer[length++] = (char)c;
+    }
+    buffer[length] = 0;
+    SDL_free(text);
+    return length;
+}
+
+extern "C" void Sys_SetClipboardText(const char *text)
+{
+    if (text == NULL)
+        return;
+    if (!SDL_SetClipboardText(Utf8FromWindows1252(text).c_str()))
+        Sys_Log("SDL_SetClipboardText failed: %s", SDL_GetError());
 }
 
 // ---- window ----------------------------------------------------------------------
