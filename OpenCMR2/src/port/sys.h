@@ -72,6 +72,9 @@ void Sys_RequestTextInput(const char *label, const char *text, int maxLength);
    lobby's chat line): typed into, but neither keyboard nor text bar opens by
    itself; Android shows a chip that opens the bar. */
 void Sys_OfferTextInput(const char *label, const char *text, int maxLength);
+int Sys_GetClipboardText(char *buffer, int size);
+BOOL Sys_SetClipboardText(const char *text);
+int Sys_GetPasteCount(int *injectedTotal);
 
 /* ---- window ---- */
 

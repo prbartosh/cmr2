@@ -1,0 +1,8 @@
+*
+!third_party/enet
+!src/net
+!src/port/net.h
+!src/port/types.h
+!src/lobby
+!tools/nat_test/code_client.cpp
+!tools/nat_test/router.sh

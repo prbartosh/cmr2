@@ -21,12 +21,16 @@
 // for its own players; everything read from the network is bounds-checked.
 
 #include "net/net_session.h"
+#include "net/join_code.h"
 #include "net/net_wire.h"
 
 #include "net/enet_platform.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
@@ -66,7 +70,11 @@ const size_t kMaxMachines = 16;
 const size_t kMaxInbox = 16384;
 const uint32_t kBrowseIdleMs = 3000;        // the search stops when the game stops asking
 const uint32_t kQueryIntervalMs = 1000;
+const uint32_t kFastQueryIntervalMs = 250;
+const uint32_t kLobbyRetryMs = 5000;
+const uint32_t kLobbyRefreshMs = 600000;
 const uint32_t kSessionExpiryMs = 4000;
+const size_t kMaxFound = 64;
 const uint32_t kResolveIntervalMs = 30000;
 const uint32_t kPendingPeerMs = 5000;       // a connection must JOIN or RESUME within this
 const uint32_t kRejectGraceMs = 1000;       // a rejected one must hang up within this
@@ -82,11 +90,6 @@ uint32_t NowMs()
     return (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
                .count() +
            1;
-}
-
-bool Elapsed(uint32_t now, uint32_t since, uint32_t ms)
-{
-    return (uint32_t)(now - since) >= ms;
 }
 
 std::string GuidKey(const NetGuid &g)
@@ -163,6 +166,90 @@ void SendRaw(ENetHost *host, uint32_t address, uint16_t port, const std::vector<
     enet_socket_send(host->socket, &to, &buffer, 1);
 }
 
+std::vector<uint8_t> ReplyPacket(uint32_t nonce, const NetSessionDesc &d, uint32_t currentPlayers,
+                                 const std::string &name, bool passwordRequired)
+{
+    Writer w;
+    w.Bytes(kMagic, 4);
+    w.U8(kReply);
+    w.U8(kProtocol);
+    w.U32(nonce);
+    WriteDesc(w, d, currentPlayers, name, std::string());
+    w.U8(passwordRequired ? 1 : 0);
+    return w.data;
+}
+
+size_t MaxReplySize()
+{
+    static const size_t size = ReplyPacket(0, NetSessionDesc(), 0, std::string(kMaxText, ' '), true).size();
+    return size;
+}
+
+bool ParsePort(const char *text, uint16_t *port)
+{
+    if (!isdigit((unsigned char)text[0]))
+        return false;
+    char *end = nullptr;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno != 0 || *end != '\0' || value == 0 || value > 65535)
+        return false;
+    *port = (uint16_t)value;
+    return true;
+}
+
+enum class LobbyResult { Resolved, Unresolved, Invalid };
+
+struct LobbyLookup {
+    LobbyResult result = LobbyResult::Unresolved;
+    lobby::Endpoint lobbyAt;
+    lobby::Endpoint local;
+};
+
+LobbyLookup LookUpLobby(const std::string &setting, uint16_t localPort,
+                        bool (*resolveHost)(const char *name, uint32_t *address))
+{
+    LobbyLookup lookup;
+    std::string name = setting;
+    uint16_t port = lobby::kDefaultPort;
+    size_t colon = name.rfind(':');
+    if (colon != std::string::npos) {
+        if (!ParsePort(name.c_str() + colon + 1, &port)) {
+            lookup.result = LobbyResult::Invalid;
+            return lookup;
+        }
+        name.resize(colon);
+    }
+    if (name.empty()) {
+        lookup.result = LobbyResult::Invalid;
+        return lookup;
+    }
+    ENetAddress address;
+    if (enet_address_set_host_ip(&address, name.c_str()) != 0) {
+        bool resolved = resolveHost != nullptr ? resolveHost(name.c_str(), &address.host)
+                                               : enet_address_set_host(&address, name.c_str()) == 0;
+        if (!resolved)
+            return lookup;
+    }
+    if (address.host == 0)
+        return lookup;
+    address.port = port;
+    lookup.result = LobbyResult::Resolved;
+    lookup.lobbyAt.address = address.host;
+    lookup.lobbyAt.port = port;
+    ENetSocket probe = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
+    if (probe != (ENetSocket)-1) {
+        ENetAddress mine;
+        if (enet_socket_connect(probe, &address) == 0 && enet_socket_get_address(probe, &mine) == 0 &&
+            mine.host != 0 && !IsLoopbackAddress(mine.host)) {
+            lookup.local.address = mine.host;
+            lookup.local.port = localPort;
+        }
+        enet_socket_destroy(probe);
+    }
+    return lookup;
+}
+
 } // namespace
 
 // ---- players and the roster ------------------------------------------------------------
@@ -192,7 +279,14 @@ bool ReadPlayer(Reader &r, Player &p)
 
 } // namespace
 
-Session::Session(const Config &config) : config(config)
+Session::Session(const Config &config)
+    : config(config),
+      rendezvous(
+          [this](const lobby::Endpoint &to, const std::vector<uint8_t> &data) {
+              if (host != nullptr)
+                  SendRaw(host, to.address, to.port, data);
+          },
+          config.relay, rng)
 {
     std::random_device device;
     rng.seed(((uint64_t)device() << 32) ^ device());
@@ -204,6 +298,7 @@ Session::~Session()
     running = false;
     if (thread.joinable())
         thread.join();
+    StopResolver();
     std::lock_guard<std::mutex> lock(mutex);
     if (host != nullptr) {
         enet_host_flush(host);
@@ -248,6 +343,7 @@ HRESULT Session::Start()
     LOG("net: UDP port %u", (unsigned)boundPort);
     running = true;
     thread = std::thread(&Session::Run, this);
+    StartResolver();
     return NET_OK;
 }
 
@@ -256,7 +352,9 @@ void Session::Abandon()
     running = false;
     if (thread.joinable())
         thread.join();
+    StopResolver();
     std::lock_guard<std::mutex> lock(mutex);
+    rendezvous.StopHosting(false);
     if (host != nullptr) {
         enet_host_destroy(host);    // resets every peer without a word
         host = nullptr;
@@ -281,9 +379,72 @@ void Session::Run()
                 resolving = true;
                 resolve = true;
             }
+            if (!config.lobby.empty() && rendezvous.NeedsLobby() && !lobbyResolving &&
+                (lastLobbyResolve == 0 ||
+                 Elapsed(now, lastLobbyResolve,
+                         lobbyResolved && !rendezvous.LobbyUnreachable() ? kLobbyRefreshMs : kLobbyRetryMs))) {
+                lobbyResolving = true;
+                lobbyRequested = true;
+                resolverWake.notify_one();
+            }
         }
         if (resolve)
             ResolvePeers();
+    }
+}
+
+void Session::StartResolver()
+{
+    if (config.lobby.empty() || resolver.joinable())
+        return;
+    resolverStop = false;
+    resolver = std::thread(&Session::ResolveLoop, this);
+}
+
+void Session::StopResolver()
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        resolverStop = true;
+        lobbyRequested = false;
+        lobbyResolving = false;
+    }
+    resolverWake.notify_all();
+    if (resolver.joinable())
+        resolver.join();
+}
+
+void Session::ResolveLoop()
+{
+    std::unique_lock<std::mutex> lock(mutex);
+    for (;;) {
+        resolverWake.wait(lock, [this] { return resolverStop || lobbyRequested; });
+        if (resolverStop)
+            return;
+        lobbyRequested = false;
+        std::string setting = config.lobby;
+        uint16_t localPort = boundPort;
+        lock.unlock();
+        LobbyLookup lookup = LookUpLobby(setting, localPort, config.resolveHost);
+        lock.lock();
+        if (resolverStop)
+            return;
+        bool ok = lookup.result == LobbyResult::Resolved;
+        if (ok) {
+            rendezvous.SetLobby(lookup.lobbyAt, lookup.local);
+        } else {
+            if (lookup.result == LobbyResult::Invalid) {
+                if (!lobbyInvalidLogged)
+                    LOG("net: invalid lobby setting %s", config.lobby.c_str());
+                lobbyInvalidLogged = true;
+            } else {
+                LOG("net: cannot resolve the lobby %s", config.lobby.c_str());
+            }
+            rendezvous.LobbyUnresolved();
+        }
+        lobbyResolved = ok;
+        lastLobbyResolve = NowMs();
+        lobbyResolving = false;
     }
 }
 
@@ -310,6 +471,7 @@ void Session::Service(uint32_t now)
         }
     }
     t_servicing = nullptr;
+    now = NowMs();
 
     // Connections that never said who they are.
     for (auto it = pendingPeers.begin(); it != pendingPeers.end();) {
@@ -330,6 +492,7 @@ void Session::Service(uint32_t now)
             RemoveMachine(id, true);
         migrationDeadline = 0;
     }
+    rendezvous.Tick(now);
     Search(now);
     enet_host_flush(host);
 }
@@ -368,7 +531,8 @@ void Session::ResolvePeers()
 void Session::Search(uint32_t now)
 {
     bool browsing = lastSearchCall != 0 && !Elapsed(now, lastSearchCall, kBrowseIdleMs);
-    if (!browsing)
+    bool finding = rendezvous.Finding();
+    if (!browsing && !finding)
         return;
     for (auto it = found.begin(); it != found.end();) {
         if (Elapsed(now, it->second.lastSeenMs, kSessionExpiryMs))
@@ -376,21 +540,31 @@ void Session::Search(uint32_t now)
         else
             ++it;
     }
-    if (lastQuery != 0 && !Elapsed(now, lastQuery, kQueryIntervalMs))
+    bool regular = lastQuery == 0 || Elapsed(now, lastQuery, kQueryIntervalMs);
+    bool fast = finding && (lastTargetQuery == 0 || Elapsed(now, lastTargetQuery, kFastQueryIntervalMs));
+    if (!regular && !fast)
         return;
-    lastQuery = now;
-    previousNonce = queryNonce;
-    queryNonce = (uint32_t)rng() | 1;
+    if (regular) {
+        lastQuery = now;
+        previousNonce = queryNonce;
+        queryNonce = (uint32_t)rng() | 1;
+    }
+    lastTargetQuery = now;
     Writer w;
     w.Bytes(kMagic, 4);
     w.U8(kQuery);
     w.U8(kProtocol);
     w.U32(queryNonce);
     w.Bytes(searchApplication.bytes, 16);
-    if (config.broadcast)
-        SendRaw(host, ENET_HOST_BROADCAST, config.port, w.data);
-    for (const auto &peer : peerAddresses)
-        SendRaw(host, peer.first, peer.second, w.data);
+    w.data.resize(MaxReplySize(), 0);
+    if (regular && browsing) {
+        if (config.broadcast)
+            SendRaw(host, ENET_HOST_BROADCAST, config.port, w.data);
+        for (const auto &peer : peerAddresses)
+            SendRaw(host, peer.first, peer.second, w.data);
+    }
+    for (const lobby::Endpoint &target : rendezvous.QueryTargets())
+        SendRaw(host, target.address, target.port, w.data);
 }
 
 int Session::Intercept(_ENetHost *host, _ENetEvent *)
@@ -405,6 +579,14 @@ int Session::Intercept(_ENetHost *host, _ENetEvent *)
 
 void Session::HandleRaw(const uint8_t *data, size_t size, uint32_t address, uint16_t port)
 {
+    lobby::Endpoint from;
+    from.address = address;
+    from.port = port;
+    lobby::Kind lobbyKind;
+    if (lobby::Peek(data, size, lobbyKind)) {
+        rendezvous.Handle(data, size, from, NowMs());
+        return;
+    }
     Reader r(data + 4, size - 4);
     uint8_t kind = r.U8();
     if (r.U8() != kProtocol)
@@ -416,14 +598,10 @@ void Session::HandleRaw(const uint8_t *data, size_t size, uint32_t address, uint
         if (!r.ok() || state != State::Hosting ||
             memcmp(&application, &desc.guidApplication, sizeof(application)) != 0)
             return;
-        Writer w;
-        w.Bytes(kMagic, 4);
-        w.U8(kReply);
-        w.U8(kProtocol);
-        w.U32(nonce);
-        WriteDesc(w, desc, SessionPlayerCount(), sessionName, std::string());
-        w.U8(password.empty() ? 0 : 1);
-        SendRaw(host, address, port, w.data);
+        std::vector<uint8_t> reply = ReplyPacket(nonce, desc, SessionPlayerCount(), sessionName, !password.empty());
+        if (IsPublicAddress(address) && size < reply.size())
+            return;
+        SendRaw(host, address, port, reply);
     } else if (kind == kReply) {
         uint32_t nonce = r.U32();
         if (nonce == 0 || (nonce != queryNonce && nonce != previousNonce))
@@ -435,10 +613,21 @@ void Session::HandleRaw(const uint8_t *data, size_t size, uint32_t address, uint
         info.passwordRequired = r.U8() != 0;
         if (!r.ok())
             return;
+        uint32_t now = NowMs();
         info.address = address;
         info.port = port;
-        info.lastSeenMs = NowMs();
-        found[GuidKey(info.desc.guidInstance)] = info;
+        info.lastSeenMs = now;
+        info.relayed = rendezvous.IsRelay(from);
+        std::string key = GuidKey(info.desc.guidInstance);
+        auto it = found.find(key);
+        if (it == found.end() && found.size() >= kMaxFound)
+            return;
+        if (it == found.end() ||
+            ReplacesPath(it->second.relayed, !Elapsed(now, it->second.lastSeenMs, kSessionExpiryMs), info.relayed))
+            found[key] = info;
+        lobby::Guid instance;
+        memcpy(instance.data(), info.desc.guidInstance.bytes, instance.size());
+        rendezvous.OnSessionReply(from, instance);
     }
 }
 
@@ -459,6 +648,10 @@ HRESULT Session::EnumSessions(const NetGuid *application, NetSessionCallback cal
         searchApplication = wanted;
         if (idle)
             lastQuery = 0;      // the service thread asks at once
+        if (findDeferred) {
+            findDeferred = false;
+            rendezvous.Find(deferredCode);
+        }
         for (const auto &entry : found) {
             const NetSessionDesc &d = entry.second.desc;
             if (memcmp(&d.guidApplication, &wanted, sizeof(wanted)) != 0)
@@ -486,6 +679,7 @@ HRESULT Session::EnumSessions(const NetGuid *application, NetSessionCallback cal
 
 void Session::ResetSession()
 {
+    rendezvous.StopHosting(true);
     state = State::Idle;
     memset(&desc, 0, sizeof(desc));
     sessionName.clear();
@@ -524,6 +718,8 @@ HRESULT Session::Open(const NetSessionDesc *d, DWORD flags)
         localMachine = hostMachine = 1;
         machines[1].id = 1;
         state = State::Hosting;
+        StopFind();
+        StartCodeHosting();
         LOG("net: hosting \"%s\" (up to %u players)", sessionName.c_str(), (unsigned)desc.dwMaxPlayers);
         return NET_OK;
     }
@@ -547,8 +743,10 @@ HRESULT Session::Open(const NetSessionDesc *d, DWORD flags)
     enet_host_flush(host);
     bool answered = changed.wait_for(lock, std::chrono::milliseconds(config.joinTimeoutMs),
                                      [this] { return joinResult != 0; });
-    if (answered && joinResult == 1)
+    if (answered && joinResult == 1) {
+        StopFind();
         return NET_OK;
+    }
     HRESULT result = answered ? (HRESULT)joinResult : NET_ERR_TIMEOUT;
     // A graceful hang-up keeps the connection's slot until the host
     // acknowledges it, so a retry cannot be hit by the old connection.
@@ -630,6 +828,88 @@ bool Session::IsHost()
 {
     std::lock_guard<std::mutex> lock(mutex);
     return state == State::Hosting;
+}
+
+void Session::StartCodeHosting()
+{
+    if (config.lobby.empty())
+        return;
+    lobby::Guid instance;
+    memcpy(instance.data(), desc.guidInstance.bytes, instance.size());
+    rendezvous.Host(instance);
+}
+
+NetCodeStatus Session::HostCode(std::string *code)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    if (code != nullptr)
+        code->clear();
+    if (config.lobby.empty())
+        return NET_CODE_NO_LOBBY;
+    if (state != State::Hosting)
+        return NET_CODE_IDLE;
+    lobby::Code raw;
+    NetCodeStatus status = rendezvous.HostStatus(&raw);
+    if (status == NET_CODE_READY && code != nullptr)
+        *code = joincode::Format(raw);
+    return status;
+}
+
+NetCodeStatus Session::FindByCode(const char *text)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    if (config.lobby.empty())
+        return NET_CODE_NO_LOBBY;
+    lobby::Code code;
+    if (!joincode::Parse(text, code))
+        return NET_CODE_INVALID;
+    if (host == nullptr || state != State::Idle)
+        return NET_CODE_IDLE;
+    codeFoundLogged = false;
+    if (!lobbyResolved || rendezvous.LobbyUnreachable())
+        lastLobbyResolve = 0;
+    if (lastSearchCall == 0) {
+        rendezvous.CancelFind();
+        findDeferred = true;
+        deferredCode = code;
+        return NET_CODE_CONTACTING;
+    }
+    findDeferred = false;
+    rendezvous.Find(code);
+    return rendezvous.FindStatus(nullptr, nullptr);
+}
+
+NetCodeStatus Session::CodeSession(NetGuid *instance, bool *relayed)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    if (findDeferred)
+        return NET_CODE_CONTACTING;
+    lobby::Guid guid;
+    bool viaRelay = false;
+    NetCodeStatus status = rendezvous.FindStatus(&guid, &viaRelay);
+    if (status == NET_CODE_FOUND) {
+        if (!codeFoundLogged) {
+            codeFoundLogged = true;
+            LOG("net: game found by code (%s)", viaRelay ? "relay" : "direct");
+        }
+        if (instance != nullptr)
+            memcpy(instance->bytes, guid.data(), guid.size());
+        if (relayed != nullptr)
+            *relayed = viaRelay;
+    }
+    return status;
+}
+
+void Session::CancelFind()
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    StopFind();
+}
+
+void Session::StopFind()
+{
+    findDeferred = false;
+    rendezvous.CancelFind();
 }
 
 // ---- players -----------------------------------------------------------------------------
@@ -1251,6 +1531,7 @@ void Session::BecomeHost()
     machines[localMachine].address = 0;
     machines[localMachine].port = 0;
     migrationDeadline = machines.size() > 1 ? NowMs() + config.joinTimeoutMs * 2 : 0;
+    StartCodeHosting();
     QueueSystem(NET_SYS_HOST, nullptr);
 }
 

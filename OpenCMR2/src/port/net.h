@@ -168,6 +168,28 @@ HRESULT Net_Send(NetPlayerID from, NetPlayerID to, BOOL guaranteed, const void *
    keeps the message; NET_ERR_NOMESSAGES when there is none. */
 HRESULT Net_Receive(NetPlayerID *from, NetPlayerID *to, void *data, DWORD *dataSize);
 
+typedef enum NetCodeStatus {
+    NET_CODE_IDLE = 0,
+    NET_CODE_NO_LOBBY,
+    NET_CODE_INVALID,
+    NET_CODE_CONTACTING,
+    NET_CODE_READY,
+    NET_CODE_CONNECTING,
+    NET_CODE_RELAYING,
+    NET_CODE_FOUND,
+    NET_CODE_NOT_FOUND,
+    NET_CODE_LOBBY_UNREACHABLE,
+    NET_CODE_HOST_UNREACHABLE,
+    NET_CODE_RATE_LIMITED
+} NetCodeStatus;
+
+#define NET_CODE_TEXT_SIZE 10
+
+NetCodeStatus Net_GetHostCode(char *code, DWORD size);
+NetCodeStatus Net_FindByCode(const char *code);
+NetCodeStatus Net_GetCodeSession(NetGuid *instance, BOOL *relayed);
+void Net_CancelFind(void);
+
 #ifdef __cplusplus
 }
 #endif

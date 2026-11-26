@@ -320,7 +320,7 @@ leaves the previous one.
 | `[install] language` | `English` | English, American, French, German, Italian, Spanish or Polish |
 | `[install] sku` | `EUROPE` | Game edition: `EUROPE`, `AMERICA`, `POLAND` or `JAPAN`; when the data has no `CountrySpecific` folder for it and one for another edition, that one |
 | `[install] menu_shortcut` | asked | Entry in the applications menu (Linux) or Start menu (Windows): `1` keeps it pointing at this copy, `0` removes it |
-| `[net] ...` | | Network play, see [NETWORK.md](docs/NETWORK.md) |
+| `[net] ...` | | Network play, see [NETWORK.md](docs/NETWORK.md). Join codes: `lobby` (server, `host[:port]`) and `relay` (`auto`, `always` or `never`), see [LOBBY.md](docs/LOBBY.md) |
 
 ## Building
 
@@ -439,6 +439,7 @@ the rest of the development workflow are described in
 | [ORIGINAL_REFERENCE.md](docs/ORIGINAL_REFERENCE.md) | Recording the original game for the comparisons |
 | [BASELINE.md](docs/BASELINE.md) | Stage capture, replay and CPU profiling |
 | [NETWORK.md](docs/NETWORK.md) | Network play setup and protocol |
+| [LOBBY.md](docs/LOBBY.md) | Lobby server for join codes (rendezvous and relay): running, limits, privacy |
 | [VIDEO.md](docs/VIDEO.md) | Bink decoder |
 | [WINDOWS.md](docs/WINDOWS.md) | Release packages and cross-building for Windows |
 | [64bit-raw-access.md](docs/64bit-raw-access.md) | 64-bit memory access audit |

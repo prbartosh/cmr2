@@ -21,6 +21,10 @@
 #include <string>
 #include <vector>
 
+#ifndef OPENCMR2_DEFAULT_LOBBY
+#define OPENCMR2_DEFAULT_LOBBY ""
+#endif
+
 namespace {
 
 std::unique_ptr<net::Session> s_session;
@@ -76,6 +80,16 @@ std::vector<std::string> TailscalePeers()
     return peers;
 }
 
+std::string LobbySetting()
+{
+    std::string lobby = Platform_GetSetting("net.lobby", OPENCMR2_DEFAULT_LOBBY);
+    size_t first = lobby.find_first_not_of(" \t");
+    if (first == std::string::npos)
+        return std::string();
+    size_t last = lobby.find_last_not_of(" \t");
+    return lobby.substr(first, last - first + 1);
+}
+
 net::Config LoadConfig()
 {
     net::Config config;
@@ -88,6 +102,12 @@ net::Config LoadConfig()
     if (SDL_strcasecmp(tailscale, "0") != 0 && SDL_strcasecmp(tailscale, "off") != 0)
         config.extraPeers = TailscalePeers;
     config.log = Sys_Log;
+    config.lobby = LobbySetting();
+    const char *relay = Platform_GetSetting("net.relay", "auto");
+    if (SDL_strcasecmp(relay, "always") == 0)
+        config.relay = net::RelayMode::Always;
+    else if (SDL_strcasecmp(relay, "never") == 0)
+        config.relay = net::RelayMode::Never;
     return config;
 }
 
@@ -162,4 +182,43 @@ extern "C" HRESULT Net_Send(NetPlayerID from, NetPlayerID to, BOOL guaranteed, c
 extern "C" HRESULT Net_Receive(NetPlayerID *from, NetPlayerID *to, void *data, DWORD *dataSize)
 {
     return s_session ? s_session->Receive(from, to, data, dataSize) : NET_ERR_NOMESSAGES;
+}
+
+extern "C" NetCodeStatus Net_GetHostCode(char *code, DWORD size)
+{
+    if (code != NULL && size > 0)
+        code[0] = '\0';
+    if (!s_session)
+        return LobbySetting().empty() ? NET_CODE_NO_LOBBY : NET_CODE_IDLE;
+    std::string text;
+    NetCodeStatus status = s_session->HostCode(&text);
+    if (code != NULL && size >= NET_CODE_TEXT_SIZE && text.size() < size)
+        memcpy(code, text.c_str(), text.size() + 1);
+    return status;
+}
+
+extern "C" NetCodeStatus Net_FindByCode(const char *code)
+{
+    if (!s_session)
+        return LobbySetting().empty() ? NET_CODE_NO_LOBBY : NET_CODE_IDLE;
+    return s_session->FindByCode(code);
+}
+
+extern "C" NetCodeStatus Net_GetCodeSession(NetGuid *instance, BOOL *relayed)
+{
+    if (relayed != NULL)
+        *relayed = FALSE;
+    if (!s_session)
+        return NET_CODE_IDLE;
+    bool viaRelay = false;
+    NetCodeStatus status = s_session->CodeSession(instance, &viaRelay);
+    if (relayed != NULL)
+        *relayed = viaRelay ? TRUE : FALSE;
+    return status;
+}
+
+extern "C" void Net_CancelFind(void)
+{
+    if (s_session)
+        s_session->CancelFind();
 }

@@ -20,6 +20,25 @@ target_compile_options(net_session_test PRIVATE "SHELL:-include ${PROJECT_SOURCE
 add_test(NAME net_session COMMAND net_session_test)
 set_tests_properties(net_session PROPERTIES TIMEOUT 60)
 
+add_executable(net_rendezvous_test net_rendezvous.cpp)
+target_link_libraries(net_rendezvous_test PRIVATE opencmr2_net)
+target_compile_options(net_rendezvous_test PRIVATE "SHELL:-include ${PROJECT_SOURCE_DIR}/src/port/types.h")
+add_test(NAME net_rendezvous COMMAND net_rendezvous_test)
+set_tests_properties(net_rendezvous PROPERTIES TIMEOUT 60)
+
+if(TARGET lobby_server_test)
+    add_test(NAME lobby_server COMMAND lobby_server_test)
+    set_tests_properties(lobby_server PROPERTIES TIMEOUT 60)
+endif()
+
+if(TARGET opencmr2_lobby)
+    add_executable(net_lobby_e2e_test net_lobby_e2e.cpp)
+    target_link_libraries(net_lobby_e2e_test PRIVATE opencmr2_net opencmr2_lobby)
+    target_compile_options(net_lobby_e2e_test PRIVATE "SHELL:-include ${PROJECT_SOURCE_DIR}/src/port/types.h")
+    add_test(NAME net_lobby_e2e COMMAND net_lobby_e2e_test)
+    set_tests_properties(net_lobby_e2e PROPERTIES TIMEOUT 90)
+endif()
+
 add_executable(bink_decoder_test bink_decoder.cpp)
 target_link_libraries(bink_decoder_test PRIVATE opencmr2_bink)
 add_test(NAME bink_decoder COMMAND bink_decoder_test)
@@ -150,6 +169,17 @@ if(OPENCMR2_BINK_TEST_DATA_DIR)
                 ${CMAKE_CURRENT_SOURCE_DIR}/lan_game.py --host-probe $<TARGET_FILE:stage_probe>
                 --data ${OPENCMR2_BINK_TEST_DATA_DIR} --players 3)
             set_tests_properties(lan_game_3 PROPERTIES TIMEOUT 150)
+            if(TARGET opencmr2-lobby)
+                add_test(NAME lan_game_code COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/lan_game.py --host-probe $<TARGET_FILE:stage_probe>
+                    --data ${OPENCMR2_BINK_TEST_DATA_DIR} --join-code --lobby $<TARGET_FILE:opencmr2-lobby>)
+                set_tests_properties(lan_game_code PROPERTIES TIMEOUT 120)
+                add_test(NAME lan_game_code_relay COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/lan_game.py --host-probe $<TARGET_FILE:stage_probe>
+                    --data ${OPENCMR2_BINK_TEST_DATA_DIR} --join-code --lobby $<TARGET_FILE:opencmr2-lobby>
+                    --relay always)
+                set_tests_properties(lan_game_code_relay PROPERTIES TIMEOUT 120)
+            endif()
         endif()
         add_test(NAME stage_lighting COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/stage_lighting.py --probe $<TARGET_FILE:stage_probe>

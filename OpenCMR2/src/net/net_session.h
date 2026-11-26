@@ -19,6 +19,7 @@
 #ifndef OPENCMR2_NET_SESSION_H
 #define OPENCMR2_NET_SESSION_H
 
+#include "net/rendezvous.h"
 #include "port/net.h"
 
 #include <stdint.h>
@@ -51,6 +52,9 @@ struct Config {
     // More hosts to search, asked for on the service thread (Tailscale peers).
     std::vector<std::string> (*extraPeers)() = nullptr;
     void (*log)(const char *format, ...) = nullptr;
+    std::string lobby;
+    RelayMode relay = RelayMode::Auto;
+    bool (*resolveHost)(const char *name, uint32_t *address) = nullptr;
 };
 
 // A session as seen by the search.
@@ -61,6 +65,7 @@ struct SessionInfo {
     uint32_t address = 0;                   // host, network byte order
     uint16_t port = 0;
     uint32_t lastSeenMs = 0;
+    bool relayed = false;
 };
 
 class Session {
@@ -87,6 +92,11 @@ public:
     HRESULT Receive(NetPlayerID *from, NetPlayerID *to, void *data, DWORD *dataSize);
 
     bool IsHost();
+
+    NetCodeStatus HostCode(std::string *code);
+    NetCodeStatus FindByCode(const char *code);
+    NetCodeStatus CodeSession(NetGuid *instance, bool *relayed);
+    void CancelFind();
 
     // Testing: drops the network without telling anyone (a crash or a cable
     // pulled), so the others only notice through the timeout.
@@ -123,6 +133,11 @@ private:
     void Service(uint32_t now);
     void Search(uint32_t now);
     void ResolvePeers();
+    void StartResolver();
+    void StopResolver();
+    void ResolveLoop();
+    void StartCodeHosting();
+    void StopFind();
     static int Intercept(_ENetHost *host, _ENetEvent *event);
     void HandleRaw(const uint8_t *data, size_t size, uint32_t address, uint16_t port);
 
@@ -190,6 +205,20 @@ private:
     std::vector<std::pair<uint32_t, uint16_t>> peerAddresses;
     uint32_t lastResolve = 0;
     bool resolving = false;
+    uint32_t lastTargetQuery = 0;
+
+    Rendezvous rendezvous;
+    uint32_t lastLobbyResolve = 0;
+    bool lobbyResolving = false;
+    bool lobbyResolved = false;
+    bool lobbyRequested = false;
+    bool resolverStop = false;
+    std::condition_variable resolverWake;
+    std::thread resolver;
+    bool codeFoundLogged = false;
+    bool lobbyInvalidLogged = false;
+    bool findDeferred = false;
+    lobby::Code deferredCode = {};
 };
 
 } // namespace net
