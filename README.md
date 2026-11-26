@@ -6,7 +6,7 @@ Lokalna konfiguracja do uruchamiania **Colin McRae Rally 2.0** natywnie na macOS
 
 Pliki gry oraz binarki silnika są ignorowane przez Git (`.gitignore`). Aby uruchomić grę, w katalogu głównym powinny znajdować się:
 
-- `OpenCMR2-macOS-arm64/` — paczka OpenCMR2 dla macOS (`arm64`) z `opencmr2` i `libSDL3.0.dylib`
+- `OpenCMR2-macOS-arm64/`: paczka OpenCMR2 dla macOS (`arm64`, od macOS 11) z `opencmr2`, `libSDL3.0.dylib` i serwerem kodów gry `opencmr2-lobby`
 - `Colin McRae Rally 2/Colin McRae Rally 2/` — oryginalna instalacja PC gry (`GAME/`, `FRONTEND/`, `SOUNDS/`, `CountrySpecific/` itd.)
 
 ## Uruchamianie
