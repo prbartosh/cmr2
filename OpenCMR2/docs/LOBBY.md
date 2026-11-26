@@ -156,7 +156,10 @@ it cleanly. Logs go to stderr with UTC timestamps.
 | Largest datagram | 4096 bytes |
 
 Over a limit the lobby answers `FULL` or `RATE_LIMITED`. All limits are
-checked only after the cookie is valid. The rate limit table holds at most
+checked only after the cookie is valid. A relay request repeated with the
+same nonce from the same address and port gets the relay it already has
+(and the host its offer again, until the host is bound); it costs no lookup
+and does not count against the relay limits. The rate limit table holds at most
 65536 addresses. It never drops an address that is still limited: when the
 table is full, it forgets addresses idle for 40 seconds (their limits are
 back to full by then), and if it is still full, requests from new
