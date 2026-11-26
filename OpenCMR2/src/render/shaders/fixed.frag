@@ -63,8 +63,9 @@ layout(std140, set = 3, binding = 1) uniform FragmentLightingUniforms {
     ivec4 texCoordIndex;    // stage 0, stage 1, texture transform 0, texture transform 1
     vec4 viewUp;            // world up in eye space
     vec4 enhanceParams;     // x: perPixelLighting, y: hemisphereAmbient, z: carFresnelStrength, w: visualOverhaul
-    mat4 eyeToLightClip;    // eye space -> sun shadow clip space
-    vec4 shadowParams;      // x: enabled (0/1), y: strength, z: invMapSize, w: receiveShadows (0/1)
+    mat4 eyeToLightClip[2]; // eye space -> sun shadow clip space (cascade 0 near, cascade 1 far)
+    vec4 shadowParams;      // x: enabled (0/1), y: strength, z: invCascadeSize, w: cascadeCount (1 or 2)
+    vec4 shadowParams2;     // x: pcfQuality (0/1/2), y: radiusScale0, z: radiusScale1, w: unused
     vec4 sunDirEye;         // xyz: direction toward sun in eye space, w: unused
 };
 
@@ -249,37 +250,129 @@ vec3 PerturbNormal(vec3 N, vec3 eyePos, vec2 uv, vec3 mapSample, float strength)
     return normalize(tbn * normalize(tn));
 }
 
-// 9-tap PCF directional sun shadow sampling with normal-offset bias and frustum edge fade.
-// Returns 1.0 when fully lit, 0.0 when occluded by shadow casters.
+// Screen-space Interleaved Gradient Noise (Jorge Jimenez 2014) for per-pixel Poisson rotation.
+float InterleavedGradientNoise(vec2 p)
+{
+    vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
+    return fract(magic.z * fract(dot(p, magic.xy)));
+}
+
+// 16-tap blue-noise Poisson disk (first 8 and first 4 are also well-distributed subsets).
+const vec2 kPoissonDisk16[16] = vec2[16](
+    vec2(-0.613392,  0.617481), vec2( 0.170019, -0.040254),
+    vec2(-0.299417,  0.791925), vec2( 0.645680,  0.493210),
+    vec2(-0.651784,  0.717887), vec2( 0.421003,  0.027070),
+    vec2(-0.817194, -0.271096), vec2(-0.705374, -0.668203),
+    vec2( 0.977050, -0.108615), vec2( 0.063326,  0.142369),
+    vec2( 0.203528,  0.214331), vec2(-0.667531,  0.326090),
+    vec2(-0.098422, -0.295755), vec2(-0.885922,  0.215369),
+    vec2( 0.566637,  0.605213), vec2( 0.039766, -0.396100)
+);
+
+// Sample one cascade (0 = near, 1 = far) from the 2x1 shadow atlas using Rotated Poisson Disk PCF.
+float SampleShadowCascade(int cascadeIdx, vec3 proj, float ndl, mat2 rot)
+{
+    vec2 luv = vec2(proj.x * 0.5 + 0.5, 0.5 - proj.y * 0.5);
+    float invSize = shadowParams.z;
+    bool twoCascades = shadowParams.w > 1.5;
+
+    float bias = (cascadeIdx == 0 && twoCascades)
+                     ? mix(0.0014, 0.00035, ndl)
+                     : mix(0.0028, 0.00075, ndl);
+    float radiusScale = (cascadeIdx == 0) ? shadowParams2.y : shadowParams2.z;
+    float radius = invSize * radiusScale;
+
+    int pcfQual = int(shadowParams2.x + 0.5);
+    int tapCount = (pcfQual >= 2) ? 16 : (pcfQual == 1 ? 8 : 4);
+
+    float minUV = 0.5 * invSize;
+    float maxUV = 1.0 - 0.5 * invSize;
+    float uOffset = (twoCascades && cascadeIdx == 1) ? 0.5 : 0.0;
+    float uScale = twoCascades ? 0.5 : 1.0;
+
+    float vis = 0.0;
+    for (int i = 0; i < 16; i++) {
+        if (i >= tapCount)
+            break;
+        vec2 off = (rot * kPoissonDisk16[i]) * radius;
+        vec2 cuv = clamp(luv + off, vec2(minUV), vec2(maxUV));
+        vec2 atlasUV = vec2(uOffset + cuv.x * uScale, cuv.y);
+        float d = texture(shadowMapTex, atlasUV).r;
+        vis += (proj.z - bias <= d) ? 1.0 : 0.0;
+    }
+    return vis / float(tapCount);
+}
+
+// 2-cascade CSM directional sun shadow sampling with IGN-rotated Poisson Disk PCF
+// and smooth cross-cascade blending. Returns 1.0 when fully lit, 0.0 when shadowed.
 float SampleSunShadow(vec3 eyePos, vec3 geomN, bool hasNormal)
 {
     if (shadowParams.x < 0.5 || fogParams.z < 0.5 || enhanceParams.w < 0.5)
         return 1.0;
-    vec3 offsetPos = eyePos + (hasNormal ? geomN * 0.07 : vec3(0.0));
-    vec4 lc = eyeToLightClip * vec4(offsetPos, 1.0);
-    if (abs(lc.w) < 1e-5)
-        return 1.0;
-    vec3 proj = lc.xyz / lc.w;
-    vec2 suv = vec2(proj.x * 0.5 + 0.5, 0.5 - proj.y * 0.5);
-    if (suv.x <= 0.002 || suv.x >= 0.998 || suv.y <= 0.002 || suv.y >= 0.998 ||
-        proj.z <= 0.0 || proj.z >= 1.0)
-        return 1.0;
-    float edge = max(abs(proj.x), abs(proj.y));
-    float fade = 1.0 - smoothstep(0.78, 0.98, edge);
-    if (fade <= 0.0)
-        return 1.0;
+
     float ndl = hasNormal ? max(dot(geomN, sunDirEye.xyz), 0.0) : 0.5;
-    float bias = mix(0.0026, 0.0007, ndl);
-    float invSize = shadowParams.z;
-    float vis = 0.0;
-    for (int dy = -1; dy <= 1; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-            float d = texture(shadowMapTex, suv + vec2(float(dx), float(dy)) * invSize).r;
-            vis += (proj.z - bias <= d) ? 1.0 : 0.0;
-        }
+    float angle = InterleavedGradientNoise(gl_FragCoord.xy) * 6.2831853;
+    float ca = cos(angle);
+    float sa = sin(angle);
+    mat2 rot = mat2(ca, -sa, sa, ca);
+
+    bool twoCascades = shadowParams.w > 1.5;
+
+    // Cascade 0 (near high-res around car, or sole cascade when shadow_cascades == 1).
+    float normalOff0 = twoCascades ? 0.035 : 0.07;
+    vec3 offsetPos0 = eyePos + (hasNormal ? geomN * normalOff0 : vec3(0.0));
+    vec4 lc0 = eyeToLightClip[0] * vec4(offsetPos0, 1.0);
+    bool valid0 = false;
+    vec3 proj0 = vec3(0.0);
+    float edge0 = 2.0;
+    if (abs(lc0.w) >= 1e-5) {
+        proj0 = lc0.xyz / lc0.w;
+        edge0 = max(abs(proj0.x), abs(proj0.y));
+        valid0 = edge0 < 0.98 && proj0.z > 0.0 && proj0.z < 1.0;
     }
-    vis /= 9.0;
-    return mix(1.0, vis, fade);
+
+    if (!twoCascades) {
+        if (!valid0)
+            return 1.0;
+        float fade = 1.0 - smoothstep(0.78, 0.98, edge0);
+        if (fade <= 0.0)
+            return 1.0;
+        float vis0 = SampleShadowCascade(0, proj0, ndl, rot);
+        return mix(1.0, vis0, fade);
+    }
+
+    // Fast path: strictly inside Cascade 0 core (0..~18m) — only sample Cascade 0.
+    if (valid0 && edge0 < 0.78) {
+        return SampleShadowCascade(0, proj0, ndl, rot);
+    }
+
+    // Cascade 1 (far 20..110m).
+    vec3 offsetPos1 = eyePos + (hasNormal ? geomN * 0.085 : vec3(0.0));
+    vec4 lc1 = eyeToLightClip[1] * vec4(offsetPos1, 1.0);
+    bool valid1 = false;
+    vec3 proj1 = vec3(0.0);
+    float edge1 = 2.0;
+    if (abs(lc1.w) >= 1e-5) {
+        proj1 = lc1.xyz / lc1.w;
+        edge1 = max(abs(proj1.x), abs(proj1.y));
+        valid1 = edge1 < 0.98 && proj1.z > 0.0 && proj1.z < 1.0;
+    }
+
+    float vis1 = 1.0;
+    if (valid1) {
+        float fade1 = 1.0 - smoothstep(0.80, 0.98, edge1);
+        if (fade1 > 0.0)
+            vis1 = mix(1.0, SampleShadowCascade(1, proj1, ndl, rot), fade1);
+    }
+
+    // Smooth blend band between Cascade 0 and Cascade 1 (edge0 in [0.78, 0.96]).
+    if (valid0 && edge0 < 0.96) {
+        float vis0 = SampleShadowCascade(0, proj0, ndl, rot);
+        float t = smoothstep(0.78, 0.96, edge0);
+        return mix(vis0, vis1, t);
+    }
+
+    return vis1;
 }
 
 void main()
