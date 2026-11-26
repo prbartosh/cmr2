@@ -16,12 +16,21 @@ struct Options {
     size_t maxSessions = 4096;
     size_t maxSessionsPerAddress = 4;
     size_t maxRelaysPerSession = 7;
+    size_t maxRelaysPerGuestAddress = 2;
+    size_t maxRelaysPerHostAddress = 7;
+    size_t maxBuckets = 65536;
     uint32_t sessionTtlMs = 35000;
     uint32_t relayIdleMs = 30000;
+    uint32_t relayBindMs = 10000;
+    uint32_t cookieWindowMs = 30000;
     uint32_t relayBytesPerSecond = 262144;
     bool verbose = false;
     void (*log)(const char *format, ...) = nullptr;
 };
+
+constexpr size_t kMaxSessionsLimit = 65536;
+
+void SipHash128(const uint8_t key[16], const void *data, size_t size, uint8_t out[16]);
 
 class Server {
 public:
