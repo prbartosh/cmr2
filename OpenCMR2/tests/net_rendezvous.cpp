@@ -1299,6 +1299,105 @@ void SessionUnknownCode()
     CHECK(guest->CodeSession(nullptr, nullptr) == NET_CODE_IDLE);
 }
 
+std::atomic<bool> s_resolverBlocked{false};
+std::atomic<bool> s_resolverRelease{false};
+std::atomic<int> s_resolverCalls{0};
+
+bool BlockingResolve(const char *, uint32_t *)
+{
+    s_resolverCalls++;
+    s_resolverBlocked = true;
+    auto end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (!s_resolverRelease && std::chrono::steady_clock::now() < end)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    s_resolverBlocked = false;
+    return false;
+}
+
+bool LiteralResolve(const char *, uint32_t *)
+{
+    s_resolverCalls++;
+    return false;
+}
+
+std::unique_ptr<net::Session> NamedLobbySession(const char *lobbyName, bool (*resolve)(const char *, uint32_t *))
+{
+    net::Config config;
+    config.port = 0;
+    config.broadcast = false;
+    config.timeoutMs = 1500;
+    config.joinTimeoutMs = 3000;
+    config.lobby = lobbyName;
+    config.resolveHost = resolve;
+    config.log = Log;
+    std::unique_ptr<net::Session> session(new net::Session(config));
+    CHECK(session->Start() == NET_OK);
+    return session;
+}
+
+void ServesWhileLobbyResolves(const char *lobbyName, bool (*resolve)(const char *, uint32_t *))
+{
+    std::unique_ptr<net::Session> host = NamedLobbySession(lobbyName, resolve);
+    NetSessionDesc hosted = Host(*host);
+    if (resolve != nullptr)
+        CHECK(WaitFor([] { return s_resolverBlocked.load(); }));
+    std::unique_ptr<net::Session> guest = MakeSession(0, net::RelayMode::Auto, host->BoundPort());
+    CHECK(WaitFor([&] { return Listed(*guest, hosted.guidInstance); }));
+    CHECK(Join(*guest, hosted.guidInstance) == NET_OK);
+    NetName name = { sizeof(NetName), 0, (char *)"p", (char *)"p" };
+    NetPlayerID hostPlayer = 0, guestPlayer = 0;
+    CHECK(host->CreatePlayer(&hostPlayer, &name, nullptr, 0) == NET_OK);
+    CHECK(guest->CreatePlayer(&guestPlayer, &name, nullptr, 0) == NET_OK);
+    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+    int exchanges = 0;
+    while (std::chrono::steady_clock::now() < end) {
+        bool up = WaitFor([&] {
+            guest->Send(guestPlayer, hostPlayer, TRUE, "hi", 2);
+            return Receives(*host, guestPlayer);
+        });
+        bool down = WaitFor([&] {
+            host->Send(hostPlayer, NET_ID_ALL, TRUE, "hi", 2);
+            return Receives(*guest, hostPlayer);
+        });
+        CHECK(up && down);
+        if (!up || !down)
+            break;
+        exchanges++;
+    }
+    CHECK(exchanges > 0);
+    CHECK(host->IsHost());
+    CHECK(!guest->IsHost());
+    std::string code;
+    NetCodeStatus status = host->HostCode(&code);
+    CHECK(status == NET_CODE_CONTACTING || status == NET_CODE_LOBBY_UNREACHABLE);
+    if (resolve != nullptr)
+        CHECK(s_resolverBlocked);
+    s_resolverRelease = true;
+    CHECK(WaitFor([] { return !s_resolverBlocked; }));
+}
+
+void SlowLobbyResolution()
+{
+    s_resolverRelease = false;
+    s_resolverCalls = 0;
+    ServesWhileLobbyResolves("lobby.example:28630", BlockingResolve);
+    CHECK(s_resolverCalls >= 1);
+    ServesWhileLobbyResolves("nonexistent.invalid", nullptr);
+}
+
+void LiteralLobbyAddress()
+{
+    FakeLobby fake;
+    s_resolverCalls = 0;
+    std::string lobbyName = "127.0.0.1:" + std::to_string(fake.Port());
+    std::unique_ptr<net::Session> host = NamedLobbySession(lobbyName.c_str(), LiteralResolve);
+    Host(*host);
+    std::string code;
+    CHECK(WaitFor([&] { return host->HostCode(&code) == NET_CODE_READY; }));
+    CHECK(code == "7K3M-9QX2");
+    CHECK(s_resolverCalls == 0);
+}
+
 }
 
 int main()
@@ -1329,6 +1428,8 @@ int main()
     JoinPinned();
     AbandonIsSilent();
     MigrationRegisters();
+    SlowLobbyResolution();
+    LiteralLobbyAddress();
 
     if (s_failures != 0) {
         fprintf(stderr, "net_rendezvous: %d failures\n", s_failures);

@@ -54,6 +54,7 @@ struct Config {
     void (*log)(const char *format, ...) = nullptr;
     std::string lobby;
     RelayMode relay = RelayMode::Auto;
+    bool (*resolveHost)(const char *name, uint32_t *address) = nullptr;
 };
 
 // A session as seen by the search.
@@ -132,7 +133,9 @@ private:
     void Service(uint32_t now);
     void Search(uint32_t now);
     void ResolvePeers();
-    void ResolveLobby();
+    void StartResolver();
+    void StopResolver();
+    void ResolveLoop();
     void StartCodeHosting();
     static int Intercept(_ENetHost *host, _ENetEvent *event);
     void HandleRaw(const uint8_t *data, size_t size, uint32_t address, uint16_t port);
@@ -207,6 +210,10 @@ private:
     uint32_t lastLobbyResolve = 0;
     bool lobbyResolving = false;
     bool lobbyResolved = false;
+    bool lobbyRequested = false;
+    bool resolverStop = false;
+    std::condition_variable resolverWake;
+    std::thread resolver;
 };
 
 } // namespace net
