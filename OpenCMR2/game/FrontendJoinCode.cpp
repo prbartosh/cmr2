@@ -11,6 +11,8 @@
 #include "main.h"
 #include <stdio.h>
 #include <string.h>
+#include <string>
+#include <vector>
 
 extern int g_selectedNetworkSession;
 extern BYTE g_unk0x00818ef4;
@@ -20,6 +22,7 @@ extern NetGuid g_unk0x00818cf0;
 extern char g_sessionPassword[20];
 extern char g_strTextCursor[];
 extern char g_strLabelSpacedText[];
+extern Menu *g_menuNextAction;
 
 int Network_CopyEnumeratedSessionGUID(BYTE index, NetGuid *pOut);
 unsigned int Network_GetEnumeratedSessionCount(void);
@@ -101,6 +104,9 @@ static BOOL s_joinCodeWaiting;
 static DWORD s_joinCodeFoundAt;
 static char s_hostCode[NET_CODE_TEXT_SIZE];
 static BOOL s_hostCodeCopied;
+static int s_pasteSeen;
+static int s_pasteInjected;
+static int s_pasteDiscard;
 
 static char *JoinCode_Text(int text)
 {
@@ -113,6 +119,8 @@ static char *JoinCode_Text(int text)
 static int JoinCode_MessageFor(int status)
 {
     switch (status) {
+    case NET_CODE_IDLE:
+        return JOINCODE_TEXT_UNAVAILABLE;
     case NET_CODE_NO_LOBBY:
         return JOINCODE_TEXT_NO_LOBBY;
     case NET_CODE_INVALID:
@@ -211,6 +219,66 @@ static BOOL JoinCode_Normalize(const char *text, char *out)
     return TRUE;
 }
 
+static BOOL JoinCode_IsDelimiter(char c)
+{
+    return c != 0 && (c == ' ' || c == '\t' || c == '\r' || c == '\n' || strchr(":;,.!?()[]\"'", c) != NULL);
+}
+
+static BOOL JoinCode_Store(const std::string &text, char *out)
+{
+    net::lobby::Code code;
+
+    if (!net::joincode::Parse(text.c_str(), code))
+        return FALSE;
+    snprintf(out, NET_CODE_TEXT_SIZE, "%s", net::joincode::Format(code).c_str());
+    return TRUE;
+}
+
+static BOOL JoinCode_Extract(const char *text, char *out)
+{
+    std::vector<std::string> tokens;
+    std::string token;
+    std::string stripped;
+    size_t i;
+
+    for (i = 0; text[i] != 0; i++) {
+        if (JoinCode_IsDelimiter(text[i])) {
+            if (!token.empty())
+                tokens.push_back(token);
+            token.clear();
+        } else {
+            token += text[i];
+            stripped += text[i];
+        }
+    }
+    if (!token.empty())
+        tokens.push_back(token);
+    for (i = tokens.size(); i > 0; i--) {
+        if (JoinCode_Store(tokens[i - 1], out))
+            return TRUE;
+    }
+    for (i = tokens.size(); i > 1; i--) {
+        if (JoinCode_Store(tokens[i - 2] + " " + tokens[i - 1], out))
+            return TRUE;
+    }
+    return JoinCode_Store(stripped, out);
+}
+
+static void JoinCode_Paste(void)
+{
+    char clipboard[256];
+    char code[NET_CODE_TEXT_SIZE];
+
+    if (Sys_GetClipboardText(clipboard, sizeof(clipboard)) > 0 && JoinCode_Extract(clipboard, code)) {
+        strcpy(s_joinCode, code);
+        JoinCode_Edited();
+        Menu_PlaySoundId(1);
+        return;
+    }
+    JoinCode_StopSearch(JOINCODE_TEXT_INVALID);
+    Menu_PlaySoundId(3);
+}
+
 static void JoinCode_Join(Menu *pMenu, int index, const NetGuid *pGuid)
 {
     s_joinCodeSearching = FALSE;
@@ -275,8 +343,6 @@ static void JoinCode_Submit(Menu *pMenu, MenuItem *pItem)
 
 static void JoinCode_Enter(Menu *pMenu, int param)
 {
-    char clipboard[net::joincode::kMaxInput + 2];
-
     Net_CancelFind();
     Menu_SetFlags(pMenu, 0, 0, 1, 1);
     Input_ClearCharacterQueue();
@@ -284,8 +350,8 @@ static void JoinCode_Enter(Menu *pMenu, int param)
     s_joinCodeSearching = FALSE;
     s_joinCodeWaiting = FALSE;
     s_joinCodeMessage = JOINCODE_TEXT_NONE;
-    if (Sys_GetClipboardText(clipboard, sizeof(clipboard)) > 0)
-        JoinCode_Normalize(clipboard, s_joinCode);
+    s_pasteSeen = Sys_GetPasteCount(&s_pasteInjected);
+    s_pasteDiscard = 0;
 }
 
 static void JoinCode_Update(Menu *pMenu)
@@ -294,16 +360,27 @@ static void JoinCode_Update(Menu *pMenu)
     BOOL relayed;
     int status;
     int key;
+    int paste;
+    int injected;
 
-    Sys_RequestTextInput(JoinCode_Text(JOINCODE_TEXT_FIELD), s_joinCode, kJoinCodeLength);
-    while (Input_PopQueuedCharacter(&key))
-        JoinCode_Type(key);
-    status = CGameInfo::EnumerateNetworkSessionsWithUserData(g_sessionPassword);
-    if (status == -2) {
-        JoinCode_StopSearch(JOINCODE_TEXT_NONE);
-        Menu_SetNextAction(pMenu->pParent);
+    if (g_menuNextAction != NULL)
         return;
+    Sys_RequestTextInput(JoinCode_Text(JOINCODE_TEXT_FIELD), s_joinCode, kJoinCodeLength);
+    paste = Sys_GetPasteCount(&injected);
+    if (paste != s_pasteSeen) {
+        s_pasteSeen = paste;
+        s_pasteDiscard += injected - s_pasteInjected;
+        s_pasteInjected = injected;
+        JoinCode_Paste();
     }
+    while (Input_PopQueuedCharacter(&key)) {
+        if (s_pasteDiscard > 0) {
+            s_pasteDiscard--;
+            continue;
+        }
+        JoinCode_Type(key);
+    }
+    CGameInfo::EnumerateNetworkSessionsWithUserData(g_sessionPassword);
     if (!s_joinCodeSearching)
         return;
     memset(&guid, 0, sizeof(guid));
@@ -411,9 +488,8 @@ void FrontendJoinCode_DrawHostCode(void)
             return;
         if (strcmp(code, s_hostCode) != 0) {
             strcpy(s_hostCode, code);
-            Sys_SetClipboardText(code);
+            s_hostCodeCopied = Sys_SetClipboardText(code);
             Sys_Log("net: join code %s", code);
-            s_hostCodeCopied = TRUE;
         }
         if (s_hostCodeCopied)
             snprintf(text, sizeof(text), "%s: %s %s", JoinCode_Text(JOINCODE_TEXT_FIELD), code,
