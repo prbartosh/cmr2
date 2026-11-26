@@ -32,11 +32,11 @@ constexpr int64_t kLookupCapacity = 10 * kLookupCost;
 constexpr int64_t kRegisterCost = 10000;
 constexpr int64_t kRegisterCapacity = 4 * kRegisterCost;
 constexpr int64_t kBucketIdleMs = std::max(kLookupCapacity, kRegisterCapacity);
-constexpr size_t kMaxBuckets = 65536;
 constexpr int64_t kBucketPruneMs = 10000;
-constexpr int64_t kSweepMs = 50;
+constexpr int64_t kBucketFullPruneMs = 1000;
+constexpr int64_t kSweepMs = 1000;
 constexpr int64_t kStatsMs = 60000;
-constexpr int kIntroducePerSecond = 4;
+constexpr int kIntroducePerSecond = 16;
 constexpr int kCodeAttempts = 32;
 constexpr int kDrainLimit = 4096;
 constexpr int kSocketBuffer = 1 << 20;
@@ -77,6 +77,43 @@ bool RandomBytes(void *out, size_t size)
         done += chunk;
     }
     return true;
+}
+
+uint64_t Rotl(uint64_t x, int bits)
+{
+    return (x << bits) | (x >> (64 - bits));
+}
+
+void SipRound(uint64_t &v0, uint64_t &v1, uint64_t &v2, uint64_t &v3)
+{
+    v0 += v1;
+    v1 = Rotl(v1, 13);
+    v1 ^= v0;
+    v0 = Rotl(v0, 32);
+    v2 += v3;
+    v3 = Rotl(v3, 16);
+    v3 ^= v2;
+    v0 += v3;
+    v3 = Rotl(v3, 21);
+    v3 ^= v0;
+    v2 += v1;
+    v1 = Rotl(v1, 17);
+    v1 ^= v2;
+    v2 = Rotl(v2, 32);
+}
+
+uint64_t LoadLe64(const uint8_t *p)
+{
+    uint64_t value = 0;
+    for (int i = 0; i < 8; i++)
+        value |= (uint64_t)p[i] << (8 * i);
+    return value;
+}
+
+void StoreLe64(uint8_t *p, uint64_t value)
+{
+    for (int i = 0; i < 8; i++)
+        p[i] = (uint8_t)(value >> (8 * i));
 }
 
 bool KeysEqual(const wire::Key &a, const wire::Key &b)
@@ -202,8 +239,11 @@ struct Relay {
     wire::Key guestToken = {};
     wire::Endpoint host;
     wire::Endpoint guest;
+    uint32_t hostAddress = 0;
+    uint32_t guestAddress = 0;
     bool hostBound = false;
     bool guestBound = false;
+    int64_t createdAt = 0;
     int64_t lastActivity = 0;
     int64_t credit = 0;
     int64_t creditUpdated = 0;
@@ -223,8 +263,43 @@ struct Stats {
     uint64_t relayed = 0;
     uint64_t limited = 0;
     uint64_t failed = 0;
+    uint64_t challenged = 0;
 };
 
+}
+
+void SipHash128(const uint8_t key[16], const void *data, size_t size, uint8_t out[16])
+{
+    const uint8_t *in = (const uint8_t *)data;
+    uint64_t k0 = LoadLe64(key);
+    uint64_t k1 = LoadLe64(key + 8);
+    uint64_t v0 = k0 ^ 0x736f6d6570736575ull;
+    uint64_t v1 = k1 ^ 0x646f72616e646f6dull ^ 0xee;
+    uint64_t v2 = k0 ^ 0x6c7967656e657261ull;
+    uint64_t v3 = k1 ^ 0x7465646279746573ull;
+    size_t blocks = size - size % 8;
+    for (size_t i = 0; i < blocks; i += 8) {
+        uint64_t m = LoadLe64(in + i);
+        v3 ^= m;
+        SipRound(v0, v1, v2, v3);
+        SipRound(v0, v1, v2, v3);
+        v0 ^= m;
+    }
+    uint64_t last = (uint64_t)size << 56;
+    for (size_t i = 0; i < size % 8; i++)
+        last |= (uint64_t)in[blocks + i] << (8 * i);
+    v3 ^= last;
+    SipRound(v0, v1, v2, v3);
+    SipRound(v0, v1, v2, v3);
+    v0 ^= last;
+    v2 ^= 0xee;
+    for (int i = 0; i < 4; i++)
+        SipRound(v0, v1, v2, v3);
+    StoreLe64(out, v0 ^ v1 ^ v2 ^ v3);
+    v1 ^= 0xdd;
+    for (int i = 0; i < 4; i++)
+        SipRound(v0, v1, v2, v3);
+    StoreLe64(out + 8, v0 ^ v1 ^ v2 ^ v3);
 }
 
 struct Server::State {
@@ -238,12 +313,14 @@ struct Server::State {
     size_t relayCursor = 0;
     uint64_t nextRelayId = 1;
     std::unordered_map<uint32_t, Bucket> buckets;
+    wire::Key cookieKey = {};
     std::vector<pollfd> pollFds;
     std::vector<uint64_t> pollRelays;
     std::vector<uint8_t> buffer;
     int64_t now = 0;
     int64_t nextSweep = 0;
     int64_t nextPrune = 0;
+    int64_t nextFullPrune = 0;
     int64_t nextStats = 0;
     Stats stats;
     bool statsDirty = false;
@@ -291,6 +368,39 @@ struct Server::State {
         sendto(fd, data.data(), data.size(), 0, (const sockaddr *)&sa, sizeof(sa));
     }
 
+    uint64_t CookieWindow() const { return (uint64_t)now / options.cookieWindowMs; }
+
+    wire::Key MakeCookie(const wire::Endpoint &from, uint64_t window) const
+    {
+        uint8_t input[14];
+        memcpy(input, &from.address, sizeof(from.address));
+        input[4] = (uint8_t)(from.port >> 8);
+        input[5] = (uint8_t)from.port;
+        for (int i = 0; i < 8; i++)
+            input[6 + i] = (uint8_t)(window >> (8 * i));
+        wire::Key cookie;
+        SipHash128(cookieKey.data(), input, sizeof(input), cookie.data());
+        return cookie;
+    }
+
+    bool CookieValid(const wire::Endpoint &from, const wire::Key &cookie) const
+    {
+        uint64_t window = CookieWindow();
+        bool current = KeysEqual(cookie, MakeCookie(from, window));
+        bool previous = KeysEqual(cookie, MakeCookie(from, window - 1));
+        return current | previous;
+    }
+
+    void SendChallenge(const wire::Endpoint &to, uint32_t nonce, size_t limit)
+    {
+        wire::Challenge challenge;
+        challenge.nonce = nonce;
+        challenge.cookie = MakeCookie(to, CookieWindow());
+        Send(mainFd, to, challenge, limit);
+        stats.challenged++;
+        statsDirty = true;
+    }
+
     void Fail(const wire::Endpoint &to, uint32_t nonce, wire::Failure reason, size_t limit)
     {
         wire::Failed failed;
@@ -304,39 +414,43 @@ struct Server::State {
         statsDirty = true;
     }
 
-    Bucket &BucketFor(uint32_t address)
+    Bucket *BucketFor(uint32_t address)
     {
         auto it = buckets.find(address);
         if (it == buckets.end()) {
-            if (buckets.size() >= kMaxBuckets)
-                buckets.erase(buckets.begin());
+            if (buckets.size() >= options.maxBuckets && now >= nextFullPrune) {
+                PruneBuckets();
+                nextFullPrune = now + kBucketFullPruneMs;
+            }
+            if (buckets.size() >= options.maxBuckets)
+                return nullptr;
             it = buckets.emplace(address, Bucket()).first;
             it->second.updated = now;
-            return it->second;
+            return &it->second;
         }
         Bucket &bucket = it->second;
         int64_t elapsed = std::max<int64_t>(0, now - bucket.updated);
         bucket.lookup = std::min(kLookupCapacity, bucket.lookup + elapsed);
         bucket.registration = std::min(kRegisterCapacity, bucket.registration + elapsed);
         bucket.updated = now;
-        return bucket;
+        return &bucket;
     }
 
     bool TakeLookup(uint32_t address)
     {
-        Bucket &bucket = BucketFor(address);
-        if (bucket.lookup < kLookupCost)
+        Bucket *bucket = BucketFor(address);
+        if (bucket == nullptr || bucket->lookup < kLookupCost)
             return false;
-        bucket.lookup -= kLookupCost;
+        bucket->lookup -= kLookupCost;
         return true;
     }
 
     bool TakeRegistration(uint32_t address)
     {
-        Bucket &bucket = BucketFor(address);
-        if (bucket.registration < kRegisterCost)
+        Bucket *bucket = BucketFor(address);
+        if (bucket == nullptr || bucket->registration < kRegisterCost)
             return false;
-        bucket.registration -= kRegisterCost;
+        bucket->registration -= kRegisterCost;
         return true;
     }
 
@@ -389,7 +503,23 @@ struct Server::State {
     Session *FindSession(const wire::Code &code)
     {
         auto it = sessions.find(CodeKey(code));
-        return it == sessions.end() ? nullptr : &it->second;
+        return it == sessions.end() || now >= it->second.expiresAt ? nullptr : &it->second;
+    }
+
+    size_t RelaysForGuest(uint32_t address) const
+    {
+        size_t count = 0;
+        for (const auto &entry : relays)
+            count += entry.second.guestAddress == address;
+        return count;
+    }
+
+    size_t RelaysForHost(uint32_t address) const
+    {
+        size_t count = 0;
+        for (const auto &entry : relays)
+            count += entry.second.hostAddress == address;
+        return count;
     }
 
     void CloseRelay(uint64_t id, bool detach)
@@ -463,6 +593,10 @@ struct Server::State {
         wire::Register request;
         if (!wire::Decode(data, size, request))
             return;
+        if (!CookieValid(from, request.cookie)) {
+            SendChallenge(from, request.nonce, size);
+            return;
+        }
         Session *existing = FindRegistration(from, request);
         if (existing == nullptr) {
             if (sessions.size() >= options.maxSessions || SessionsAt(from.address) >= options.maxSessionsPerAddress) {
@@ -521,20 +655,31 @@ struct Server::State {
         if (!wire::Decode(data, size, request))
             return;
         uint64_t key = CodeKey(request.code);
-        auto it = sessions.find(key);
-        if (it == sessions.end() || !KeysEqual(it->second.secret, request.secret)) {
+        Session *found = FindSession(request.code);
+        if (found == nullptr || !KeysEqual(found->secret, request.secret)) {
             Fail(from, request.nonce, wire::FAILURE_UNKNOWN_SESSION, size);
             return;
         }
-        Session &session = it->second;
-        if (session.hostPublic.address != from.address) {
-            IndexRemove(session.hostPublic.address, key);
-            IndexAdd(from.address, key);
-        }
-        if (options.verbose && session.hostPublic != from) {
-            char endpoint[32];
-            Log("session %s moved to %s", net::joincode::Format(session.code).c_str(),
-                FormatEndpoint(from, endpoint, sizeof(endpoint)));
+        Session &session = *found;
+        if (session.hostPublic != from) {
+            if (!CookieValid(from, request.cookie)) {
+                SendChallenge(from, request.nonce, size);
+                return;
+            }
+            if (session.hostPublic.address != from.address) {
+                IndexRemove(session.hostPublic.address, key);
+                IndexAdd(from.address, key);
+                for (uint64_t id : session.relays) {
+                    auto relay = relays.find(id);
+                    if (relay != relays.end())
+                        relay->second.hostAddress = from.address;
+                }
+            }
+            if (options.verbose) {
+                char endpoint[32];
+                Log("session %s moved to %s", net::joincode::Format(session.code).c_str(),
+                    FormatEndpoint(from, endpoint, sizeof(endpoint)));
+            }
         }
         session.hostPublic = from;
         session.hostLocal = request.local;
@@ -549,11 +694,10 @@ struct Server::State {
         wire::Unregister request;
         if (!wire::Decode(data, size, request))
             return;
-        uint64_t key = CodeKey(request.code);
-        auto it = sessions.find(key);
-        if (it == sessions.end() || !KeysEqual(it->second.secret, request.secret))
+        Session *session = FindSession(request.code);
+        if (session == nullptr || !KeysEqual(session->secret, request.secret))
             return;
-        RemoveSession(key);
+        RemoveSession(CodeKey(request.code));
     }
 
     void HandleResolve(const wire::Endpoint &from, const uint8_t *data, size_t size)
@@ -561,6 +705,10 @@ struct Server::State {
         wire::Resolve request;
         if (!wire::Decode(data, size, request))
             return;
+        if (!CookieValid(from, request.cookie)) {
+            SendChallenge(from, request.nonce, size);
+            return;
+        }
         if (!TakeLookup(from.address)) {
             Fail(from, request.nonce, wire::FAILURE_RATE_LIMITED, size);
             return;
@@ -605,25 +753,33 @@ struct Server::State {
         wire::Relay request;
         if (!wire::Decode(data, size, request))
             return;
+        if (!CookieValid(from, request.cookie)) {
+            SendChallenge(from, request.nonce, size);
+            return;
+        }
         if (!TakeLookup(from.address)) {
             Fail(from, request.nonce, wire::FAILURE_RATE_LIMITED, size);
             return;
         }
-        uint64_t key = CodeKey(request.code);
-        auto it = sessions.find(key);
-        if (it == sessions.end()) {
+        Session *found = FindSession(request.code);
+        if (found == nullptr) {
             Fail(from, request.nonce, wire::FAILURE_NOT_FOUND, size);
             return;
         }
-        Session &session = it->second;
+        Session &session = *found;
         Relay relay;
-        relay.session = key;
+        relay.session = CodeKey(request.code);
+        relay.guestAddress = from.address;
+        relay.hostAddress = session.hostPublic.address;
         if (session.relays.size() >= options.maxRelaysPerSession ||
+            RelaysForGuest(relay.guestAddress) >= options.maxRelaysPerGuestAddress ||
+            RelaysForHost(relay.hostAddress) >= options.maxRelaysPerHostAddress ||
             !RandomBytes(relay.hostToken.data(), relay.hostToken.size()) ||
             !RandomBytes(relay.guestToken.data(), relay.guestToken.size()) || !OpenRelay(relay)) {
             Fail(from, request.nonce, wire::FAILURE_FULL, size);
             return;
         }
+        relay.createdAt = now;
         relay.lastActivity = now;
         relay.creditUpdated = now;
         relay.credit = 2 * (int64_t)options.relayBytesPerSecond * 1000;
@@ -712,16 +868,17 @@ struct Server::State {
         wire::Bind request;
         if (!wire::Decode(data, size, request))
             return;
-        if (KeysEqual(request.token, relay.hostToken)) {
+        bool hostToken = KeysEqual(request.token, relay.hostToken);
+        bool guestToken = KeysEqual(request.token, relay.guestToken);
+        if (hostToken && from.address == relay.hostAddress) {
             relay.host = from;
             relay.hostBound = true;
-        } else if (KeysEqual(request.token, relay.guestToken)) {
+        } else if (guestToken && from.address == relay.guestAddress) {
             relay.guest = from;
             relay.guestBound = true;
         } else {
             return;
         }
-        relay.lastActivity = now;
         wire::Bound reply;
         reply.token = request.token;
         Send(relay.fd, from, reply, size);
@@ -748,11 +905,12 @@ struct Server::State {
             return;
         }
         sockaddr_in sa = ToSockaddr(*to);
-        if (sendto(relay.fd, data, size, 0, (const sockaddr *)&sa, sizeof(sa)) == (ssize_t)size)
+        if (sendto(relay.fd, data, size, 0, (const sockaddr *)&sa, sizeof(sa)) == (ssize_t)size) {
             relay.forwardedBytes += size;
-        else
+            relay.lastActivity = now;
+        } else {
             relay.droppedBytes += size;
-        relay.lastActivity = now;
+        }
     }
 
     template <typename Handler>
@@ -792,7 +950,10 @@ struct Server::State {
             RemoveSession(key);
         std::vector<uint64_t> idle;
         for (auto &entry : relays) {
-            if (now - entry.second.lastActivity >= (int64_t)options.relayIdleMs)
+            const Relay &relay = entry.second;
+            bool unbound =
+                !(relay.hostBound && relay.guestBound) && now - relay.createdAt >= (int64_t)options.relayBindMs;
+            if (unbound || now - relay.lastActivity >= (int64_t)options.relayIdleMs)
                 idle.push_back(entry.first);
         }
         for (uint64_t id : idle)
@@ -812,10 +973,11 @@ struct Server::State {
         if (now >= nextStats) {
             if (statsDirty) {
                 Log("%zu sessions, %zu relays; registered %llu, resolved %llu, relayed %llu, rate limited %llu, "
-                    "failed %llu",
+                    "failed %llu, challenged %llu",
                     sessions.size(), relays.size(), (unsigned long long)stats.registered,
                     (unsigned long long)stats.resolved, (unsigned long long)stats.relayed,
-                    (unsigned long long)stats.limited, (unsigned long long)stats.failed);
+                    (unsigned long long)stats.limited, (unsigned long long)stats.failed,
+                    (unsigned long long)stats.challenged);
                 stats = Stats();
                 statsDirty = false;
             }
@@ -834,6 +996,14 @@ bool Server::Start()
     if (s.mainFd >= 0)
         return true;
     const Options &o = s.options;
+    if (o.maxSessions == 0 || o.maxSessions > kMaxSessionsLimit) {
+        s.Log("error: max sessions must be from 1 to %zu", kMaxSessionsLimit);
+        return false;
+    }
+    if (o.cookieWindowMs == 0) {
+        s.Log("error: invalid cookie window");
+        return false;
+    }
     if (o.relayFirstPort != 0) {
         uint32_t last = (uint32_t)o.relayFirstPort + o.relayPortCount;
         if (o.relayPortCount == 0 || last - 1 > 65535 || (o.port >= o.relayFirstPort && o.port < last)) {
@@ -842,8 +1012,7 @@ bool Server::Start()
         }
         s.relaySlots.assign(o.relayPortCount, false);
     }
-    uint8_t probe[16];
-    if (!RandomBytes(probe, sizeof(probe))) {
+    if (!RandomBytes(s.cookieKey.data(), s.cookieKey.size())) {
         s.Log("error: no random source");
         return false;
     }

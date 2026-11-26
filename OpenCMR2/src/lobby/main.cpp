@@ -37,12 +37,14 @@ void Usage(FILE *out)
 {
     fprintf(out,
             "usage: opencmr2-lobby [--bind ADDR] [--port N] [--relay-ports FIRST-LAST] [--max-sessions N]\n"
-            "                      [--verbose] [--help]\n"
+            "                      [--max-guest-relays N] [--max-host-relays N] [--verbose] [--help]\n"
             "\n"
             "  --bind ADDR               IPv4 address to listen on (default 0.0.0.0)\n"
             "  --port N                  UDP port for the lobby (default 28630)\n"
             "  --relay-ports FIRST-LAST  UDP ports for relays (default 28631-28694)\n"
-            "  --max-sessions N          most sessions at once (default 4096)\n"
+            "  --max-sessions N          most sessions at once, up to 65536 (default 4096)\n"
+            "  --max-guest-relays N      most relays at once requested from one IP address (default 2)\n"
+            "  --max-host-relays N       most relays at once to hosts on one IP address (default 7)\n"
             "  --verbose                 log endpoints and codes\n"
             "  --help                    show this help\n");
 }
@@ -114,11 +116,21 @@ int main(int argc, char **argv)
             }
             i++;
         } else if (strcmp(arg, "--max-sessions") == 0) {
-            if (!ParseNumber(value, 1, 1000000, number)) {
-                fprintf(stderr, "opencmr2-lobby: --max-sessions needs a number from 1 to 1000000\n");
+            if (!ParseNumber(value, 1, lobby::kMaxSessionsLimit, number)) {
+                fprintf(stderr, "opencmr2-lobby: --max-sessions needs a number from 1 to %zu\n", lobby::kMaxSessionsLimit);
                 return 2;
             }
             options.maxSessions = (size_t)number;
+            i++;
+        } else if (strcmp(arg, "--max-guest-relays") == 0 || strcmp(arg, "--max-host-relays") == 0) {
+            if (!ParseNumber(value, 1, 65535, number)) {
+                fprintf(stderr, "opencmr2-lobby: %s needs a number from 1 to 65535\n", arg);
+                return 2;
+            }
+            if (strcmp(arg, "--max-guest-relays") == 0)
+                options.maxRelaysPerGuestAddress = (size_t)number;
+            else
+                options.maxRelaysPerHostAddress = (size_t)number;
             i++;
         } else {
             fprintf(stderr, "opencmr2-lobby: unknown option %s\n", arg);

@@ -27,13 +27,43 @@ and a C++17 compiler. It runs on Linux and macOS.
    into the game traffic (ENet), and it is neither encrypted nor
    authenticated: the lobby operator, or anyone on the path, can read it.
 
+**Return routability.** Before the lobby acts on a registration, lookup or
+relay request, the sender proves that it receives packets at its source
+address. A request with a missing or wrong cookie gets a `CHALLENGE`
+carrying a cookie for that address and port; the client sends the same
+request again with the cookie. The lobby keeps no state for unproven
+requests, so forged source addresses cannot create sessions, relays or
+introductions, or use up another address's rate limits. This is the same
+idea as the cookie in DTLS (HelloVerifyRequest) and QUIC (Retry).
+
 The lobby never sees the game itself: once host and guest talk to each
 other (directly or through a relay), the lobby only keeps the registration
 alive.
 
 Protocol: `src/net/lobby_wire.h` (messages) and `src/net/join_code.h` (code
-format). Every request is padded to 64 bytes and every reply is shorter than
-the request, so the lobby cannot be used to amplify traffic.
+format). Every request is padded to 64 bytes and every reply, `CHALLENGE`
+(26 bytes) included, is shorter than the request, so the lobby cannot be
+used to amplify traffic.
+
+### Cookies
+
+`REGISTER`, `REFRESH`, `RESOLVE` and `RELAY` carry a 16-byte cookie after the
+nonce. The cookie is SipHash-2-4 with 128-bit output, keyed with 128 random
+bits the lobby draws from the system's secure random source at start-up,
+over the source IPv4 address, the source port and a 30-second time window.
+The lobby accepts the cookie of the current and the previous window (30 to
+60 seconds of validity) and compares it in constant time. A restart picks a
+new key, so clients simply get one more `CHALLENGE`.
+
+- `REGISTER`, `RESOLVE` and `RELAY` need a valid cookie. Without one, the
+  lobby answers `CHALLENGE` and does nothing else: no session, no relay, no
+  introduction to the host, and no rate limit or per-address cap is
+  consulted.
+- `REFRESH` needs a valid cookie only when it comes from another address or
+  port than the session's current host address. A host behind a NAT that
+  changes its mapping moves the session only after proving it receives at
+  the new address; a refresh from the same address works with any cookie.
+- `UNREGISTER` needs only the session secret.
 
 ## Firewall
 
@@ -99,7 +129,9 @@ it fails.
 | `--bind ADDR` | `0.0.0.0` | IPv4 address to listen on |
 | `--port N` | 28630 | Lobby UDP port |
 | `--relay-ports FIRST-LAST` | 28631-28694 | Relay UDP ports; the number of ports is the number of relays at once |
-| `--max-sessions N` | 4096 | Registered hosts at once |
+| `--max-sessions N` | 4096 | Registered hosts at once (at most 65536) |
+| `--max-guest-relays N` | 2 | Relays at once requested from one IP address |
+| `--max-host-relays N` | 7 | Relays at once to hosts on one IP address, over all their sessions |
 | `--verbose` | off | Log addresses and codes (see Privacy) |
 | `--help` | | Show the options |
 
@@ -114,15 +146,31 @@ it cleanly. Logs go to stderr with UTC timestamps.
 | Sessions per public IP address | 4 |
 | Registrations per IP address | 4 at once, then 1 per 10 s |
 | Lookups (resolve and relay requests) per IP address | 10 at once, then 1 per 3 s |
-| Introductions per session | 4 per second |
+| Introductions per session | 16 per second |
 | Relays per session | 7 |
+| Relays requested from one IP address | 2 at once (`--max-guest-relays`) |
+| Relays to hosts on one IP address | 7 at once (`--max-host-relays`) |
+| Relay binding | both sides within 10 s, or the relay closes |
 | Relay bandwidth | 256 KiB/s per relay (bursts of 512 KiB) |
-| Relay idle timeout | 30 s without traffic |
+| Relay idle timeout | 30 s without forwarded traffic (binding does not count) |
 | Largest datagram | 4096 bytes |
 
-Over a limit the lobby answers `FULL` or `RATE_LIMITED`. The rate limit
-table holds at most 65536 addresses and forgets idle ones, so spoofed
-sources cannot grow it without bound.
+Over a limit the lobby answers `FULL` or `RATE_LIMITED`. All limits are
+checked only after the cookie is valid. The rate limit table holds at most
+65536 addresses. It never drops an address that is still limited: when the
+table is full, it forgets addresses idle for 40 seconds (their limits are
+back to full by then), and if it is still full, requests from new
+addresses get `RATE_LIMITED` until room frees up. Expired sessions and idle
+relays are swept once a second.
+
+The per-address limits count IP addresses, not players. Players behind one
+carrier-grade NAT (common on mobile networks and some ISPs) share one
+public address and therefore share its registrations, lookups and relays:
+for example, a third player behind the same CGNAT address cannot get a relay
+while two others hold one. If that matters for your players, raise
+`--max-guest-relays` and `--max-host-relays`; the other per-address limits
+are fixed in the code (`lobby::Options` and the constants at the top of
+`lobby_server.cpp`).
 
 ## Security and privacy
 
@@ -133,9 +181,18 @@ sources cannot grow it without bound.
   host's game still decides who plays.
 - **Secrets and tokens** (128 bits) prove that a request comes from the
   host, and decide which addresses a relay port is bound to. They are
-  compared in constant time. After binding, a relay forwards by source
-  address: datagrams from any other address are dropped without an answer,
-  but a forged source address that matches a bound player is not detected.
+  compared in constant time. The relay records the guest's IP address
+  (proven by its cookie) and the host's current IP address when it is
+  created, and accepts the host token only from the host's IP address and
+  the guest token only from the guest's (any port, so a NAT that changes
+  the port still works). A session owner therefore cannot point a relay at
+  a third party with a forged `BIND`. After binding, a relay forwards by
+  source address: datagrams from any other address are dropped without an
+  answer, but a forged source address that matches a bound player is not
+  detected.
+- **Cookies** stop forged source addresses from creating sessions or relays,
+  making hosts send packets to arbitrary addresses, or exhausting another
+  address's limits (see Cookies above).
 - **Malformed input** is dropped silently. The parser checks every length;
   the test suite sends it 20000 random datagrams.
 - **What is stored:** only in memory, for the lifetime of a session: the
@@ -170,9 +227,15 @@ functions (`Net_GetHostCode`, `Net_FindByCode` in `src/port/net.h`) return
 ## Tests
 
 `tests/lobby_server.cpp` (`ctest -R lobby_server`) runs the server on the
-loopback and covers registration, resolve and introduction, the local
-address rule, refresh, expiry, the rate limits and caps, relays (binding,
-rebinding, forwarding, bandwidth, idle expiry) and random input.
+loopback and covers the SipHash-2-4-128 reference vectors, the cookie
+round trip (missing, wrong, stale and other-address cookies create no
+state; window rollover), registration, resolve and introduction, the local
+address rule, refresh and moving a session, expiry, the rate limits and
+caps (introductions, relays per guest and per host address, a full rate
+limit table), relays (binding from the right address only, rebinding,
+forwarding, bandwidth, idle expiry, unbound relays) and random input. The
+cases that need a second loopback address (127.0.0.2) run on Linux and are
+skipped with a message on macOS.
 
 `tests/net_lobby_e2e.cpp` (`ctest -R net_lobby_e2e`) runs real sessions
 against the server on the loopback: a direct and a relayed join by code with

@@ -38,10 +38,5 @@ if(OPENCMR2_BUILD_TESTS AND NOT ANDROID AND EXISTS ${OPENCMR2_LOBBY_TEST_SOURCE}
         enable_testing()
         add_test(NAME lobby_server COMMAND lobby_server_test)
         set_tests_properties(lobby_server PROPERTIES TIMEOUT 60)
-    else()
-        cmake_language(DEFER DIRECTORY ${CMAKE_SOURCE_DIR}
-            CALL add_test NAME lobby_server COMMAND $<TARGET_FILE:lobby_server_test>)
-        cmake_language(DEFER DIRECTORY ${CMAKE_SOURCE_DIR}
-            CALL set_tests_properties lobby_server PROPERTIES TIMEOUT 60)
     endif()
 endif()
