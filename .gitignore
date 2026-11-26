@@ -11,3 +11,8 @@ OpenCMR2-macOS-arm64/
 # Paczki aplikacji i katalogi budowania
 *.app/
 build/
+OpenCMR2/build*/
+OpenCMR2/overrides/
+OpenCMR2/dumped_textures/
+__pycache__/
+*.py[cod]
