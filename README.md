@@ -23,6 +23,57 @@ Pliki gry oraz binarki silnika są ignorowane przez Git (`.gitignore`). Aby uruc
 > xattr -dr com.apple.quarantine OpenCMR2-macOS-arm64
 > ```
 
+## Instalacja na innym Macu (z Dysku Google)
+
+Pliki gry i binarki silnika nie są w repozytorium (zasoby gry są chronione prawem autorskim). Właściciel trzyma je w prywatnym folderze na swoim Dysku Google:
+
+- `Colin McRae Rally 2/` (oryginalne pliki gry)
+- `OpenCMR2-macOS-arm64/` (silnik: `opencmr2`, `libSDL3.0.dylib`, serwer `opencmr2-lobby`, licencje)
+- `Uruchom Colin McRae Rally 2.command` (launcher)
+- `INSTRUKCJA.txt` (skrócona instrukcja)
+- `cmr2-tekstury-HD.zip` (opcjonalne tekstury HD, ok. 3,8 GB, po rozpakowaniu ok. 6,2 GB)
+
+### Wymagania
+
+Mac z procesorem Apple Silicon (M1 lub nowszy), macOS 11 Big Sur lub nowszy. SDL3 jest w paczce, Homebrew nie jest potrzebny.
+
+### Pobieranie
+
+- **Dysk Google w przeglądarce:** prawy klik na folderze, **Pobierz**. Dysk pakuje folder w jeden lub kilka plików zip: rozpakuj wszystkie części do jednego folderu (np. `~/Gry/cmr2`).
+- **Aplikacja Dysk Google na Macu:** oznacz folder jako dostępny offline albo skopiuj go z folderu Dysku w inne miejsce (np. `~/Gry/cmr2`). Uruchamianie gry wprost ze strumieniowanego folderu Dysku jest wolne.
+
+### Pierwsze uruchomienie
+
+W Terminalu, w pobranym folderze:
+
+```bash
+xattr -dr com.apple.quarantine .
+chmod +x "Uruchom Colin McRae Rally 2.command" OpenCMR2-macOS-arm64/opencmr2 OpenCMR2-macOS-arm64/opencmr2-lobby
+```
+
+Potem podwójne kliknięcie na `Uruchom Colin McRae Rally 2.command`.
+
+### Tekstury HD (opcjonalnie)
+
+```bash
+mkdir -p "$HOME/Library/Application Support/OpenCMR2"
+ditto -x -k cmr2-tekstury-HD.zip "$HOME/Library/Application Support/OpenCMR2/"
+```
+
+Tekstury trafiają do `~/Library/Application Support/OpenCMR2/overrides`. Gra przez internet z kodem wymaga jeszcze ustawienia `lobby` (sekcja poniżej).
+
+### Własna paczka z tego repozytorium
+
+Kto ma własną kopię gry, może zbudować silnik sam, zamiast pobierać paczkę: [OpenCMR2/README.md](OpenCMR2/README.md), sekcja *Building* (preset `macos`). Żeby paczka działała na innym Macu bez Homebrew, zbuduj ją z SDL3 kompilowanym ze źródeł:
+
+```bash
+cd OpenCMR2
+cmake --preset macos -B build/macos-package -DOPENCMR2_VENDORED_SDL=ON -DOPENCMR2_BUILD_TESTS=OFF
+cmake --build build/macos-package --target opencmr2 opencmr2-lobby
+```
+
+Do `OpenCMR2-macOS-arm64/` trafiają `build/macos-package/src/opencmr2`, `build/macos-package/src/lobby/opencmr2-lobby` i `build/macos-package/_deps/sdl3-build/libSDL3.0.dylib`. W `opencmr2` usuń rpath do katalogu builda (`install_name_tool -delete_rpath`, zostaje tylko `@executable_path`) i podpisz pliki ponownie (`codesign --force -s -`).
+
 ## Gra przez internet (kod gry)
 
 Multiplayer przez internet bez przekierowywania portów: gospodarz dostaje krótki kod (np. `7KQ2-M9XA`), znajomy wpisuje go w grze. Połączenie ustawia mały serwer pośredniczący (lobby), a sama gra toczy się bezpośrednio między graczami (albo przez relay lobby, gdy routery nie przepuszczają ruchu).
