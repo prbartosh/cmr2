@@ -254,7 +254,7 @@ else()
 endif()
 
 # Sessions over ENet, without SDL: tests run hosts and clients in one process.
-add_library(opencmr2_net STATIC net/net_session.cpp)
+add_library(opencmr2_net STATIC net/net_session.cpp net/rendezvous.cpp)
 target_include_directories(opencmr2_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 find_package(Threads REQUIRED)
 target_link_libraries(opencmr2_net PUBLIC enet Threads::Threads)
@@ -293,6 +293,8 @@ endif()
 target_include_directories(opencmr2_platform PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated
     ${PROJECT_SOURCE_DIR}/third_party/stb)
 target_link_libraries(opencmr2_platform PRIVATE opencmr2_bink opencmr2_net)
+set(OPENCMR2_LOBBY "" CACHE STRING "Default join-code lobby server (host or host:port), empty for none")
+target_compile_definitions(opencmr2_platform PRIVATE OPENCMR2_DEFAULT_LOBBY="${OPENCMR2_LOBBY}")
 
 # ---- installation (Linux desktop, Flatpak, AppImage, distro packages) -----------
 if(NOT ANDROID)

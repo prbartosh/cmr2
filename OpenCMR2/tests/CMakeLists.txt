@@ -20,6 +20,12 @@ target_compile_options(net_session_test PRIVATE "SHELL:-include ${PROJECT_SOURCE
 add_test(NAME net_session COMMAND net_session_test)
 set_tests_properties(net_session PROPERTIES TIMEOUT 60)
 
+add_executable(net_rendezvous_test net_rendezvous.cpp)
+target_link_libraries(net_rendezvous_test PRIVATE opencmr2_net)
+target_compile_options(net_rendezvous_test PRIVATE "SHELL:-include ${PROJECT_SOURCE_DIR}/src/port/types.h")
+add_test(NAME net_rendezvous COMMAND net_rendezvous_test)
+set_tests_properties(net_rendezvous PROPERTIES TIMEOUT 60)
+
 add_executable(bink_decoder_test bink_decoder.cpp)
 target_link_libraries(bink_decoder_test PRIVATE opencmr2_bink)
 add_test(NAME bink_decoder COMMAND bink_decoder_test)
