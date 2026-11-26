@@ -167,6 +167,49 @@ void SendRaw(ENetHost *host, uint32_t address, uint16_t port, const std::vector<
     enet_socket_send(host->socket, &to, &buffer, 1);
 }
 
+struct LobbyLookup {
+    bool ok = false;
+    lobby::Endpoint lobbyAt;
+    lobby::Endpoint local;
+};
+
+LobbyLookup LookUpLobby(const std::string &setting, uint16_t localPort,
+                        bool (*resolveHost)(const char *name, uint32_t *address))
+{
+    LobbyLookup lookup;
+    std::string name = setting;
+    uint16_t port = lobby::kDefaultPort;
+    size_t colon = name.rfind(':');
+    if (colon != std::string::npos) {
+        port = (uint16_t)atoi(name.c_str() + colon + 1);
+        name.resize(colon);
+    }
+    if (name.empty() || port == 0)
+        return lookup;
+    ENetAddress address;
+    if (enet_address_set_host_ip(&address, name.c_str()) != 0) {
+        bool resolved = resolveHost != nullptr ? resolveHost(name.c_str(), &address.host)
+                                               : enet_address_set_host(&address, name.c_str()) == 0;
+        if (!resolved)
+            return lookup;
+    }
+    address.port = port;
+    lookup.ok = true;
+    lookup.lobbyAt.address = address.host;
+    lookup.lobbyAt.port = port;
+    ENetSocket probe = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
+    if (probe != (ENetSocket)-1) {
+        ENetAddress mine;
+        if (enet_socket_connect(probe, &address) == 0 && enet_socket_get_address(probe, &mine) == 0 &&
+            mine.host != 0 && !IsLoopbackAddress(mine.host)) {
+            lookup.local.address = mine.host;
+            lookup.local.port = localPort;
+        }
+        enet_socket_destroy(probe);
+    }
+    return lookup;
+}
+
 } // namespace
 
 // ---- players and the roster ------------------------------------------------------------
@@ -215,6 +258,7 @@ Session::~Session()
     running = false;
     if (thread.joinable())
         thread.join();
+    StopResolver();
     std::lock_guard<std::mutex> lock(mutex);
     if (host != nullptr) {
         enet_host_flush(host);
@@ -259,6 +303,7 @@ HRESULT Session::Start()
     LOG("net: UDP port %u", (unsigned)boundPort);
     running = true;
     thread = std::thread(&Session::Run, this);
+    StartResolver();
     return NET_OK;
 }
 
@@ -267,6 +312,7 @@ void Session::Abandon()
     running = false;
     if (thread.joinable())
         thread.join();
+    StopResolver();
     std::lock_guard<std::mutex> lock(mutex);
     rendezvous.StopHosting(false);
     if (host != nullptr) {
@@ -284,7 +330,6 @@ void Session::Run()
         enet_uint32 condition = ENET_SOCKET_WAIT_RECEIVE;
         enet_socket_wait(host->socket, &condition, 5);
         bool resolve = false;
-        bool resolveLobby = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
             uint32_t now = NowMs();
@@ -298,13 +343,58 @@ void Session::Run()
                 (lastLobbyResolve == 0 ||
                  Elapsed(now, lastLobbyResolve, lobbyResolved ? kLobbyRefreshMs : kLobbyRetryMs))) {
                 lobbyResolving = true;
-                resolveLobby = true;
+                lobbyRequested = true;
+                resolverWake.notify_one();
             }
         }
         if (resolve)
             ResolvePeers();
-        if (resolveLobby)
-            ResolveLobby();
+    }
+}
+
+void Session::StartResolver()
+{
+    if (config.lobby.empty() || resolver.joinable())
+        return;
+    resolverStop = false;
+    resolver = std::thread(&Session::ResolveLoop, this);
+}
+
+void Session::StopResolver()
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        resolverStop = true;
+        lobbyRequested = false;
+        lobbyResolving = false;
+    }
+    resolverWake.notify_all();
+    if (resolver.joinable())
+        resolver.join();
+}
+
+void Session::ResolveLoop()
+{
+    std::unique_lock<std::mutex> lock(mutex);
+    for (;;) {
+        resolverWake.wait(lock, [this] { return resolverStop || lobbyRequested; });
+        if (resolverStop)
+            return;
+        lobbyRequested = false;
+        std::string setting = config.lobby;
+        uint16_t localPort = boundPort;
+        lock.unlock();
+        LobbyLookup lookup = LookUpLobby(setting, localPort, config.resolveHost);
+        lock.lock();
+        if (resolverStop)
+            return;
+        if (lookup.ok)
+            rendezvous.SetLobby(lookup.lobbyAt, lookup.local);
+        else
+            LOG("net: cannot resolve the lobby %s", config.lobby.c_str());
+        lobbyResolved = lookup.ok;
+        lastLobbyResolve = NowMs();
+        lobbyResolving = false;
     }
 }
 
@@ -385,43 +475,6 @@ void Session::ResolvePeers()
     lastResolve = NowMs();
     lastQuery = 0;      // ask the new list straight away
     resolving = false;
-}
-
-void Session::ResolveLobby()
-{
-    std::string name = config.lobby;
-    uint16_t port = lobby::kDefaultPort;
-    size_t colon = name.rfind(':');
-    if (colon != std::string::npos) {
-        port = (uint16_t)atoi(name.c_str() + colon + 1);
-        name.resize(colon);
-    }
-    ENetAddress address;
-    bool ok = !name.empty() && port != 0 && enet_address_set_host(&address, name.c_str()) == 0;
-    lobby::Endpoint lobbyAt, local;
-    if (ok) {
-        address.port = port;
-        lobbyAt.address = address.host;
-        lobbyAt.port = port;
-        ENetSocket probe = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
-        if (probe != (ENetSocket)-1) {
-            ENetAddress mine;
-            if (enet_socket_connect(probe, &address) == 0 && enet_socket_get_address(probe, &mine) == 0 &&
-                mine.host != 0 && !IsLoopbackAddress(mine.host)) {
-                local.address = mine.host;
-                local.port = boundPort;
-            }
-            enet_socket_destroy(probe);
-        }
-    } else {
-        LOG("net: cannot resolve the lobby %s", config.lobby.c_str());
-    }
-    std::lock_guard<std::mutex> lock(mutex);
-    if (ok)
-        rendezvous.SetLobby(lobbyAt, local);
-    lobbyResolved = ok;
-    lastLobbyResolve = NowMs();
-    lobbyResolving = false;
 }
 
 void Session::Search(uint32_t now)

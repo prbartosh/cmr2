@@ -26,6 +26,14 @@ target_compile_options(net_rendezvous_test PRIVATE "SHELL:-include ${PROJECT_SOU
 add_test(NAME net_rendezvous COMMAND net_rendezvous_test)
 set_tests_properties(net_rendezvous PROPERTIES TIMEOUT 60)
 
+if(TARGET opencmr2_lobby)
+    add_executable(net_lobby_e2e_test net_lobby_e2e.cpp)
+    target_link_libraries(net_lobby_e2e_test PRIVATE opencmr2_net opencmr2_lobby)
+    target_compile_options(net_lobby_e2e_test PRIVATE "SHELL:-include ${PROJECT_SOURCE_DIR}/src/port/types.h")
+    add_test(NAME net_lobby_e2e COMMAND net_lobby_e2e_test)
+    set_tests_properties(net_lobby_e2e PROPERTIES TIMEOUT 90)
+endif()
+
 add_executable(bink_decoder_test bink_decoder.cpp)
 target_link_libraries(bink_decoder_test PRIVATE opencmr2_bink)
 add_test(NAME bink_decoder COMMAND bink_decoder_test)
