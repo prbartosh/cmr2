@@ -983,6 +983,8 @@ std::string Utf8FromWindows1252(const std::string &text)
 // Text input can carry several characters; they are handed out one by one.
 std::vector<int> s_pendingText;
 bool s_pasteSwallow;
+int s_pasteCount;
+int s_pasteInjected;
 
 void PasteClipboard();
 
@@ -1118,6 +1120,8 @@ void PasteClipboard()
         }
     }
     SDL_free(text);
+    s_pasteCount++;
+    s_pasteInjected += count;
 }
 
 #ifdef __ANDROID__
@@ -1385,12 +1389,22 @@ extern "C" int Sys_GetClipboardText(char *buffer, int size)
     return length;
 }
 
-extern "C" void Sys_SetClipboardText(const char *text)
+extern "C" BOOL Sys_SetClipboardText(const char *text)
 {
     if (text == NULL)
-        return;
-    if (!SDL_SetClipboardText(Utf8FromWindows1252(text).c_str()))
+        return FALSE;
+    if (!SDL_SetClipboardText(Utf8FromWindows1252(text).c_str())) {
         Sys_Log("SDL_SetClipboardText failed: %s", SDL_GetError());
+        return FALSE;
+    }
+    return TRUE;
+}
+
+extern "C" int Sys_GetPasteCount(int *injectedTotal)
+{
+    if (injectedTotal != NULL)
+        *injectedTotal = s_pasteInjected;
+    return s_pasteCount;
 }
 
 // ---- window ----------------------------------------------------------------------
