@@ -41,7 +41,7 @@ Multiplayer przez internet bez przekierowywania portów: gospodarz dostaje krót
 
 ### Gospodarz
 
-1. **Sieć → Gospodarz**, utwórz grę.
+1. **Sieć → Sesja → Gospodarz**, ustaw grę (nazwa, tryb, liczba graczy, opcjonalnie hasło) i zatwierdź.
 2. W lobby gry pojawia się linia **Kod gry: XXXX-XXXX**. Kod jest automatycznie kopiowany do schowka (obok kodu widać „(skopiowano do schowka)”).
 3. Wyślij kod znajomemu. Kod działa, dopóki gra jest otwarta i połączona z lobby.
 
