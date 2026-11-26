@@ -16,3 +16,6 @@ OpenCMR2/overrides/
 OpenCMR2/dumped_textures/
 __pycache__/
 *.py[cod]
+
+# Worktree agentów Claude Code (nigdy do repozytorium)
+.claude/worktrees/

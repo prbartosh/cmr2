@@ -3,6 +3,7 @@
 > **Data aktualizacji:** 2026-11-26  
 > **Stan bazowy (`main`):** Etapy 0–9 ukończone, zweryfikowane (24/24 `ctest`, 13/13 testów Python, smoke-test Metal na polskiej edycji + 11 939 plików tekstur HD w `~/Library/Application Support/OpenCMR2/overrides/`).  
 > **Przeznaczenie:** Checkpoint i specyfikacja dla kolejnej sesji (Faza 2: Etapy 10–14 — „Max Visuals + High Performance”).
+> **Faza 3 (multiplayer przez internet z kodem gry):** zrealizowana na branchu `multiplayer-join-code` (poza `main`), opis w sekcji 5.
 
 ---
 
@@ -99,3 +100,74 @@ cat "$TMP_USER/opencmr2.log"
    - **Soft Particles** (próbkowanie głębi sceny przy półprzezroczystych cząsteczkach kurzu/śniegu/dymu, usuwające twarde linie przecięcia z ziemią i nadwoziem).
    - Dodanie przełączników nowych funkcji do podmenu **Grafika HD** w `game/FrontendScreens.cpp` (6 języków, w tym PL).
    - Końcowa weryfikacja: pełny `ctest` (wszystkie testy + UDP), pomiar czasu klatki / FPS na Metal w wysokiej rozdzielczości, weryfikacja `F10` oraz opcjonalna aktualizacja paczki binarnej `OpenCMR2-macOS-arm64/`.
+
+---
+
+## 5. Faza 3: Multiplayer przez internet z kodem gry
+
+Stan: branch `multiplayer-join-code` (nie scalony z `main`). Instrukcja dla graczy: `README.md` (sekcja „Gra przez internet”). Dokumentacja techniczna: `OpenCMR2/docs/LOBBY.md` (serwer) i `OpenCMR2/docs/NETWORK.md` (sieć gry).
+
+### Architektura
+
+- **Cel:** dołączanie do gry przez internet krótkim kodem, bez przekierowywania portów i bez VPN.
+- **Rendezvous przez lobby:** gospodarz rejestruje się w serwerze lobby (UDP) i dostaje kod oraz sekret. Gość pyta lobby o kod, dostaje publiczny adres gospodarza, a gospodarz jednocześnie adres gościa.
+- **Hole punching:** obie strony wysyłają do siebie pakiety, co otwiera mapowanie w typowych routerach (NAT). Adresy lokalne (LAN) przekazywane są tylko, gdy obaj gracze mają ten sam adres publiczny, a adres lokalny jest prywatny.
+- **Relay jako fallback:** gdy hole punching zawodzi (symetryczny NAT, CGNAT), lobby otwiera port relay i przekazuje datagramy bez zmian. Relay nie szyfruje ruchu.
+- **Ten sam socket co gra:** cała rozmowa z lobby i hole punching idą przez socket ENet sesji gry, więc mapowanie NAT dotyczy portu, na którym potem toczy się gra.
+- **Return-routability cookie:** lobby odpowiada wyzwaniem z cookie, które klient odsyła w żądaniu (dowód, że odbiera pakiety pod swoim adresem źródłowym). Żądania są dopełniane do 64 bajtów, a odpowiedzi krótsze, więc lobby nie służy do amplifikacji.
+- **Kody:** 40 losowych bitów (`getentropy`), 8 znaków Crockford base 32 (np. `7KQ2-M9XA`), wpisywane bez rozróżniania wielkości liter, I/L jak 1, O jak 0.
+- **Limity po stronie lobby:** m.in. 4 sesje i 4 rejestracje na adres IP, limity zapytań, 7 relay na sesję, 256 KiB/s na relay (pełna tabela w `LOBBY.md`).
+
+### Pliki i moduły (wszystko w `OpenCMR2/`)
+
+- `src/lobby/`: serwer `opencmr2-lobby` (`lobby_server.cpp/.h`, `main.cpp`, `CMakeLists.txt`, `Dockerfile`, `opencmr2-lobby.service`). Samodzielny build bez reszty projektu.
+- `src/net/lobby_wire.h`, `src/net/join_code.h`: protokół lobby i format kodu.
+- `src/net/rendezvous.cpp/.h`: klient (rejestracja, wyszukiwanie po kodzie, hole punching, relay).
+- `src/net/net_session.cpp/.h`, `src/net/net_api.cpp`, `src/port/net.h`: integracja z sesją, API C `Net_GetHostCode`, `Net_FindByCode`, `Net_GetCodeSession`, `Net_CancelFind` i statusy `NET_CODE_*`.
+- `game/FrontendJoinCode.cpp/.h` (+ wpisy w `FrontendMenus.cpp`, `FrontendScreens.cpp`): ekran „Dołącz kodem” (6 języków), linia „Kod gry” u gospodarza, kopiowanie do schowka.
+- `src/platform/sys.cpp`, `src/port/sys.h`: schowek (odczyt, zapis) i wklejanie Ctrl+V / Cmd+V w polach tekstowych; szablon `[net]` w domyślnym `opencmr2.ini`.
+- `tools/nat_test/`: test w Dockerze z dwoma routerami NAT.
+- `docs/LOBBY.md`: dokumentacja serwera.
+
+### Konfiguracja
+
+- `[net] lobby = adres[:port]` w `~/Library/Application Support/OpenCMR2/opencmr2.ini` (domyślny port 28630). Ustawienie nadpisuje domyślną wartość z buildu (`-DOPENCMR2_LOBBY=adres` przy konfiguracji CMake, domyślnie puste). Bez lobby: status `NET_CODE_NO_LOBBY`, kody wyłączone, reszta sieci (broadcast, Tailscale, `peers`) działa jak dotąd.
+- `[net] relay = auto|always|never` (domyślnie `auto`): `auto` najpierw bezpośrednio (3 s), potem relay; `always` zawsze relay; `never` tylko bezpośrednio.
+- Serwer lobby: UDP 28630 (lobby) i 28631-28694 (relay). Opcje: `--bind`, `--port`, `--relay-ports`, `--max-sessions`, `--verbose` (loguje adresy i kody, tylko do diagnostyki). Uruchamianie: binarka, Docker (`--network host`) lub systemd, patrz `LOBBY.md`.
+
+### Testy
+
+```bash
+# ctest (z katalogu OpenCMR2/build/<preset>), testy sieciowe po UDP na loopbacku
+ctest -R "net_rendezvous|net_lobby_e2e|lobby_server" --output-on-failure
+
+# testy na prawdziwych procesach gry (wymagają danych oryginalnej gry i pliku `opencmr2-lobby` z buildu)
+ctest -R "lan_game_code|lan_game_code_relay" --output-on-failure
+
+# NAT w Dockerze (cone/symetryczny, hole punching i relay), ok. minuty
+OpenCMR2/tools/nat_test/run.sh
+```
+
+- `net_rendezvous`: klient (rejestracja, wyszukiwanie, hole punching, relay) na symulowanym transporcie.
+- `lobby_server`: serwer na loopbacku (rejestracja, wprowadzenie stron, limity, relay, losowe wejście).
+- `net_lobby_e2e`: prawdziwe sesje przez prawdziwe lobby (join bezpośredni i przez relay, błędne kody, brak lobby).
+- `lan_game_code`, `lan_game_code_relay`: dwa procesy gry przez menu i kod, bezpośrednio i z `--relay always` (rejestrowane w CTest tylko z danymi gry i celem `opencmr2-lobby`).
+- `tools/nat_test/run.sh`: 4 scenariusze (cone/cone auto, symetryczny auto przez relay, symetryczny z `never` daje `HOST_UNREACHABLE`, cone z `always`). Wymaga Dockera, nic nie opuszcza maszyny.
+
+Uwaga: ta sekcja powstała na podstawie kodu i dokumentacji; testów przy jej pisaniu nie uruchamiano.
+
+### Gwarancje zachowane
+
+- Zero zmian w fizyce i modelu jazdy (`CarPhysics.cpp`, `TrackCollision.cpp`, `X87Single.h`, tempo 25 Hz bez zmian). Zmiany dotyczą tylko sieci, menu frontendu, platformy (schowek) i narzędzi.
+- Dotychczasowe wykrywanie gier (broadcast, Tailscale, `peers`) działa jak dotąd.
+- Brak zmian w oryginalnych plikach gry.
+
+### Znane ograniczenia
+
+- Tylko IPv4 (lobby, gniazda i hole punching).
+- Host migration: gość, który dołączył kodem, po zmianie gospodarza może się nie połączyć z nowym hostem. Kończy się to czystym zerwaniem sesji, nie zawieszeniem.
+- Limity per IP (sesje, rejestracje, zapytania) są wspólne dla wszystkich za jednym adresem publicznym, np. za CGNAT.
+- Prawdziwy CGNAT operatorów i sieci komórkowe nie były testowane (tylko NAT Linuxa w Dockerze: cone i symetryczny). `nat_test` nie sprawdza też hairpinningu, IPv6, utraty pakietów ani NAT zmieniającego mapowanie w trakcie gry.
+- Lobby musi działać na hoście z publicznym adresem IP i otwartymi portami UDP. Operator lobby widzi adresy graczy, a ruch przez relay nie jest szyfrowany ani uwierzytelniany.
+- Brak publicznego lobby w repozytorium: adres trzeba ustawić samemu (`lobby` w ini lub `-DOPENCMR2_LOBBY`).
+- Gra ufa komunikatom graczy (jak oryginał z 2000 r.): grać ze znajomymi.
