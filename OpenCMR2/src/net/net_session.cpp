@@ -21,6 +21,7 @@
 // for its own players; everything read from the network is bounds-checked.
 
 #include "net/net_session.h"
+#include "net/join_code.h"
 #include "net/net_wire.h"
 
 #include "net/enet_platform.h"
@@ -66,6 +67,9 @@ const size_t kMaxMachines = 16;
 const size_t kMaxInbox = 16384;
 const uint32_t kBrowseIdleMs = 3000;        // the search stops when the game stops asking
 const uint32_t kQueryIntervalMs = 1000;
+const uint32_t kFastQueryIntervalMs = 250;
+const uint32_t kLobbyRetryMs = 5000;
+const uint32_t kLobbyRefreshMs = 600000;
 const uint32_t kSessionExpiryMs = 4000;
 const uint32_t kResolveIntervalMs = 30000;
 const uint32_t kPendingPeerMs = 5000;       // a connection must JOIN or RESUME within this
@@ -192,7 +196,14 @@ bool ReadPlayer(Reader &r, Player &p)
 
 } // namespace
 
-Session::Session(const Config &config) : config(config)
+Session::Session(const Config &config)
+    : config(config),
+      rendezvous(
+          [this](const lobby::Endpoint &to, const std::vector<uint8_t> &data) {
+              if (host != nullptr)
+                  SendRaw(host, to.address, to.port, data);
+          },
+          config.relay, rng)
 {
     std::random_device device;
     rng.seed(((uint64_t)device() << 32) ^ device());
@@ -257,6 +268,7 @@ void Session::Abandon()
     if (thread.joinable())
         thread.join();
     std::lock_guard<std::mutex> lock(mutex);
+    rendezvous.StopHosting(false);
     if (host != nullptr) {
         enet_host_destroy(host);    // resets every peer without a word
         host = nullptr;
@@ -272,6 +284,7 @@ void Session::Run()
         enet_uint32 condition = ENET_SOCKET_WAIT_RECEIVE;
         enet_socket_wait(host->socket, &condition, 5);
         bool resolve = false;
+        bool resolveLobby = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
             uint32_t now = NowMs();
@@ -281,9 +294,17 @@ void Session::Run()
                 resolving = true;
                 resolve = true;
             }
+            if (!config.lobby.empty() && rendezvous.NeedsLobby() && !lobbyResolving &&
+                (lastLobbyResolve == 0 ||
+                 Elapsed(now, lastLobbyResolve, lobbyResolved ? kLobbyRefreshMs : kLobbyRetryMs))) {
+                lobbyResolving = true;
+                resolveLobby = true;
+            }
         }
         if (resolve)
             ResolvePeers();
+        if (resolveLobby)
+            ResolveLobby();
     }
 }
 
@@ -330,6 +351,7 @@ void Session::Service(uint32_t now)
             RemoveMachine(id, true);
         migrationDeadline = 0;
     }
+    rendezvous.Tick(now);
     Search(now);
     enet_host_flush(host);
 }
@@ -365,10 +387,48 @@ void Session::ResolvePeers()
     resolving = false;
 }
 
+void Session::ResolveLobby()
+{
+    std::string name = config.lobby;
+    uint16_t port = lobby::kDefaultPort;
+    size_t colon = name.rfind(':');
+    if (colon != std::string::npos) {
+        port = (uint16_t)atoi(name.c_str() + colon + 1);
+        name.resize(colon);
+    }
+    ENetAddress address;
+    bool ok = !name.empty() && port != 0 && enet_address_set_host(&address, name.c_str()) == 0;
+    lobby::Endpoint lobbyAt, local;
+    if (ok) {
+        address.port = port;
+        lobbyAt.address = address.host;
+        lobbyAt.port = port;
+        ENetSocket probe = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
+        if (probe != (ENetSocket)-1) {
+            ENetAddress mine;
+            if (enet_socket_connect(probe, &address) == 0 && enet_socket_get_address(probe, &mine) == 0 &&
+                mine.host != 0 && !IsLoopbackAddress(mine.host)) {
+                local.address = mine.host;
+                local.port = boundPort;
+            }
+            enet_socket_destroy(probe);
+        }
+    } else {
+        LOG("net: cannot resolve the lobby %s", config.lobby.c_str());
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (ok)
+        rendezvous.SetLobby(lobbyAt, local);
+    lobbyResolved = ok;
+    lastLobbyResolve = NowMs();
+    lobbyResolving = false;
+}
+
 void Session::Search(uint32_t now)
 {
     bool browsing = lastSearchCall != 0 && !Elapsed(now, lastSearchCall, kBrowseIdleMs);
-    if (!browsing)
+    bool finding = rendezvous.Finding();
+    if (!browsing && !finding)
         return;
     for (auto it = found.begin(); it != found.end();) {
         if (Elapsed(now, it->second.lastSeenMs, kSessionExpiryMs))
@@ -376,21 +436,30 @@ void Session::Search(uint32_t now)
         else
             ++it;
     }
-    if (lastQuery != 0 && !Elapsed(now, lastQuery, kQueryIntervalMs))
+    bool regular = lastQuery == 0 || Elapsed(now, lastQuery, kQueryIntervalMs);
+    bool fast = finding && (lastTargetQuery == 0 || Elapsed(now, lastTargetQuery, kFastQueryIntervalMs));
+    if (!regular && !fast)
         return;
-    lastQuery = now;
-    previousNonce = queryNonce;
-    queryNonce = (uint32_t)rng() | 1;
+    if (regular) {
+        lastQuery = now;
+        previousNonce = queryNonce;
+        queryNonce = (uint32_t)rng() | 1;
+    }
+    lastTargetQuery = now;
     Writer w;
     w.Bytes(kMagic, 4);
     w.U8(kQuery);
     w.U8(kProtocol);
     w.U32(queryNonce);
     w.Bytes(searchApplication.bytes, 16);
-    if (config.broadcast)
-        SendRaw(host, ENET_HOST_BROADCAST, config.port, w.data);
-    for (const auto &peer : peerAddresses)
-        SendRaw(host, peer.first, peer.second, w.data);
+    if (regular && browsing) {
+        if (config.broadcast)
+            SendRaw(host, ENET_HOST_BROADCAST, config.port, w.data);
+        for (const auto &peer : peerAddresses)
+            SendRaw(host, peer.first, peer.second, w.data);
+    }
+    for (const lobby::Endpoint &target : rendezvous.QueryTargets())
+        SendRaw(host, target.address, target.port, w.data);
 }
 
 int Session::Intercept(_ENetHost *host, _ENetEvent *)
@@ -405,6 +474,14 @@ int Session::Intercept(_ENetHost *host, _ENetEvent *)
 
 void Session::HandleRaw(const uint8_t *data, size_t size, uint32_t address, uint16_t port)
 {
+    lobby::Endpoint from;
+    from.address = address;
+    from.port = port;
+    lobby::Kind lobbyKind;
+    if (lobby::Peek(data, size, lobbyKind)) {
+        rendezvous.Handle(data, size, from, NowMs());
+        return;
+    }
     Reader r(data + 4, size - 4);
     uint8_t kind = r.U8();
     if (r.U8() != kProtocol)
@@ -435,10 +512,19 @@ void Session::HandleRaw(const uint8_t *data, size_t size, uint32_t address, uint
         info.passwordRequired = r.U8() != 0;
         if (!r.ok())
             return;
+        uint32_t now = NowMs();
         info.address = address;
         info.port = port;
-        info.lastSeenMs = NowMs();
-        found[GuidKey(info.desc.guidInstance)] = info;
+        info.lastSeenMs = now;
+        info.relayed = rendezvous.IsRelay(from);
+        std::string key = GuidKey(info.desc.guidInstance);
+        auto it = found.find(key);
+        if (it == found.end() ||
+            ReplacesPath(it->second.relayed, !Elapsed(now, it->second.lastSeenMs, kSessionExpiryMs), info.relayed))
+            found[key] = info;
+        lobby::Guid instance;
+        memcpy(instance.data(), info.desc.guidInstance.bytes, instance.size());
+        rendezvous.OnSessionReply(from, instance);
     }
 }
 
@@ -486,6 +572,7 @@ HRESULT Session::EnumSessions(const NetGuid *application, NetSessionCallback cal
 
 void Session::ResetSession()
 {
+    rendezvous.StopHosting(true);
     state = State::Idle;
     memset(&desc, 0, sizeof(desc));
     sessionName.clear();
@@ -524,6 +611,7 @@ HRESULT Session::Open(const NetSessionDesc *d, DWORD flags)
         localMachine = hostMachine = 1;
         machines[1].id = 1;
         state = State::Hosting;
+        StartCodeHosting();
         LOG("net: hosting \"%s\" (up to %u players)", sessionName.c_str(), (unsigned)desc.dwMaxPlayers);
         return NET_OK;
     }
@@ -630,6 +718,66 @@ bool Session::IsHost()
 {
     std::lock_guard<std::mutex> lock(mutex);
     return state == State::Hosting;
+}
+
+void Session::StartCodeHosting()
+{
+    if (config.lobby.empty())
+        return;
+    lobby::Guid instance;
+    memcpy(instance.data(), desc.guidInstance.bytes, instance.size());
+    rendezvous.Host(instance);
+}
+
+NetCodeStatus Session::HostCode(std::string *code)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    if (code != nullptr)
+        code->clear();
+    if (config.lobby.empty())
+        return NET_CODE_NO_LOBBY;
+    if (state != State::Hosting)
+        return NET_CODE_IDLE;
+    lobby::Code raw;
+    NetCodeStatus status = rendezvous.HostStatus(&raw);
+    if (status == NET_CODE_READY && code != nullptr)
+        *code = joincode::Format(raw);
+    return status;
+}
+
+NetCodeStatus Session::FindByCode(const char *text)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    if (config.lobby.empty())
+        return NET_CODE_NO_LOBBY;
+    lobby::Code code;
+    if (!joincode::Parse(text, code))
+        return NET_CODE_INVALID;
+    if (host == nullptr || state != State::Idle)
+        return NET_CODE_IDLE;
+    rendezvous.Find(code);
+    return rendezvous.FindStatus(nullptr, nullptr);
+}
+
+NetCodeStatus Session::CodeSession(NetGuid *instance, bool *relayed)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    lobby::Guid guid;
+    bool viaRelay = false;
+    NetCodeStatus status = rendezvous.FindStatus(&guid, &viaRelay);
+    if (status == NET_CODE_FOUND) {
+        if (instance != nullptr)
+            memcpy(instance->bytes, guid.data(), guid.size());
+        if (relayed != nullptr)
+            *relayed = viaRelay;
+    }
+    return status;
+}
+
+void Session::CancelFind()
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    rendezvous.CancelFind();
 }
 
 // ---- players -----------------------------------------------------------------------------
@@ -1251,6 +1399,7 @@ void Session::BecomeHost()
     machines[localMachine].address = 0;
     machines[localMachine].port = 0;
     migrationDeadline = machines.size() > 1 ? NowMs() + config.joinTimeoutMs * 2 : 0;
+    StartCodeHosting();
     QueueSystem(NET_SYS_HOST, nullptr);
 }
 
