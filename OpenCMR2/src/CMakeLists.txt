@@ -125,7 +125,7 @@ endif()
 
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/render/shaders)
 set(SHADER_SOURCES fixed3d.vert fixedtl.vert fixed.frag clear.vert clear.frag
-    post.vert post_bright.frag post_blur.frag post_composite.frag
+    post.vert post_bright.frag post_blur.frag post_gtao.frag post_ao_blur.frag post_composite.frag
     shadow.vert shadow.frag)
 set(SHADER_FILES)
 foreach(shader IN LISTS SHADER_SOURCES)
@@ -167,6 +167,27 @@ foreach(shader IN LISTS SHADER_SOURCES)
             DEPENDS ${output}
             COMMENT "Translating shader ${shader} to GLSL 330")
         list(APPEND SHADER_FILES ${glsl})
+    endif()
+endforeach()
+
+# MRT linear-depth variants of fixed.frag and clear.frag for HDR 3D passes (GTAO / Soft Particles).
+foreach(mrt_base fixed clear)
+    set(mrt_spv ${CMAKE_CURRENT_BINARY_DIR}/shaders/${mrt_base}_mrt.frag.spv)
+    add_custom_command(
+        OUTPUT ${mrt_spv}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders
+        COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.0 -DOPENCMR2_MRT_DEPTH=1 -o ${mrt_spv} ${SHADER_DIR}/${mrt_base}.frag
+        DEPENDS ${SHADER_DIR}/${mrt_base}.frag ${SHADER_DIR}/common.glsl
+        COMMENT "Compiling shader ${mrt_base}_mrt.frag")
+    list(APPEND SHADER_FILES ${mrt_spv})
+    if(OPENCMR2_SHADERS_MSL)
+        set(mrt_msl ${CMAKE_CURRENT_BINARY_DIR}/shaders/${mrt_base}_mrt.frag.msl)
+        add_custom_command(
+            OUTPUT ${mrt_msl}
+            COMMAND ${SPIRV_CROSS} --msl --msl-version 20100 --msl-decoration-binding --output ${mrt_msl} ${mrt_spv}
+            DEPENDS ${mrt_spv}
+            COMMENT "Translating shader ${mrt_base}_mrt.frag to MSL")
+        list(APPEND SHADER_FILES ${mrt_msl})
     endif()
 endforeach()
 set(SHADER_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders_spirv.h)

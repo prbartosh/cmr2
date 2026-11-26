@@ -12,6 +12,9 @@ layout(location = 8) in vec4 inRawColor1;
 layout(location = 9) in vec4 inRawColor2;
 
 layout(location = 0) out vec4 outColor;
+#ifdef OPENCMR2_MRT_DEPTH
+layout(location = 1) out float outLinearDepth;
+#endif
 
 layout(set = 2, binding = 0) uniform sampler2D tex0;
 layout(set = 2, binding = 1) uniform samplerCube cube0;
@@ -558,4 +561,7 @@ void main()
             current.rgb = mix(current.rgb, texelFetch(backdrop, ivec2(gl_FragCoord.xy), 0).rgb, f);
     }
     outColor = current;
+#ifdef OPENCMR2_MRT_DEPTH
+    outLinearDepth = inEyeDepth;
+#endif
 }
