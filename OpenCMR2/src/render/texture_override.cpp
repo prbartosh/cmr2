@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -39,7 +40,7 @@ namespace {
 
 struct IndexEntry {
     std::string path;
-    int priority; // higher wins (.png=3, .dds=2, .tga=1)
+    int priority; // higher wins (.dds=3, .png=2, .tga=1)
     int rootRank; // lower wins (earlier root)
 };
 
@@ -49,6 +50,9 @@ struct OverrideIndex {
     std::unordered_map<std::string, IndexEntry> byRel;
     std::unordered_map<std::string, IndexEntry> byBase;
     std::unordered_set<std::string> dumped;
+    size_t bc7Loaded = 0;
+    size_t cpuLoaded = 0;
+    double totalLoadMs = 0.0;
 };
 
 OverrideIndex s_index;
@@ -61,9 +65,9 @@ std::string ToLowerAscii(std::string s)
 
 int ExtPriority(const std::string &extLower)
 {
-    if (extLower == ".png")
-        return 3;
     if (extLower == ".dds")
+        return 3;
+    if (extLower == ".png")
         return 2;
     if (extLower == ".tga")
         return 1;
@@ -185,20 +189,112 @@ std::string LookupFile(const std::string &relKey, const std::string &baseKey)
     return {};
 }
 
+bool ReadWholeFile(const std::string &path, std::vector<uint8_t> &out)
+{
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f)
+        return false;
+    std::streamsize sz = f.tellg();
+    if (sz <= 0 || sz > 256 * 1024 * 1024)
+        return false;
+    out.resize((size_t)sz);
+    f.seekg(0, std::ios::beg);
+    return (bool)f.read((char *)out.data(), sz);
+}
+
+uint32_t ReadLE32(const uint8_t *p, size_t off)
+{
+    return (uint32_t)p[off] | ((uint32_t)p[off + 1] << 8) | ((uint32_t)p[off + 2] << 16) |
+           ((uint32_t)p[off + 3] << 24);
+}
+
+// Fast native GPU path: loads a DDS DX10 BC7 file (DXGI_FORMAT_BC7_UNORM / SRGB)
+// directly with its pre-generated mipmap chain — zero CPU decoding or mip generation.
+GfxTexture *TryCreateNativeBC7Texture(const std::string &path, DWORD flags)
+{
+    if (!Gfx_SupportsBC7())
+        return NULL;
+
+    std::vector<uint8_t> data;
+    if (!ReadWholeFile(path, data))
+        return NULL;
+    // 4 ("DDS ") + 124 (DDS_HEADER) + 20 (DDS_HEADER_DXT10) = 148 bytes.
+    if (data.size() < 148 || memcmp(data.data(), "DDS ", 4) != 0)
+        return NULL;
+
+    const uint8_t *p = data.data();
+    if (ReadLE32(p, 4) != 124u)
+        return NULL;
+
+    uint32_t h = ReadLE32(p, 12);
+    uint32_t w = ReadLE32(p, 16);
+    uint32_t mipHeader = ReadLE32(p, 28);
+    uint32_t pfFlags = ReadLE32(p, 80);
+    uint32_t fourCC = ReadLE32(p, 84);
+
+    if ((pfFlags & 0x4u) == 0 || fourCC != 0x30315844u) // 'DX10'
+        return NULL;
+
+    uint32_t dxgiFormat = ReadLE32(p, 128);
+    uint32_t resourceDim = ReadLE32(p, 132);
+    uint32_t arraySize = ReadLE32(p, 140);
+    // DXGI_FORMAT_BC7_UNORM = 98, DXGI_FORMAT_BC7_UNORM_SRGB = 99
+    if ((dxgiFormat != 98u && dxgiFormat != 99u) || resourceDim != 3u || arraySize < 1u)
+        return NULL;
+    if (w == 0 || h == 0 || w > 8192 || h > 8192)
+        return NULL;
+
+    int maxMips = 1;
+    while ((w >> maxMips) > 0 || (h >> maxMips) > 0)
+        maxMips++;
+    maxMips = std::min(maxMips, 16);
+    int requestedMips = mipHeader > 0 ? std::min((int)mipHeader, maxMips) : 1;
+
+    // Verify available mip levels fit inside the file buffer.
+    size_t avail = data.size() - 148;
+    size_t needed = 0;
+    int validMips = 0;
+    for (int m = 0; m < requestedMips; m++) {
+        int mw = std::max(1, (int)(w >> m));
+        int mh = std::max(1, (int)(h >> m));
+        size_t sz = Gfx_LevelSize(GFX_FORMAT_BC7, mw, mh, NULL);
+        if (needed + sz > avail)
+            break;
+        needed += sz;
+        validMips++;
+    }
+    if (validMips < 1)
+        return NULL;
+
+    GfxTexture *tex = Gfx_CreateTexture((int)w, (int)h, GFX_FORMAT_BC7, validMips, flags);
+    if (tex == NULL)
+        return NULL;
+
+    const uint8_t *src = p + 148;
+    for (int m = 0; m < validMips; m++) {
+        int mw = std::max(1, (int)(w >> m));
+        int mh = std::max(1, (int)(h >> m));
+        size_t sz = Gfx_LevelSize(GFX_FORMAT_BC7, mw, mh, NULL);
+        GfxLockedRect lock{};
+        if (Gfx_LockTexture(tex, 0, m, &lock)) {
+            memcpy(lock.pixels, src, sz);
+            Gfx_UnlockTexture(tex, 0, m);
+        }
+        src += sz;
+    }
+    return tex;
+}
+
 // Decodes a DDS file (DXT1/BC1, DXT5/BC3, or 32-bit BGRA/RGBA) into tightly packed BGRA8.
 bool LoadDDSFileBGRA(const std::string &path, int &width, int &height, std::vector<uint8_t> &bgra)
 {
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
+    std::vector<uint8_t> data;
+    if (!ReadWholeFile(path, data))
         return false;
-    std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (data.size() < 128 || memcmp(data.data(), "DDS ", 4) != 0)
         return false;
 
-    auto rd32 = [&](size_t off) -> uint32_t {
-        return (uint32_t)data[off] | ((uint32_t)data[off + 1] << 8) | ((uint32_t)data[off + 2] << 16) |
-               ((uint32_t)data[off + 3] << 24);
-    };
+    auto rd32 = [&](size_t off) -> uint32_t { return ReadLE32(data.data(), off); };
 
     uint32_t h = rd32(12);
     uint32_t w = rd32(16);
@@ -356,8 +452,34 @@ void DownsampleBGRAAlphaWeighted(const uint8_t *src, int sw, int sh, uint8_t *ds
     }
 }
 
+void RecordOverrideLoad(bool nativeBc7, double elapsedMs)
+{
+    if (nativeBc7)
+        s_index.bc7Loaded++;
+    else
+        s_index.cpuLoaded++;
+    s_index.totalLoadMs += elapsedMs;
+    size_t total = s_index.bc7Loaded + s_index.cpuLoaded;
+    if (total == 1 || (total <= 50 && total % 25 == 0) || (total % 100 == 0)) {
+        Sys_Log("overrides: loaded %zu textures (%zu BC7 GPU, %zu CPU) in %.1f ms (avg %.2f ms/tex)", total,
+                s_index.bc7Loaded, s_index.cpuLoaded, s_index.totalLoadMs,
+                total > 0 ? s_index.totalLoadMs / (double)total : 0.0);
+    }
+}
+
 GfxTexture *CreateMipmappedTexture(const std::string &path, DWORD flags, bool isNormalMap)
 {
+    auto t0 = std::chrono::steady_clock::now();
+    std::string ext = ToLowerAscii(fs::path(path).extension().string());
+    if (ext == ".dds") {
+        GfxTexture *bc7 = TryCreateNativeBC7Texture(path, flags);
+        if (bc7 != NULL) {
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            RecordOverrideLoad(true, ms);
+            return bc7;
+        }
+    }
+
     int w = 0, h = 0;
     std::vector<uint8_t> level0;
     if (!LoadImageFileBGRA(path, w, h, level0))
@@ -398,6 +520,8 @@ GfxTexture *CreateMipmappedTexture(const std::string &path, DWORD flags, bool is
             prevH = mh;
         }
     }
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    RecordOverrideLoad(false, ms);
     return tex;
 }
 
@@ -463,6 +587,9 @@ extern "C" void TextureOverride_ResetIndex(void)
     s_index.byBase.clear();
     s_index.extraRoots.clear();
     s_index.dumped.clear();
+    s_index.bc7Loaded = 0;
+    s_index.cpuLoaded = 0;
+    s_index.totalLoadMs = 0.0;
 }
 
 extern "C" void TextureOverride_AddSearchRoot(const char *dir)

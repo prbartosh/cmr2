@@ -360,7 +360,8 @@ enum GfxFormat {
     GFX_FORMAT_BGRA8,         /* 32-bit with alpha */
     GFX_FORMAT_BC1,           /* DXT1 */
     GFX_FORMAT_BC3,           /* DXT5 */
-    GFX_FORMAT_BUMP_DUDVL     /* 24-bit: signed dU, signed dV, luminance (L8V8U8) */
+    GFX_FORMAT_BUMP_DUDVL,    /* 24-bit: signed dU, signed dV, luminance (L8V8U8) */
+    GFX_FORMAT_BC7            /* DX10 BC7 RGBA (native GPU compressed with pre-generated mipmaps) */
 };
 
 enum GfxPixelFormatFlags {

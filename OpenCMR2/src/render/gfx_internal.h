@@ -177,7 +177,11 @@ struct GfxExecutor {
     // Completes the back buffer read the last presented frame started, when
     // the game asks for its pixels (Gfx_ReadBackBuffer).
     virtual void CollectReadback(GfxReadback &) {}
+    // Whether the executor can sample native GPU BC7 (DX10) textures directly.
+    virtual bool SupportsBC7() const { return true; }
 };
+
+bool Gfx_SupportsBC7(void);
 
 GfxExecutor *Gfx_CreateGpuExecutor(void);
 GfxExecutor *Gfx_CreateNullExecutor(void);

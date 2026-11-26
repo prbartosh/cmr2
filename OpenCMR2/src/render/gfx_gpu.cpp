@@ -357,6 +357,7 @@ struct Executor : GfxExecutor {
     std::unordered_map<uint32_t, SDL_GPUGraphicsPipeline *> pipelines;
     std::unordered_map<uint32_t, SDL_GPUSampler *> samplers;
     bool bcSupported = true;
+    bool bc7Supported = false;
     bool presentModeVsync = true;
     int anisotropy = 16, smoothScaling = 1;   // video.anisotropy, video.smooth_scaling
     bool compressedMipmaps = true;            // video.compressed_mipmaps
@@ -528,6 +529,10 @@ struct Executor : GfxExecutor {
         }
         bcSupported = SDL_GPUTextureSupportsFormat(device, SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM,
                                                    SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        bc7Supported = SDL_GPUTextureSupportsFormat(device, SDL_GPU_TEXTUREFORMAT_BC7_RGBA_UNORM,
+                                                    SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        if (bc7Supported)
+            Sys_Log("gfx: native GPU BC7 textures enabled");
 
         vs3d = Shader(SHADER_CODE(fixed3d_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         vsTL = Shader(SHADER_CODE(fixedtl_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
@@ -741,6 +746,8 @@ struct Executor : GfxExecutor {
         Gfx_SetWindowMode(window, fullscreen, backWidth, backHeight);
     }
 
+    bool SupportsBC7() const override { return bc7Supported; }
+
     // ---- textures ----
 
     SDL_GPUTextureFormat GpuFormat(int format, bool &cpuDecode)
@@ -757,6 +764,8 @@ struct Executor : GfxExecutor {
                 return SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM;
             cpuDecode = true;
             return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+        case GFX_FORMAT_BC7:
+            return SDL_GPU_TEXTUREFORMAT_BC7_RGBA_UNORM;
         case GFX_FORMAT_BUMP_DUDVL:
             return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
         default:
@@ -805,6 +814,11 @@ struct Executor : GfxExecutor {
         g->format = GpuFormat(t->format, g->cpuDecode);
         bool cube = (t->flags & GFX_TEXTURE_CUBE) != 0;
         bool target = (t->flags & GFX_TEXTURE_RENDER_TARGET) != 0;
+        if (t->format == GFX_FORMAT_BC7 && !bc7Supported) {
+            t->gpu = g;
+            t->dirty = false;
+            return g;
+        }
         bool isCompressed = (t->format == GFX_FORMAT_BC1 || t->format == GFX_FORMAT_BC3);
         g->mipLevels = t->mipLevels;
         g->generatedMips = false;
@@ -840,7 +854,8 @@ struct Executor : GfxExecutor {
     // Bytes of a level as uploaded (after conversion).
     size_t UploadSize(GfxTexture *t, GpuTexture *g, int w, int h)
     {
-        if ((t->format == GFX_FORMAT_BC1 || t->format == GFX_FORMAT_BC3) && !g->cpuDecode)
+        if (t->format == GFX_FORMAT_BC7 ||
+            ((t->format == GFX_FORMAT_BC1 || t->format == GFX_FORMAT_BC3) && !g->cpuDecode))
             return Gfx_LevelSize(t->format, w, h, NULL);
         return (size_t)w * h * 4;
     }
@@ -860,6 +875,9 @@ struct Executor : GfxExecutor {
                 dst[i * 4 + 2] = src[i * 3 + 2];
                 dst[i * 4 + 3] = 0xff;
             }
+            break;
+        case GFX_FORMAT_BC7:
+            memcpy(dst, src, Gfx_LevelSize(t->format, w, h, NULL));
             break;
         case GFX_FORMAT_BC1:
         case GFX_FORMAT_BC3:
@@ -898,8 +916,12 @@ struct Executor : GfxExecutor {
             }
             int faces = (t->flags & GFX_TEXTURE_CUBE) ? 6 : 1;
             for (int f = 0; f < faces; f++)
-                for (int m = 0; m < g->mipLevels; m++)
+                for (int m = 0; m < g->mipLevels; m++) {
+                    if ((!g->generatedMips || m == 0) && t->levels[f][m].empty())
+                        continue;
+                    total = (total + 15u) & ~size_t(15u);
                     total += UploadSize(t, g, std::max(1, t->width >> m), std::max(1, t->height >> m));
+                }
         }
         if (total == 0)
             return;
@@ -922,6 +944,9 @@ struct Executor : GfxExecutor {
                 size_t prevOffset = offset;
                 int prevW = t->width, prevH = t->height;
                 for (int m = 0; m < g->mipLevels; m++) {
+                    if ((!g->generatedMips || m == 0) && t->levels[f][m].empty())
+                        continue;
+                    offset = (offset + 15u) & ~size_t(15u);
                     int w = std::max(1, t->width >> m), h = std::max(1, t->height >> m);
                     if (g->generatedMips && m > 0) {
                         DownsampleBGRA(map + prevOffset, prevW, prevH, map + offset, w, h);
@@ -936,6 +961,11 @@ struct Executor : GfxExecutor {
                 }
             }
             t->dirty = false;
+            // Immutable native BC7 overrides never need CPU readback: drop CPU mip copies once staged.
+            if ((t->flags & GFX_TEXTURE_OVERRIDE) && t->format == GFX_FORMAT_BC7) {
+                for (int m = 0; m < t->mipLevels; m++)
+                    std::vector<uint8_t>().swap(t->levels[0][m]);
+            }
         }
         SDL_UnmapGPUTransferBuffer(device, tb);
         SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);

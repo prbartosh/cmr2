@@ -32,6 +32,22 @@ from typing import Dict, List, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _image_io import RGBAImage, decode_png, encode_png, load_png
+from ai_upscaler import convert_esrgan_state_dict, resolve_upscaler_backend, upscale_image
+from bc7_dds import (
+    DDS_BC7_CAPS,
+    DDS_BC7_FLAGS,
+    DDS_BC7_HEADER_BYTES,
+    DXGI_FORMAT_BC7_UNORM,
+    bc7_block_mode,
+    compute_mip_dimensions,
+    decode_bc7_mode6_block,
+    downsample_mip_2x,
+    encode_bc7_mode6_block,
+    encode_bc7_python,
+    encode_dds_bc7,
+    parse_dds_bc7_header,
+    save_dds_bc7,
+)
 from bfl_extract import (
     BFL_MAGIC,
     BFLArchive,
@@ -41,8 +57,10 @@ from bfl_extract import (
     parse_bfl_bytes,
 )
 from classify_textures import classify_texture
+from neural_maps import generate_neural_normal_map, generate_pbr_specular_map, resolve_normal_backend
 from run_pipeline import run_pipeline
 from upscale_hd import (
+    compute_effective_max_size,
     compute_target_size,
     dilate_alpha_rgb,
     generate_normal_map,
@@ -516,6 +534,385 @@ class TestPipelineEndToEnd(unittest.TestCase):
             self.assertEqual(filtered["status_counts"].get("processed"), 1)
             self.assertTrue((out_dir2 / "fordbodf.png").exists())
             self.assertFalse((out_dir2 / "uk_tarmac01.png").exists())
+
+
+class TestStage10BC7DDS(unittest.TestCase):
+    def test_dds_bc7_header_and_full_mipmap_chain_layout(self):
+        for w, h in ((16, 16), (12, 8), (5, 3), (1, 1)):
+            img = RGBAImage.new(w, h, (90, 140, 210, 255))
+            dds_bytes = encode_dds_bc7(img, quality="fast", backend="python")
+            hdr = parse_dds_bc7_header(dds_bytes)
+
+            expected_dims = compute_mip_dimensions(w, h)
+            self.assertEqual((hdr.width, hdr.height), (w, h))
+            self.assertEqual(hdr.mip_count, len(expected_dims))
+            self.assertEqual(hdr.fourcc, b"DX10")
+            self.assertEqual(hdr.dxgi_format, DXGI_FORMAT_BC7_UNORM)
+            self.assertEqual(hdr.dxgi_format, 98)
+            self.assertEqual(hdr.resource_dimension, 3)
+            self.assertEqual(hdr.flags, DDS_BC7_FLAGS)
+            self.assertEqual(hdr.caps, DDS_BC7_CAPS)
+            self.assertEqual(hdr.data_offset, DDS_BC7_HEADER_BYTES)
+            self.assertEqual(hdr.linear_size, ((w + 3) // 4) * ((h + 3) // 4) * 16)
+            self.assertEqual(len(dds_bytes), hdr.total_expected_bytes)
+            # Last mip must always reach 1x1
+            self.assertEqual(hdr.mip_sizes[-1][:2], (1, 1))
+            self.assertEqual(hdr.mip_sizes[-1][2], 16)
+
+    def test_pure_python_mode6_block_bit_exact_and_anchor_invariant(self):
+        # 1. Solid block
+        solid_px = [(128, 128, 255, 255)] * 16
+        blk_solid = encode_bc7_mode6_block(solid_px)
+        self.assertEqual(len(blk_solid), 16)
+        self.assertEqual(blk_solid[0] & 0x7F, 0x40)  # Mode 6 bits 0..6 == 0b1000000
+        self.assertEqual(bc7_block_mode(blk_solid), 6)
+        dec_solid = decode_bc7_mode6_block(blk_solid)
+        for p, q in zip(solid_px, dec_solid):
+            for c0, c1 in zip(p, q):
+                self.assertAlmostEqual(c0, c1, delta=2)
+
+        # 2. Forward & reverse RGBA ramps (explicitly exercises anchor index 0 >= 8 swap)
+        ramp_fwd = [(i * 17, 255 - i * 17, 64 + i * 8, 255 - i * 12) for i in range(16)]
+        ramp_rev = list(reversed(ramp_fwd))
+        for ramp in (ramp_fwd, ramp_rev):
+            blk = encode_bc7_mode6_block(ramp)
+            self.assertEqual(len(blk), 16)
+            self.assertEqual(blk[0] & 0x7F, 0x40)
+            # Check anchor index 0 occupies bits 65..67 (3 bits -> MSB implicitly 0)
+            bits = int.from_bytes(blk, "little")
+            anchor_idx = (bits >> 65) & 0x7
+            self.assertLess(anchor_idx, 8)
+            dec = decode_bc7_mode6_block(blk)
+            max_err = max(abs(a - b) for p0, p1 in zip(ramp, dec) for a, b in zip(p0, p1))
+            self.assertLessEqual(max_err, 12, f"Unexpected Mode 6 ramp error: {max_err}")
+
+        # 3. Full pure-Python surface encoding on non-multiple-of-4 size
+        img = RGBAImage.new(6, 5, (40, 190, 70, 180))
+        raw_blocks = encode_bc7_python(img, force_pure_python=True)
+        self.assertEqual(len(raw_blocks), 2 * 2 * 16)
+        for off in range(0, len(raw_blocks), 16):
+            self.assertEqual(bc7_block_mode(raw_blocks[off : off + 16]), 6)
+
+    def test_mipmaps_alpha_weighted_and_normal_renormalized(self):
+        # 1 opaque bright-green pixel + 3 transparent black pixels in 2x2 block:
+        # alpha-weighted mip 1 MUST keep bright green (no darkening halo!)
+        foliage = RGBAImage.new(4, 4, (0, 0, 0, 0))
+        foliage.set_pixel(0, 0, (20, 220, 30, 255))
+        mip1 = downsample_mip_2x(foliage, is_normal_map=False)
+        self.assertEqual((mip1.width, mip1.height), (2, 2))
+        r, g, b, a = mip1.get_pixel(0, 0)
+        self.assertGreater(g, 200)
+        self.assertLess(r, 30)
+        self.assertAlmostEqual(a, 64, delta=1)
+
+        # Normal mipmap averaging + tangent re-normalization
+        nrm = RGBAImage.new(4, 4, (128, 128, 255, 255))
+        nrm.set_pixel(0, 0, (200, 128, 220, 255))
+        nrm.set_pixel(1, 0, (200, 128, 220, 255))
+        nmip = downsample_mip_2x(nrm, is_normal_map=True)
+        nr, ng, nb, na = nmip.get_pixel(0, 0)
+        self.assertEqual(na, 255)
+        vx = (nr / 255.0) * 2.0 - 1.0
+        vy = (ng / 255.0) * 2.0 - 1.0
+        vz = (nb / 255.0) * 2.0 - 1.0
+        self.assertAlmostEqual(math.sqrt(vx * vx + vy * vy + vz * vz), 1.0, delta=0.03)
+
+    def test_bc7_auto_backend_save_and_validate(self):
+        img = RGBAImage.new(16, 16, (30, 90, 210, 255))
+        for y in range(16):
+            for x in range(16):
+                img.set_pixel(x, y, (x * 16, y * 16, 200, 255))
+        with tempfile.TemporaryDirectory() as td:
+            out_path = save_dds_bc7(img, Path(td) / "test_auto.dds", quality="fast", backend="auto")
+            raw = out_path.read_bytes()
+            hdr = parse_dds_bc7_header(raw)
+            self.assertEqual(len(raw), hdr.total_expected_bytes)
+            self.assertEqual(hdr.dxgi_format, 98)
+            self.assertEqual(hdr.mip_count, 5)
+            # Verify every BC7 block in mip 0 has a valid mode (0..7)
+            mip0_len = hdr.mip_sizes[0][2]
+            for off in range(hdr.data_offset, hdr.data_offset + mip0_len, 16):
+                self.assertLess(bc7_block_mode(raw[off : off + 16]), 8)
+
+
+class TestStage10CarPBRAndHeroTiering(unittest.TestCase):
+    def test_car_cockpit_and_road_sub_profile_classification(self):
+        expected = [
+            ("fordbodf.dds", "data/cars/focusc5.bfl", "car_livery", "car_body"),
+            ("subboddf.dds", "", "car_livery", "car_body"),
+            ("peugdbodf.dds", "", "car_livery", "car_body"),
+            ("seatbodf.dds", "data/cars/seatc5.bfl", "car_livery", "car_body"),
+            ("focint01.dds", "", "car_livery", "car_cockpit"),
+            ("ford_cockpit.dds", "", "car_livery", "car_cockpit"),
+            ("steer_wheel.dds", "", "car_livery", "car_cockpit"),
+            ("subglid.dds", "", "car_livery", "car_glass"),
+            ("fordglod.dds", "", "car_livery", "car_glass"),
+            ("peugglob.dds", "", "car_livery", "car_glass"),
+            ("car_windscr.dds", "", "car_livery", "car_glass"),
+            ("subund.dds", "", "car_livery", "car_wheel"),
+            ("peugwh1.dds", "", "car_livery", "car_wheel"),
+            ("subaru_wheel.dds", "", "car_livery", "car_wheel"),
+            ("fordlig.dds", "", "car_livery", "car_light"),
+            ("headlite.dds", "", "car_livery", "car_light"),
+            ("uk_tarmac01.dds", "", "road_surface", "road_tarmac"),
+            ("gravel_wet.tga", "", "road_surface", "road_gravel"),
+            ("swed_snow01.dds", "", "road_surface", "road_snow"),
+            ("white_wall.dds", "", "buildings_props", ""),
+            ("lightpost.dds", "", "buildings_props", ""),
+            ("lgt_red.tga", "", "ui_skip", ""),
+        ]
+        for name, hint, exp_cat, exp_sub in expected:
+            res = classify_texture(name, hint)
+            self.assertEqual(res.category, exp_cat, f"{name}: expected {exp_cat}, got {res}")
+            self.assertEqual(res.sub_profile, exp_sub, f"{name}: expected sub {exp_sub!r}, got {res.sub_profile!r}")
+
+    def test_car_body_cockpit_and_wheel_pbr_material_differentiation(self):
+        # 1. car_body atlas containing blue paint, smooth dark window, textured grille, black rubber
+        body = RGBAImage.new(20, 20, (20, 80, 210, 255))
+        for y in range(2, 7):
+            for x in range(12, 18):
+                body.set_pixel(x, y, (42, 46, 50, 255))  # smooth dark window
+        for y in range(12, 18):
+            for x in range(12, 18):
+                v = 18 if (x + y) % 2 == 0 else 86
+                body.set_pixel(x, y, (v, v, v, 255))  # textured matte grille
+        for y in range(12, 18):
+            for x in range(2, 7):
+                body.set_pixel(x, y, (10, 10, 12, 255))  # matte black rubber/intake
+
+        spec_body = generate_pbr_specular_map(body, category="car_livery", sub_profile="car_body")
+        p_paint = spec_body.get_pixel(3, 3)
+        p_window = spec_body.get_pixel(15, 4)
+        p_grille = spec_body.get_pixel(15, 15)
+        p_rubber = spec_body.get_pixel(4, 15)
+
+        # Painted panel: high gloss R, strong reflection G, high clearcoat B
+        self.assertGreater(p_paint[0], 185)
+        self.assertGreater(p_paint[1], 180)
+        self.assertGreater(p_paint[2], 200)
+        # Smooth dark window: very high reflection G and gloss R
+        self.assertGreater(p_window[0], 210)
+        self.assertGreater(p_window[1], 220)
+        # Matte grille & dark rubber: LOW R, LOW G, LOW B
+        self.assertLess(p_grille[0], 85)
+        self.assertLess(p_grille[1], 65)
+        self.assertLess(p_grille[2], 45)
+        self.assertLess(p_rubber[0], 70)
+        self.assertLess(p_rubber[1], 45)
+        self.assertLess(p_rubber[2], 30)
+
+        # 2. car_cockpit: matte dashboard vs bright glossy dial/metallic trim
+        cockpit = RGBAImage.new(16, 16, (38, 38, 40, 255))
+        for y in range(6, 11):
+            for x in range(6, 11):
+                cockpit.set_pixel(x, y, (220, 224, 228, 255))
+        spec_cockpit = generate_pbr_specular_map(cockpit, category="car_livery", sub_profile="car_cockpit")
+        p_dash = spec_cockpit.get_pixel(2, 2)
+        p_dial = spec_cockpit.get_pixel(8, 8)
+        self.assertLess(p_dash[0], 65)
+        self.assertLess(p_dash[1], 40)
+        self.assertLess(p_dash[2], 25)
+        self.assertGreater(p_dial[0], 180)
+        self.assertGreater(p_dial[1], 170)
+
+        # 3. car_wheel: matte rubber tyre vs bright silver alloy rim
+        wheel = RGBAImage.new(16, 16, (32, 32, 34, 255))
+        for y in range(5, 11):
+            for x in range(5, 11):
+                wheel.set_pixel(x, y, (195, 200, 205, 255))
+        spec_wheel = generate_pbr_specular_map(wheel, category="car_livery", sub_profile="car_wheel")
+        p_tyre = spec_wheel.get_pixel(1, 1)
+        p_rim = spec_wheel.get_pixel(8, 8)
+        self.assertLess(p_tyre[0], 65)
+        self.assertLess(p_tyre[1], 40)
+        self.assertLess(p_tyre[2], 25)
+        self.assertGreater(p_rim[0], 185)
+        self.assertGreater(p_rim[1], 185)
+
+    def test_hero_max_size_resolution_tiering(self):
+        # Hero car body & road surface use hero_max_size=4096 while buildings_props stay at max_size=1024
+        self.assertEqual(compute_effective_max_size("car_livery", "car_body", max_size=1024, hero_max_size=4096), 4096)
+        self.assertEqual(compute_effective_max_size("road_surface", "road_tarmac", max_size=1024, hero_max_size=4096), 4096)
+        self.assertEqual(compute_effective_max_size("buildings_props", "", max_size=1024, hero_max_size=4096), 1024)
+        self.assertEqual(compute_effective_max_size("car_livery", "car_wheel", max_size=1024, hero_max_size=4096), 1024)
+
+        car_512 = RGBAImage.new(16, 16, (30, 80, 200, 255))
+        res_hero = process_texture(
+            car_512,
+            category="car_livery",
+            sub_profile="car_body",
+            scale=4,
+            max_size=32,
+            hero_max_size=64,
+        )
+        res_prop = process_texture(
+            car_512,
+            category="buildings_props",
+            scale=4,
+            max_size=32,
+            hero_max_size=64,
+        )
+        assert res_hero is not None and res_prop is not None
+        self.assertEqual(res_hero.dst_size, (64, 64))
+        self.assertEqual(res_prop.dst_size, (32, 32))
+
+
+class TestStage10AIAndNeuralHooks(unittest.TestCase):
+    def test_esrgan_state_dict_conversion_classic_and_basicsr(self):
+        class _DummyTensor:
+            def __init__(self, shape):
+                self.shape = shape
+
+        # Classic ESRGAN key format (matches 4x-UltraSharp.pth)
+        classic_sd = {
+            "model.0.weight": _DummyTensor((64, 3, 3, 3)),
+            "model.0.bias": _DummyTensor((64,)),
+            "model.1.sub.0.RDB1.conv1.0.weight": _DummyTensor((32, 64, 3, 3)),
+            "model.1.sub.0.RDB1.conv1.0.bias": _DummyTensor((32,)),
+            "model.1.sub.22.RDB3.conv5.0.weight": _DummyTensor((64, 192, 3, 3)),
+            "model.1.sub.23.weight": _DummyTensor((64, 64, 3, 3)),
+            "model.3.weight": _DummyTensor((64, 64, 3, 3)),
+            "model.6.weight": _DummyTensor((64, 64, 3, 3)),
+            "model.8.weight": _DummyTensor((64, 64, 3, 3)),
+            "model.10.weight": _DummyTensor((3, 64, 3, 3)),
+        }
+        conv_classic, meta_c = convert_esrgan_state_dict(classic_sd)
+        self.assertIn("conv_first.weight", conv_classic)
+        self.assertIn("body.0.rdb1.conv1.weight", conv_classic)
+        self.assertIn("body.22.rdb3.conv5.weight", conv_classic)
+        self.assertIn("conv_body.weight", conv_classic)
+        self.assertIn("conv_up1.weight", conv_classic)
+        self.assertIn("conv_up2.weight", conv_classic)
+        self.assertIn("conv_hr.weight", conv_classic)
+        self.assertIn("conv_last.weight", conv_classic)
+        self.assertEqual(meta_c["num_block"], 23)
+        self.assertEqual(meta_c["num_feat"], 64)
+        self.assertEqual(meta_c["num_grow_ch"], 32)
+        self.assertEqual(meta_c["scale"], 4)
+
+        # BasicSR / Real-ESRGAN wrapped format (params_ema + module. prefix)
+        basicsr_sd = {
+            "params_ema": {
+                "module.conv_first.weight": _DummyTensor((64, 3, 3, 3)),
+                "module.body.0.rdb1.conv1.weight": _DummyTensor((32, 64, 3, 3)),
+                "module.body.22.rdb3.conv5.weight": _DummyTensor((64, 192, 3, 3)),
+                "module.conv_body.weight": _DummyTensor((64, 64, 3, 3)),
+                "module.conv_up1.weight": _DummyTensor((64, 64, 3, 3)),
+                "module.conv_up2.weight": _DummyTensor((64, 64, 3, 3)),
+                "module.conv_hr.weight": _DummyTensor((64, 64, 3, 3)),
+                "module.conv_last.weight": _DummyTensor((3, 64, 3, 3)),
+            }
+        }
+        conv_b, meta_b = convert_esrgan_state_dict(basicsr_sd)
+        self.assertIn("conv_first.weight", conv_b)
+        self.assertIn("body.0.rdb1.conv1.weight", conv_b)
+        self.assertIn("conv_last.weight", conv_b)
+        self.assertEqual(meta_b["num_block"], 23)
+        self.assertEqual(meta_b["scale"], 4)
+
+    def test_periodic_wrap_and_alpha_halo_through_stage10_hooks(self):
+        # Verify upscale_image + generate_neural_normal_map hooks preserve wrap & alpha dilation
+        tile = RGBAImage.new(16, 16)
+        for y in range(16):
+            for x in range(16):
+                v = int(round(128 + 70 * math.sin(2.0 * math.pi * x / 16) + 35 * math.cos(2.0 * math.pi * y / 16)))
+                tile.set_pixel(x, y, (v, v, v, 255))
+
+        up, used_up = upscale_image(tile, 32, 32, backend="lanczos", wrap_x=True, wrap_y=True)
+        self.assertEqual(used_up, "lanczos")
+        self.assertEqual((up.width, up.height), (32, 32))
+        h_diff = sum(abs(up.get_pixel(0, y)[0] - up.get_pixel(31, y)[0]) for y in range(32)) / 32.0
+        v_diff = sum(abs(up.get_pixel(x, 0)[0] - up.get_pixel(x, 31)[0]) for x in range(32)) / 32.0
+        self.assertLess(h_diff, 18.0)
+        self.assertLess(v_diff, 12.0)
+
+        nrm, used_n = generate_neural_normal_map(
+            up, category="road_surface", sub_profile="road_tarmac", wrap_x=True, wrap_y=True, backend="scharr"
+        )
+        self.assertEqual(used_n, "scharr")
+        nh = sum(abs(nrm.get_pixel(0, y)[0] - nrm.get_pixel(31, y)[0]) for y in range(32)) / 32.0
+        nv = sum(abs(nrm.get_pixel(x, 0)[1] - nrm.get_pixel(x, 31)[1]) for x in range(32)) / 32.0
+        self.assertLess(nh, 10.0)
+        self.assertLess(nv, 10.0)
+
+        # Alpha-cutout halo check through upscale_image directly
+        leaf = RGBAImage.new(16, 16, (0, 0, 0, 0))
+        for y in range(4, 12):
+            for x in range(4, 12):
+                leaf.set_pixel(x, y, (25, 215, 35, 255))
+        leaf_up, _ = upscale_image(leaf, 32, 32, backend="lanczos", has_alpha_cutout=True)
+        edge_g = [
+            leaf_up.get_pixel(x, y)[1]
+            for y in range(32)
+            for x in range(32)
+            if 20 <= leaf_up.get_pixel(x, y)[3] <= 235
+        ]
+        self.assertTrue(len(edge_g) > 0)
+        self.assertGreater(min(edge_g), 180)
+        self.assertIn(resolve_upscaler_backend("auto"), ("mps_esrgan", "ncnn", "lanczos"))
+        self.assertIn(resolve_normal_backend("auto"), ("hybrid", "scharr"))
+
+
+class TestStage10PipelineBC7EndToEnd(unittest.TestCase):
+    def test_run_pipeline_bc7_dds_end_to_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            data_dir = Path(td) / "data"
+            out_dir = Path(td) / "overrides_bc7"
+            (data_dir / "tracks").mkdir(parents=True)
+            (data_dir / "cars").mkdir(parents=True)
+
+            road_img = RGBAImage.new(8, 8, (88, 90, 94, 255))
+            car_img = RGBAImage.new(8, 8, (20, 75, 215, 255))
+            sky_img = RGBAImage.new(8, 8, (110, 170, 240, 255))
+            ui_img = RGBAImage.new(8, 8, (255, 255, 255, 255))
+
+            bfl_stage = build_synthetic_bfl(
+                [
+                    ("uk_tarmac01.dds", build_dds_bgra32(road_img)),
+                    ("uk_sky_clouds.tga", build_tga(sky_img, bpp=24)),
+                    ("hel_13pt.tga", build_tga(ui_img, bpp=32)),
+                    ("ar_640a.tga", build_tga(ui_img, bpp=32)),
+                ],
+                compress_gzip=True,
+            )
+            (data_dir / "tracks" / "uk1.bfl").write_bytes(bfl_stage)
+            (data_dir / "cars" / "fordboddf.tga").write_bytes(build_tga(car_img, bpp=32))
+
+            manifest = run_pipeline(
+                data_path=data_dir,
+                output_dir=out_dir,
+                workers=1,
+                scale=2,
+                output_format="bc7",
+                bc7_quality="fast",
+                bc7_backend="python",
+                hero_max_size=2048,
+                quiet=True,
+            )
+            self.assertEqual(manifest["output_format"], "bc7")
+            self.assertEqual(manifest["status_counts"]["processed"], 3)
+            self.assertEqual(manifest["status_counts"]["skipped_ui"], 2)
+
+            # Road & car produce .dds, _n.dds, _s.dds with valid DX10 BC7 headers + full mips
+            for key in ("uk_tarmac01", "fordboddf"):
+                for suffix in ("", "_n", "_s"):
+                    dds_path = out_dir / f"{key}{suffix}.dds"
+                    self.assertTrue(dds_path.exists(), f"Missing {dds_path.name}")
+                    raw = dds_path.read_bytes()
+                    hdr = parse_dds_bc7_header(raw)
+                    self.assertEqual((hdr.width, hdr.height), (16, 16))
+                    self.assertEqual(hdr.dxgi_format, 98)
+                    self.assertEqual(hdr.mip_count, 5)
+                    self.assertEqual(len(raw), hdr.total_expected_bytes)
+
+            # Sky gets albedo .dds ONLY (no _n.dds / _s.dds)
+            self.assertTrue((out_dir / "uk_sky_clouds.dds").exists())
+            self.assertFalse((out_dir / "uk_sky_clouds_n.dds").exists())
+            self.assertFalse((out_dir / "uk_sky_clouds_s.dds").exists())
+
+            # UI textures never written
+            self.assertFalse((out_dir / "hel_13pt.dds").exists())
+            self.assertFalse((out_dir / "ar_640a.dds").exists())
 
 
 if __name__ == "__main__":

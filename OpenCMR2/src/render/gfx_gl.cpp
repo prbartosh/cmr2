@@ -579,6 +579,8 @@ struct Executor : GfxExecutor {
         t->gpu = NULL;
     }
 
+    bool SupportsBC7() const override { return false; }
+
     void ReadTexture(GfxTexture *t) override
     {
         GlTexture *g = (GlTexture *)t->gpu;

@@ -39,6 +39,17 @@ CATEGORIES = (
     "ui_skip",
 )
 
+SUB_PROFILES = (
+    "car_body",
+    "car_cockpit",
+    "car_glass",
+    "car_wheel",
+    "car_light",
+    "road_tarmac",
+    "road_gravel",
+    "road_snow",
+)
+
 # Exact textures vectorized at runtime by OpenCMR2:
 #   - src/render/vector_sprite.cpp (Cells / IsMap / IsArcadeMap)
 #   - src/render/outline_font.cpp + game/Font.cpp (hel_*, lcd_*, etc.)
@@ -147,12 +158,20 @@ SKY_PATTERNS = re.compile(
     r"backdrop|backdrp|distant|distmount|farhill|environment|envmap|env_|cubemap|overcast|haze)"
 )
 
+_CAR_PREFIX = (
+    r"(?:ford|foc|focus|sub|subaru|imp|impreza|peug|peu|206|mits|mit|evo|lan|lancer|"
+    r"seat|cord|cor|coro|corolla|toy|toyota|del|delta|strat|stratos|esc|escort|mini|"
+    r"sier|sierra|met|metro|6r4|rs200|quat|quattro|cel|celica|intg|integrale|car|veh)"
+)
+
 CAR_PATTERNS = re.compile(
-    r"(bodf$|livery|car\d|chassis|bonnet|hood|bumper|spoiler|wing|wheel|tyre|tire|rim|alloy|"
-    r"cockpit|interior|int_|dash|steer|seat|rollcage|windscr|glass|headl|headlite|taill|brkelite|"
-    r"revlite|hazdlite|mirror|exhaust|grille|numberplate|plate|driver|helmet|co_driv|codriv|"
-    r"subaru|impreza|focus|ford|lancer|evo|peugeot|206|seat|cordoba|corolla|mitsu|delta|stratos|"
-    r"escort|mini|sierra|metro|6r4|rs200|quattro|celica|integrale|paint$)"
+    r"(boddf$|dbodf$|bodf$|glid|glod|glob|livery|car\d|chassis|bonnet|hood|bumper|spoiler|wing|"
+    r"wheel|tyre|tire|rim|alloy|cockpit|interior|int_|dash|steer|seat|rollcage|windscr|windsh|"
+    r"glass|headl|headlite|taill|brkelite|revlite|hazdlite|mirror|exhaust|grille|numberplate|"
+    r"plate|driver|helmet|co_driv|codriv|"
+    r"subaru|impreza|focus|ford|lancer|evo|peugeot|206|cordoba|corolla|mitsu|delta|stratos|"
+    r"escort|mini|sierra|metro|6r4|rs200|quattro|celica|integrale|paint$|"
+    rf"^{_CAR_PREFIX}[a-z0-9_]*?(?:boddf|dbodf|bodf|glid|glod|glob|int|und|wh|lig)\d*$)"
 )
 
 CAR_ARCHIVE_HINTS = (
@@ -162,6 +181,29 @@ CAR_ARCHIVE_HINTS = (
     "a1.bfl",
     "/interior/",
 )
+
+# Sub-profile matchers (evaluated after top-level category is determined)
+_CAR_BODY_SUB_RE = re.compile(r"(boddf|dbodf|bodf|body|livery|bonnet|hood|bumper|spoiler|wing|paint$)")
+_CAR_GLASS_SUB_RE = re.compile(r"(glid|glod|glob|windscr|windsh|glass|window)")
+_CAR_LIGHT_SUB_RE = re.compile(
+    rf"(headl|headlite|taill|brkelite|revlite|hazdlite|fogl|light|lamp|(?:^|[_\-])lig|^{_CAR_PREFIX}[a-z0-9_]*?lig\d*$)"
+)
+_CAR_WHEEL_SUB_RE = re.compile(
+    rf"(wheel|tyre|tyr|tire|rim|alloy|brake|disc|calip|underbody|under_|(?:^|[_\-])(?:und|wh\d*)|"
+    rf"^{_CAR_PREFIX}[a-z0-9_]*?(?:und|wh)\d*$)"
+)
+_CAR_COCKPIT_STRONG_RE = re.compile(
+    rf"(cockpit|interior|dash|steer|rollcage|cabin|dial|gauge|speedo|"
+    rf"(?:^|[_\-])int(?:[_\-\d]|$)|^{_CAR_PREFIX}[a-z0-9_]*?int\d*$|/interior/)"
+)
+_CAR_SEAT_SUB_RE = re.compile(r"(?:^|[_\-])seat|seat[_\-]|seats")
+
+_ROAD_SNOW_SUB_RE = re.compile(r"(snow|ice|icy|frost|slush|winter|swed)")
+_ROAD_GRAVEL_SUB_RE = re.compile(
+    r"(gravel|grav|grvl|dirt|mud|sand|sandy|soil|earth|clay|dust|shingle|pebble|"
+    r"grass|turf|verge|bank|meadow|moss|field|heath|trail)"
+)
+_ROAD_TARMAC_SUB_RE = re.compile(r"(tarmac|tarm|asph|asphalt|cobble|pave|paving|curb|kerb|skid|wet_|puddle)")
 
 ROAD_PATTERNS = re.compile(
     r"(road|tarmac|tarm|asph|asphalt|gravel|grav|grvl|dirt|mud|snow|ice|icy|sand|sandy|"
@@ -214,6 +256,7 @@ class ClassificationResult:
     seamless: bool
     has_alpha_cutout: bool
     reasons: Tuple[str, ...]
+    sub_profile: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -308,6 +351,37 @@ def analyze_image(image: RGBAImage) -> ImageMetrics:
         looks_seamless=looks_seamless,
         sky_gradient_score=sky_score,
     )
+
+
+def detect_sub_profile(key: str, path_lower: str, category: str) -> str:
+    """Determine fine-grained Stage 10 PBR sub-profile for car_livery and road_surface."""
+    if category == "car_livery":
+        # Check explicit exterior body suffixes FIRST so 'seatbodf' (SEAT Cordoba body)
+        # maps to car_body rather than cockpit 'seat'.
+        if _CAR_BODY_SUB_RE.search(key):
+            return "car_body"
+        if _CAR_GLASS_SUB_RE.search(key):
+            return "car_glass"
+        if _CAR_LIGHT_SUB_RE.search(key):
+            return "car_light"
+        if _CAR_COCKPIT_STRONG_RE.search(key) or "/interior/" in path_lower:
+            return "car_cockpit"
+        if _CAR_WHEEL_SUB_RE.search(key):
+            return "car_wheel"
+        if _CAR_SEAT_SUB_RE.search(key):
+            return "car_cockpit"
+        return "car_body"
+
+    if category == "road_surface":
+        if _ROAD_SNOW_SUB_RE.search(key) or "/swed" in path_lower:
+            return "road_snow"
+        if _ROAD_GRAVEL_SUB_RE.search(key):
+            return "road_gravel"
+        if _ROAD_TARMAC_SUB_RE.search(key):
+            return "road_tarmac"
+        return "road_tarmac"
+
+    return ""
 
 
 def _is_ui_skip(key: str, path_lower: str) -> Optional[str]:
@@ -430,6 +504,9 @@ def classify_texture(
     seamless = best_cat == "road_surface" or (
         best_cat == "buildings_props" and metrics is not None and metrics.looks_seamless
     )
+    sub_profile = detect_sub_profile(key, path_lower, best_cat)
+    if sub_profile:
+        reasons.append(f"sub_profile={sub_profile}")
     return ClassificationResult(
         key=key,
         category=best_cat,
@@ -437,6 +514,7 @@ def classify_texture(
         seamless=seamless,
         has_alpha_cutout=has_cutout or best_cat == "foliage_alpha",
         reasons=tuple(reasons),
+        sub_profile=sub_profile,
     )
 
 
