@@ -241,6 +241,8 @@ struct Relay {
     wire::Endpoint guest;
     uint32_t hostAddress = 0;
     uint32_t guestAddress = 0;
+    wire::Endpoint requester;
+    uint32_t requestNonce = 0;
     bool hostBound = false;
     bool guestBound = false;
     int64_t createdAt = 0;
@@ -748,6 +750,23 @@ struct Server::State {
         }
     }
 
+    void OfferRelay(const Session &session, const Relay &relay, const wire::Endpoint &to, uint32_t nonce, size_t size,
+                    bool offerHost)
+    {
+        wire::Relayed reply;
+        reply.nonce = nonce;
+        reply.port = relay.port;
+        reply.token = relay.guestToken;
+        Send(mainFd, to, reply, size);
+        if (!offerHost)
+            return;
+        wire::RelayOffer offer;
+        offer.secret = session.secret;
+        offer.port = relay.port;
+        offer.token = relay.hostToken;
+        Send(mainFd, session.hostPublic, offer, wire::kMinRequest);
+    }
+
     void HandleRelay(const wire::Endpoint &from, const uint8_t *data, size_t size)
     {
         wire::Relay request;
@@ -757,11 +776,21 @@ struct Server::State {
             SendChallenge(from, request.nonce, size);
             return;
         }
+        Session *found = FindSession(request.code);
+        if (found != nullptr) {
+            for (uint64_t id : found->relays) {
+                auto existing = relays.find(id);
+                if (existing != relays.end() && existing->second.requester == from &&
+                    existing->second.requestNonce == request.nonce) {
+                    OfferRelay(*found, existing->second, from, request.nonce, size, !existing->second.hostBound);
+                    return;
+                }
+            }
+        }
         if (!TakeLookup(from.address)) {
             Fail(from, request.nonce, wire::FAILURE_RATE_LIMITED, size);
             return;
         }
-        Session *found = FindSession(request.code);
         if (found == nullptr) {
             Fail(from, request.nonce, wire::FAILURE_NOT_FOUND, size);
             return;
@@ -769,6 +798,8 @@ struct Server::State {
         Session &session = *found;
         Relay relay;
         relay.session = CodeKey(request.code);
+        relay.requester = from;
+        relay.requestNonce = request.nonce;
         relay.guestAddress = from.address;
         relay.hostAddress = session.hostPublic.address;
         if (session.relays.size() >= options.maxRelaysPerSession ||
@@ -788,16 +819,7 @@ struct Server::State {
         session.relays.push_back(id);
         stats.relayed++;
         UpdateCounts();
-        wire::Relayed reply;
-        reply.nonce = request.nonce;
-        reply.port = relay.port;
-        reply.token = relay.guestToken;
-        wire::RelayOffer offer;
-        offer.secret = session.secret;
-        offer.port = relay.port;
-        offer.token = relay.hostToken;
-        Send(mainFd, from, reply, size);
-        Send(mainFd, session.hostPublic, offer, wire::kMinRequest);
+        OfferRelay(session, relay, from, request.nonce, size, true);
         if (options.verbose) {
             char guest[32];
             Log("session %s relay on port %u for %s", net::joincode::Format(session.code).c_str(),

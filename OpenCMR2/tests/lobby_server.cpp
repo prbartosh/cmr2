@@ -1342,6 +1342,61 @@ void TestRelayCaps()
     }
 }
 
+void TestRelayRetry()
+{
+    lobby::Options options = TestOptions();
+    options.relayPortCount = 8;
+    Running lobby(options);
+    CHECK(lobby.started);
+    if (!lobby.started)
+        return;
+    uint16_t port = lobby.Port();
+    Client host, guest, neighbour;
+    Hosted hosted;
+    CHECK(RegisterHost(host, port, 1, MakeGuid(120), wire::Endpoint(), hosted));
+    RelayPair relay;
+    CHECK(OpenRelay(host, guest, port, hosted, 5, relay));
+    CHECK(lobby.server.RelayCount() == 1);
+
+    wire::Relay request;
+    request.nonce = 5;
+    request.code = hosted.code;
+    guest.Send(port, request);
+    wire::Relayed relayed;
+    CHECK(guest.AwaitReply(port, relayed));
+    CHECK(relayed.nonce == 5);
+    CHECK(relayed.port == relay.relayPort);
+    CHECK(relayed.token == relay.guestToken);
+    wire::RelayOffer offer;
+    CHECK(host.Await(port, offer));
+    CHECK(offer.port == relay.relayPort);
+    CHECK(offer.token == relay.hostToken);
+    CHECK(lobby.server.RelayCount() == 1);
+
+    CHECK(BindRelay(host, relay.relayPort, relay.hostToken));
+    for (int i = 0; i < 12; i++) {
+        guest.Send(port, request);
+        CHECK(guest.AwaitReply(port, relayed));
+        CHECK(relayed.nonce == 5);
+        CHECK(relayed.port == relay.relayPort);
+        CHECK(relayed.token == relay.guestToken);
+    }
+    CHECK(host.Silent(100));
+    CHECK(lobby.server.RelayCount() == 1);
+
+    RelayPair second;
+    CHECK(OpenRelay(host, guest, port, hosted, 6, second));
+    CHECK(second.relayPort != relay.relayPort);
+    CHECK(lobby.server.RelayCount() == 2);
+    request.nonce = 7;
+    guest.Send(port, request);
+    CHECK(guest.AwaitFailure(port, 7, wire::FAILURE_FULL));
+    request.nonce = 5;
+    neighbour.Send(port, request);
+    CHECK(neighbour.AwaitFailure(port, 5, wire::FAILURE_FULL));
+    CHECK(lobby.server.RelayCount() == 2);
+}
+
 void TestRelayTimers()
 {
     {
@@ -1488,6 +1543,7 @@ int main()
     TestCookieWindow();
     TestIntroduceLimit();
     TestRelayCaps();
+    TestRelayRetry();
     TestRelayTimers();
     TestBindAddress();
     TestBucketTable();
