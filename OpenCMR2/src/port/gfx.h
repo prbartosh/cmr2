@@ -271,6 +271,8 @@ void Gfx_SetRenderTarget(GfxTexture *target);
    the fade off. */
 void Gfx_CaptureBackdrop(void);
 void Gfx_SetDistanceFade(float start, float end);
+/* Current stage weather state for visual enhancements (kind: 0=clear, 1=rain, 2=snow; intensity 0..1). */
+void Gfx_SetWeatherState(int kind, float intensity);
 
 /* ---- fixed-function state -------------------------------------------------- */
 
@@ -360,7 +362,8 @@ enum GfxFormat {
     GFX_FORMAT_BGRA8,         /* 32-bit with alpha */
     GFX_FORMAT_BC1,           /* DXT1 */
     GFX_FORMAT_BC3,           /* DXT5 */
-    GFX_FORMAT_BUMP_DUDVL     /* 24-bit: signed dU, signed dV, luminance (L8V8U8) */
+    GFX_FORMAT_BUMP_DUDVL,    /* 24-bit: signed dU, signed dV, luminance (L8V8U8) */
+    GFX_FORMAT_BC7            /* DX10 BC7 RGBA (native GPU compressed with pre-generated mipmaps) */
 };
 
 enum GfxPixelFormatFlags {

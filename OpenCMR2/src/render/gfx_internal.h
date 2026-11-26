@@ -93,6 +93,8 @@ struct GfxDrawState {
     int fogVertexMode = GFX_FOG_NONE, fogTableMode = GFX_FOG_NONE;
     float fogStart = 0.0f, fogEnd = 1.0f;
     float fadeStart = 0.0f, fadeEnd = 0.0f;   // Gfx_SetDistanceFade (end <= start: off)
+    int weatherKind = 0;                      // Gfx_SetWeatherState (0=clear, 1=rain, 2=snow)
+    float weatherIntensity = 0.0f;            // 0..1 precipitation strength
     bool depthTest = true, depthWrite = true;
     int depthFunc = GFX_CMP_LESSEQUAL;
     int cull = GFX_CULL_CCW;
@@ -177,7 +179,11 @@ struct GfxExecutor {
     // Completes the back buffer read the last presented frame started, when
     // the game asks for its pixels (Gfx_ReadBackBuffer).
     virtual void CollectReadback(GfxReadback &) {}
+    // Whether the executor can sample native GPU BC7 (DX10) textures directly.
+    virtual bool SupportsBC7() const { return true; }
 };
+
+bool Gfx_SupportsBC7(void);
 
 GfxExecutor *Gfx_CreateGpuExecutor(void);
 GfxExecutor *Gfx_CreateNullExecutor(void);

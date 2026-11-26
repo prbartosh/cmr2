@@ -12,6 +12,9 @@ layout(location = 8) in vec4 inRawColor1;
 layout(location = 9) in vec4 inRawColor2;
 
 layout(location = 0) out vec4 outColor;
+#ifdef OPENCMR2_MRT_DEPTH
+layout(location = 1) out float outLinearDepth;
+#endif
 
 layout(set = 2, binding = 0) uniform sampler2D tex0;
 layout(set = 2, binding = 1) uniform samplerCube cube0;
@@ -23,6 +26,7 @@ layout(set = 2, binding = 6) uniform sampler2D native1;
 layout(set = 2, binding = 7) uniform sampler2D normalMap0;
 layout(set = 2, binding = 8) uniform sampler2D specMap0;
 layout(set = 2, binding = 9) uniform sampler2D shadowMapTex;
+layout(set = 2, binding = 10) uniform sampler2D sceneDepthTex;
 
 layout(std140, set = 3, binding = 0) uniform FragmentUniforms {
     ivec4 stage0;       // colour op, colour arg1, colour arg2, alpha op
@@ -63,9 +67,12 @@ layout(std140, set = 3, binding = 1) uniform FragmentLightingUniforms {
     ivec4 texCoordIndex;    // stage 0, stage 1, texture transform 0, texture transform 1
     vec4 viewUp;            // world up in eye space
     vec4 enhanceParams;     // x: perPixelLighting, y: hemisphereAmbient, z: carFresnelStrength, w: visualOverhaul
-    mat4 eyeToLightClip;    // eye space -> sun shadow clip space
-    vec4 shadowParams;      // x: enabled (0/1), y: strength, z: invMapSize, w: receiveShadows (0/1)
-    vec4 sunDirEye;         // xyz: direction toward sun in eye space, w: unused
+    mat4 eyeToLightClip[2]; // eye space -> sun shadow clip space (cascade 0 near, cascade 1 far)
+    vec4 shadowParams;      // x: enabled (0/1), y: strength, z: invCascadeSize, w: cascadeCount (1 or 2)
+    vec4 shadowParams2;     // x: pcfQuality (0/1/2), y: radiusScale0, z: radiusScale1, w: unused
+    vec4 sunDirEye;         // xyz: direction toward sun in eye space, w: sunIntensity (0..1)
+    vec4 pbrParams;         // x: pbrShading (0/1), y: maxCubeMip, z: wetness (0..1), w: atmosphericFog (0/1)
+    vec4 atmoParams;        // rgb: horizon scatter tint, w: mieStrength
 };
 
 const int TOP_DISABLE = 1, TOP_SELECTARG1 = 2, TOP_SELECTARG2 = 3, TOP_MODULATE = 4, TOP_MODULATE2X = 5,
@@ -179,10 +186,20 @@ vec4 SampleVectorIcon(sampler2D field, sampler2D original, vec2 uv, int scaledPo
     return vec4(mix(detail, colour, ink), IconCoverage(distances.b));
 }
 
-vec4 Sample(int kind, int scaledPoint, sampler2D t2, samplerCube tc, sampler2D original, vec4 coord)
+vec4 Sample(int kind, int scaledPoint, sampler2D t2, samplerCube tc, sampler2D original, vec4 coord,
+            float cubeLod, float clearcoat, float coatFresnel, bool usePbrIbl)
 {
-    if (kind == 2)
+    if (kind == 2) {
+        if (usePbrIbl) {
+            vec4 baseEnv = textureLod(tc, coord.xyz, cubeLod);
+            if (clearcoat > 0.05) {
+                vec3 sharpEnv = textureLod(tc, coord.xyz, 0.25).rgb;
+                baseEnv.rgb = mix(baseEnv.rgb, sharpEnv, clamp(clearcoat * (0.35 + 0.55 * coatFresnel), 0.0, 0.85));
+            }
+            return baseEnv;
+        }
         return texture(tc, coord.xyz);
+    }
     if (kind == 0)
         return vec4(1.0);
     if (kind == 4)
@@ -194,6 +211,51 @@ vec4 Sample(int kind, int scaledPoint, sampler2D t2, samplerCube tc, sampler2D o
     if (scaledPoint != 0)
         return SampleScaledPoint(t2, coord.xy);
     return texture(t2, coord.xy);
+}
+
+// Energy-conserving Cook-Torrance GGX microfacet helpers (PBR Stage 13).
+float D_GGX(float NdotH, float alpha)
+{
+    float a2 = max(alpha * alpha, 0.0004);
+    float d = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+    return a2 / (3.14159265 * d * d);
+}
+
+float V_SmithGGXFast(float NdotV, float NdotL, float alpha)
+{
+    return 0.5 / max(mix(2.0 * NdotL * NdotV, NdotL + NdotV, alpha), 1e-4);
+}
+
+vec3 F_Schlick(float cosTheta, vec3 F0)
+{
+    float m = clamp(1.0 - cosTheta, 0.0, 1.0);
+    float m2 = m * m;
+    return F0 + (vec3(1.0) - F0) * (m2 * m2 * m);
+}
+
+vec3 F_SchlickRoughness(float cosTheta, vec3 F0, float roughness)
+{
+    float m = clamp(1.0 - cosTheta, 0.0, 1.0);
+    float m2 = m * m;
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * (m2 * m2 * m);
+}
+
+// Smooth procedural puddle variation for wet road/tarmac surfaces during rain.
+float PuddleHash(vec2 p)
+{
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+float PuddleNoise(vec2 p)
+{
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float a = PuddleHash(i);
+    float b = PuddleHash(i + vec2(1.0, 0.0));
+    float c = PuddleHash(i + vec2(0.0, 1.0));
+    float d = PuddleHash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
 float SignedByte(float v)
@@ -249,37 +311,129 @@ vec3 PerturbNormal(vec3 N, vec3 eyePos, vec2 uv, vec3 mapSample, float strength)
     return normalize(tbn * normalize(tn));
 }
 
-// 9-tap PCF directional sun shadow sampling with normal-offset bias and frustum edge fade.
-// Returns 1.0 when fully lit, 0.0 when occluded by shadow casters.
+// Screen-space Interleaved Gradient Noise (Jorge Jimenez 2014) for per-pixel Poisson rotation.
+float InterleavedGradientNoise(vec2 p)
+{
+    vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
+    return fract(magic.z * fract(dot(p, magic.xy)));
+}
+
+// 16-tap blue-noise Poisson disk (first 8 and first 4 are also well-distributed subsets).
+const vec2 kPoissonDisk16[16] = vec2[16](
+    vec2(-0.613392,  0.617481), vec2( 0.170019, -0.040254),
+    vec2(-0.299417,  0.791925), vec2( 0.645680,  0.493210),
+    vec2(-0.651784,  0.717887), vec2( 0.421003,  0.027070),
+    vec2(-0.817194, -0.271096), vec2(-0.705374, -0.668203),
+    vec2( 0.977050, -0.108615), vec2( 0.063326,  0.142369),
+    vec2( 0.203528,  0.214331), vec2(-0.667531,  0.326090),
+    vec2(-0.098422, -0.295755), vec2(-0.885922,  0.215369),
+    vec2( 0.566637,  0.605213), vec2( 0.039766, -0.396100)
+);
+
+// Sample one cascade (0 = near, 1 = far) from the 2x1 shadow atlas using Rotated Poisson Disk PCF.
+float SampleShadowCascade(int cascadeIdx, vec3 proj, float ndl, mat2 rot)
+{
+    vec2 luv = vec2(proj.x * 0.5 + 0.5, 0.5 - proj.y * 0.5);
+    float invSize = shadowParams.z;
+    bool twoCascades = shadowParams.w > 1.5;
+
+    float bias = (cascadeIdx == 0 && twoCascades)
+                     ? mix(0.0014, 0.00035, ndl)
+                     : mix(0.0028, 0.00075, ndl);
+    float radiusScale = (cascadeIdx == 0) ? shadowParams2.y : shadowParams2.z;
+    float radius = invSize * radiusScale;
+
+    int pcfQual = int(shadowParams2.x + 0.5);
+    int tapCount = (pcfQual >= 2) ? 16 : (pcfQual == 1 ? 8 : 4);
+
+    float minUV = 0.5 * invSize;
+    float maxUV = 1.0 - 0.5 * invSize;
+    float uOffset = (twoCascades && cascadeIdx == 1) ? 0.5 : 0.0;
+    float uScale = twoCascades ? 0.5 : 1.0;
+
+    float vis = 0.0;
+    for (int i = 0; i < 16; i++) {
+        if (i >= tapCount)
+            break;
+        vec2 off = (rot * kPoissonDisk16[i]) * radius;
+        vec2 cuv = clamp(luv + off, vec2(minUV), vec2(maxUV));
+        vec2 atlasUV = vec2(uOffset + cuv.x * uScale, cuv.y);
+        float d = texture(shadowMapTex, atlasUV).r;
+        vis += (proj.z - bias <= d) ? 1.0 : 0.0;
+    }
+    return vis / float(tapCount);
+}
+
+// 2-cascade CSM directional sun shadow sampling with IGN-rotated Poisson Disk PCF
+// and smooth cross-cascade blending. Returns 1.0 when fully lit, 0.0 when shadowed.
 float SampleSunShadow(vec3 eyePos, vec3 geomN, bool hasNormal)
 {
     if (shadowParams.x < 0.5 || fogParams.z < 0.5 || enhanceParams.w < 0.5)
         return 1.0;
-    vec3 offsetPos = eyePos + (hasNormal ? geomN * 0.07 : vec3(0.0));
-    vec4 lc = eyeToLightClip * vec4(offsetPos, 1.0);
-    if (abs(lc.w) < 1e-5)
-        return 1.0;
-    vec3 proj = lc.xyz / lc.w;
-    vec2 suv = vec2(proj.x * 0.5 + 0.5, 0.5 - proj.y * 0.5);
-    if (suv.x <= 0.002 || suv.x >= 0.998 || suv.y <= 0.002 || suv.y >= 0.998 ||
-        proj.z <= 0.0 || proj.z >= 1.0)
-        return 1.0;
-    float edge = max(abs(proj.x), abs(proj.y));
-    float fade = 1.0 - smoothstep(0.78, 0.98, edge);
-    if (fade <= 0.0)
-        return 1.0;
+
     float ndl = hasNormal ? max(dot(geomN, sunDirEye.xyz), 0.0) : 0.5;
-    float bias = mix(0.0026, 0.0007, ndl);
-    float invSize = shadowParams.z;
-    float vis = 0.0;
-    for (int dy = -1; dy <= 1; dy++) {
-        for (int dx = -1; dx <= 1; dx++) {
-            float d = texture(shadowMapTex, suv + vec2(float(dx), float(dy)) * invSize).r;
-            vis += (proj.z - bias <= d) ? 1.0 : 0.0;
-        }
+    float angle = InterleavedGradientNoise(gl_FragCoord.xy) * 6.2831853;
+    float ca = cos(angle);
+    float sa = sin(angle);
+    mat2 rot = mat2(ca, -sa, sa, ca);
+
+    bool twoCascades = shadowParams.w > 1.5;
+
+    // Cascade 0 (near high-res around car, or sole cascade when shadow_cascades == 1).
+    float normalOff0 = twoCascades ? 0.035 : 0.07;
+    vec3 offsetPos0 = eyePos + (hasNormal ? geomN * normalOff0 : vec3(0.0));
+    vec4 lc0 = eyeToLightClip[0] * vec4(offsetPos0, 1.0);
+    bool valid0 = false;
+    vec3 proj0 = vec3(0.0);
+    float edge0 = 2.0;
+    if (abs(lc0.w) >= 1e-5) {
+        proj0 = lc0.xyz / lc0.w;
+        edge0 = max(abs(proj0.x), abs(proj0.y));
+        valid0 = edge0 < 0.98 && proj0.z > 0.0 && proj0.z < 1.0;
     }
-    vis /= 9.0;
-    return mix(1.0, vis, fade);
+
+    if (!twoCascades) {
+        if (!valid0)
+            return 1.0;
+        float fade = 1.0 - smoothstep(0.78, 0.98, edge0);
+        if (fade <= 0.0)
+            return 1.0;
+        float vis0 = SampleShadowCascade(0, proj0, ndl, rot);
+        return mix(1.0, vis0, fade);
+    }
+
+    // Fast path: strictly inside Cascade 0 core (0..~18m) — only sample Cascade 0.
+    if (valid0 && edge0 < 0.78) {
+        return SampleShadowCascade(0, proj0, ndl, rot);
+    }
+
+    // Cascade 1 (far 20..110m).
+    vec3 offsetPos1 = eyePos + (hasNormal ? geomN * 0.085 : vec3(0.0));
+    vec4 lc1 = eyeToLightClip[1] * vec4(offsetPos1, 1.0);
+    bool valid1 = false;
+    vec3 proj1 = vec3(0.0);
+    float edge1 = 2.0;
+    if (abs(lc1.w) >= 1e-5) {
+        proj1 = lc1.xyz / lc1.w;
+        edge1 = max(abs(proj1.x), abs(proj1.y));
+        valid1 = edge1 < 0.98 && proj1.z > 0.0 && proj1.z < 1.0;
+    }
+
+    float vis1 = 1.0;
+    if (valid1) {
+        float fade1 = 1.0 - smoothstep(0.80, 0.98, edge1);
+        if (fade1 > 0.0)
+            vis1 = mix(1.0, SampleShadowCascade(1, proj1, ndl, rot), fade1);
+    }
+
+    // Smooth blend band between Cascade 0 and Cascade 1 (edge0 in [0.78, 0.96]).
+    if (valid0 && edge0 < 0.96) {
+        float vis0 = SampleShadowCascade(0, proj0, ndl, rot);
+        float t = smoothstep(0.78, 0.96, edge0);
+        return mix(vis0, vis1, t);
+    }
+
+    return vis1;
 }
 
 void main()
@@ -297,17 +451,52 @@ void main()
                         stage0.x != TOP_DISABLE && stage0b.z == 1;
     bool useSpecMap = enhanceParams.w > 0.5 && alphaTest.w != 0 &&
                       stage0.x != TOP_DISABLE && stage0b.z == 1;
+    bool usePbr = enhanceParams.w > 0.5 && pbrParams.x > 0.5;
     if (useNormalMap) {
         vec3 mapN = texture(normalMap0, inTex0.xy).rgb;
         N = PerturbNormal(N, inEyePosition, inTex0.xy, mapN, distanceFade.w);
     }
     float specMask = 1.0;
     float reflMask = 1.0;
+    float coatMask = isCubePass ? 0.85 : 0.0;
+    float microAO = 1.0;
     if (useSpecMap) {
         vec4 sm = texture(specMap0, inTex0.xy);
         specMask = sm.r;
         reflMask = sm.g;
+        coatMask = sm.b;
+        if (!isCubePass)
+            microAO = mix(0.80, 1.0, sm.b);
     }
+
+    // Derive physical roughness from *_s gloss channel (R = specular/gloss).
+    float roughness = useSpecMap ? clamp(1.0 - specMask * 0.88, 0.06, 0.96)
+                                 : (isCubePass ? 0.22 : 0.68);
+    vec3 worldUpEye = dot(viewUp.xyz, viewUp.xyz) > 1e-6 ? normalize(viewUp.xyz) : vec3(0.0, 1.0, 0.0);
+
+    // Stage 13: Wet surfaces in rain (upward-facing world surfaces, non-foliage).
+    float wetFactor = 0.0;
+    float wetPuddle = 0.0;
+    if (enhanceParams.w > 0.5 && pbrParams.z > 0.01 && fogParams.z > 0.5 && !isCubePass && alphaTest.x == 0 &&
+        stage0.x != TOP_DISABLE && stage0b.z == 1) {
+        float upFacing = hasNormal ? smoothstep(0.45, 0.88, dot(geomN, worldUpEye)) : 0.85;
+        if (upFacing > 0.01) {
+            // World-stable procedural puddle patches driven by texture coordinates.
+            float pn = 0.65 * PuddleNoise(inTex0.xy * 2.2) + 0.35 * PuddleNoise(inTex0.xy * 5.7);
+            wetPuddle = smoothstep(0.32, 0.78, pn);
+            wetFactor = pbrParams.z * upFacing;
+            // Water pools smooth out micro-roughness and flatten surface normals inside puddles.
+            float puddleWet = wetFactor * mix(0.45, 1.0, wetPuddle);
+            roughness = mix(roughness, 0.07, puddleWet);
+            specMask = max(specMask, mix(0.35, 0.92, puddleWet));
+            reflMask = max(reflMask, mix(0.30, 0.90, puddleWet));
+            if (hasNormal)
+                N = normalize(mix(N, geomN, puddleWet * 0.55));
+        }
+    }
+
+    float ndotv = clamp(dot(N, V), 0.001, 1.0);
+    float coatFresnel = mix(0.12, 1.0, pow(1.0 - ndotv, 4.5));
 
     vec4 litDiffuse = inDiffuse;
     vec4 litSpecular = inSpecular;
@@ -319,15 +508,17 @@ void main()
         vec4 matAmbient = MaterialColor(sources.z, materialAmbient, inRawColor1, inRawColor2);
         vec4 matEmissive = MaterialColor(sources.w, materialEmissive, inRawColor1, inRawColor2);
         vec3 ambient = globalAmbient.rgb;
-        if (enhanceParams.y > 0.5 && dot(viewUp.xyz, viewUp.xyz) > 1e-6) {
-            float hemi = clamp(dot(N, normalize(viewUp.xyz)) * 0.5 + 0.5, 0.0, 1.0);
+        if (enhanceParams.y > 0.5) {
+            float hemi = clamp(dot(N, worldUpEye) * 0.5 + 0.5, 0.0, 1.0);
             ambient *= mix(vec3(0.86, 0.85, 0.82), vec3(1.10, 1.12, 1.16), hemi);
         }
         vec3 diffuseSum = vec3(0.0);
         vec3 specularSum = vec3(0.0);
         vec3 toEye = lightFlags.w != 0 ? V : vec3(0.0, 0.0, -1.0);
-        float ndotv = clamp(dot(N, V), 0.0, 1.0);
-        float coatFresnel = mix(0.15, 1.0, pow(1.0 - ndotv, 4.0));
+        float alpha = roughness * roughness;
+        vec3 F0 = vec3(mix(0.03, 0.09, reflMask));
+        float metalHint = useSpecMap ? smoothstep(0.68, 0.95, reflMask) * smoothstep(0.55, 0.90, specMask) * (1.0 - coatMask * 0.5) : 0.0;
+        F0 = mix(F0, vec3(0.55), metalHint * 0.5);
 
         for (int i = 0; i < 8; i++) {
             FragLight l = lights[i];
@@ -359,20 +550,41 @@ void main()
             ambient += l.ambient.rgb * scale;
             float directScale = (type == 3) ? (scale * sunDirectShadow) : scale;
             float nDotL = max(dot(N, L), 0.0);
-            diffuseSum += l.diffuse.rgb * nDotL * directScale;
             if (nDotL > 0.0) {
                 vec3 h = normalize(toEye + L);
-                if (lightFlags.z != 0)
-                    specularSum += l.specular.rgb * pow(max(dot(N, h), 0.0), max(globalAmbient.w, 1.0)) * directScale * specMask;
-                if (isCubePass && enhanceParams.z > 0.0 && type == 3)
-                    clearcoatSpec += l.diffuse.rgb * pow(max(dot(N, h), 0.0), 48.0) * (0.28 * enhanceParams.z * coatFresnel * specMask) * directScale;
-                else if (useSpecMap && type == 3 && specMask > 0.05)
-                    clearcoatSpec += l.diffuse.rgb * pow(max(dot(N, h), 0.0), 28.0) * (0.18 * specMask) * directScale;
+                float nDotH = max(dot(N, h), 0.0);
+                float vDotH = max(dot(toEye, h), 0.0);
+                if (usePbr) {
+                    float D = D_GGX(nDotH, alpha);
+                    float Vis = V_SmithGGXFast(ndotv, nDotL, alpha);
+                    vec3 F = F_Schlick(vDotH, F0);
+                    vec3 ggxSpec = (D * Vis) * F * nDotL * 2.2;
+                    vec3 kD = vec3(1.0) - F * 0.45;
+                    diffuseSum += l.diffuse.rgb * kD * nDotL * directScale;
+                    if (lightFlags.z != 0)
+                        specularSum += l.specular.rgb * ggxSpec * directScale * specMask;
+                    if (isCubePass && enhanceParams.z > 0.0 && type == 3) {
+                        float Dc = D_GGX(nDotH, 0.045);
+                        float Vc = V_SmithGGXFast(ndotv, nDotL, 0.045);
+                        float Fc = 0.04 + 0.96 * pow(1.0 - vDotH, 5.0);
+                        clearcoatSpec += l.diffuse.rgb * (Dc * Vc * Fc * nDotL) * (0.42 * enhanceParams.z * coatMask) * directScale;
+                    } else if ((useSpecMap || wetFactor > 0.01) && type == 3 && specMask > 0.05) {
+                        clearcoatSpec += l.diffuse.rgb * ggxSpec * (0.28 * specMask) * directScale;
+                    }
+                } else {
+                    diffuseSum += l.diffuse.rgb * nDotL * directScale;
+                    if (lightFlags.z != 0)
+                        specularSum += l.specular.rgb * pow(nDotH, max(globalAmbient.w, 1.0)) * directScale * specMask;
+                    if (isCubePass && enhanceParams.z > 0.0 && type == 3)
+                        clearcoatSpec += l.diffuse.rgb * pow(nDotH, 48.0) * (0.28 * enhanceParams.z * coatFresnel * specMask) * directScale;
+                    else if (useSpecMap && type == 3 && specMask > 0.05)
+                        clearcoatSpec += l.diffuse.rgb * pow(nDotH, 28.0) * (0.18 * specMask) * directScale;
+                }
             }
         }
-        litDiffuse = vec4(clamp(matEmissive.rgb + ambient * matAmbient.rgb + diffuseSum * matDiffuse.rgb, 0.0, 1.0),
+        litDiffuse = vec4(clamp((matEmissive.rgb + ambient * matAmbient.rgb * microAO + diffuseSum * matDiffuse.rgb), 0.0, 1.0),
                           matDiffuse.a);
-        litSpecular = vec4(clamp(specularSum * matSpecular.rgb, 0.0, 1.0), inRawColor2.a);
+        litSpecular = vec4(clamp(specularSum * matSpecular.rgb, 0.0, 1.5), inRawColor2.a);
     }
 
     vec4 current = litDiffuse;
@@ -380,10 +592,16 @@ void main()
     float luminance = 1.0;
 
     float cubeFresnel = 1.0;
+    float cubeLod = usePbr ? clamp(roughness * pbrParams.y, 0.0, pbrParams.y) : 0.0;
     if (enhanceParams.w > 0.5 && enhanceParams.z > 0.0 && hasNormal) {
-        float ndotv = clamp(dot(N, V), 0.0, 1.0);
-        float f = mix(0.28, 1.35, pow(1.0 - ndotv, 3.2));
-        cubeFresnel = mix(1.0, f, enhanceParams.z) * reflMask;
+        if (usePbr) {
+            vec3 Fenv = F_SchlickRoughness(ndotv, vec3(mix(0.06, 0.30, reflMask)), roughness);
+            float f = mix(0.24, 1.38, clamp(Fenv.r * 1.45, 0.0, 1.0));
+            cubeFresnel = mix(1.0, f, enhanceParams.z) * reflMask;
+        } else {
+            float f = mix(0.28, 1.35, pow(1.0 - ndotv, 3.2));
+            cubeFresnel = mix(1.0, f, enhanceParams.z) * reflMask;
+        }
     } else if (useSpecMap) {
         cubeFresnel = reflMask;
     }
@@ -398,7 +616,8 @@ void main()
                 luminance = clamp(bump.b * bumpLuminance.x + bumpLuminance.y, 0.0, 1.0);
         } else {
             vec4 coord0 = ComputeStageCoord(0, inTex0, inEyePosition, N, hasNormal);
-            vec4 texel = Sample(stage0b.z, stage0b.w, tex0, cube0, native0, coord0);
+            vec4 texel = Sample(stage0b.z, stage0b.w, tex0, cube0, native0, coord0,
+                                cubeLod, coatMask, coatFresnel, usePbr);
             if (stage0b.z == 2)
                 texel.rgb = clamp(texel.rgb * cubeFresnel, 0.0, 1.0);
             vec4 color = Op(stage0.x, Arg(stage0.y, current, texel, litDiffuse, litSpecular),
@@ -414,7 +633,8 @@ void main()
         if (stage1.x != TOP_DISABLE) {
             vec4 baseCoord1 = ComputeStageCoord(1, inTex1, inEyePosition, N, hasNormal);
             vec4 coord = baseCoord1 + vec4(bumpOffset, 0.0, 0.0);
-            vec4 texel = Sample(stage1b.z, stage1b.w, tex1, cube1, native1, coord);
+            vec4 texel = Sample(stage1b.z, stage1b.w, tex1, cube1, native1, coord,
+                                cubeLod, coatMask, coatFresnel, usePbr);
             texel.rgb *= luminance;
             if (stage1b.z == 2)
                 texel.rgb = clamp(texel.rgb * cubeFresnel, 0.0, 1.0);
@@ -429,6 +649,48 @@ void main()
         }
     }
 
+    // Apply wet porous darkening + subtle micro-AO + GGX wet/IBL sheen on 3D world surfaces.
+    if (enhanceParams.w > 0.5 && fogParams.z > 0.5) {
+        if (!isCubePass && useSpecMap && lightFlags.x == 0)
+            current.rgb *= microAO;
+        if (wetFactor > 0.01) {
+            // Wet porous tarmac/gravel absorbs light -> richer, darker wet albedo.
+            float wetDark = mix(1.0, 0.62, wetFactor * mix(0.65, 1.0, wetPuddle));
+            current.rgb *= wetDark;
+
+            // Grazing-angle wet Fresnel reflection of sky/horizon + sharp GGX sun glint on puddles.
+            float wetF = (0.04 + 0.96 * pow(1.0 - ndotv, 4.2)) * wetFactor * mix(0.45, 1.0, wetPuddle);
+            vec3 skyRefl = mix(atmoParams.rgb * 0.72, atmoParams.rgb * 1.15 + vec3(0.08, 0.10, 0.14),
+                               clamp(dot(reflect(-V, N), worldUpEye) * 0.5 + 0.5, 0.0, 1.0));
+            current.rgb = mix(current.rgb, skyRefl, clamp(wetF * 0.62, 0.0, 0.55));
+            if (lightFlags.x == 0 && sunDirEye.w > 0.05) {
+                vec3 Lsun = normalize(sunDirEye.xyz);
+                float nDotL = max(dot(N, Lsun), 0.0);
+                if (nDotL > 0.0) {
+                    vec3 Hsun = normalize(V + Lsun);
+                    float alphaW = max(roughness * roughness, 0.012);
+                    float Dw = D_GGX(max(dot(N, Hsun), 0.0), alphaW);
+                    float Vw = V_SmithGGXFast(ndotv, nDotL, alphaW);
+                    float Fw = 0.04 + 0.96 * pow(1.0 - max(dot(V, Hsun), 0.0), 5.0);
+                    vec3 wetGlint = vec3(1.0, 0.98, 0.94) * (Dw * Vw * Fw * nDotL * sunVis * wetFactor * 0.55);
+                    clearcoatSpec += min(wetGlint, vec3(1.4));
+                }
+            }
+        } else if (usePbr && lightFlags.x == 0 && useSpecMap && specMask > 0.08 && sunDirEye.w > 0.05 && hasNormal) {
+            // Subtle PBR sun specular highlight on vertex-lit track surfaces (asphalt/ice/metal barriers).
+            vec3 Lsun = normalize(sunDirEye.xyz);
+            float nDotL = max(dot(N, Lsun), 0.0);
+            if (nDotL > 0.0) {
+                vec3 Hsun = normalize(V + Lsun);
+                float alphaT = roughness * roughness;
+                float Dt = D_GGX(max(dot(N, Hsun), 0.0), alphaT);
+                float Vt = V_SmithGGXFast(ndotv, nDotL, alphaT);
+                float Ft = 0.04 + 0.96 * pow(1.0 - max(dot(V, Hsun), 0.0), 5.0);
+                clearcoatSpec += vec3(1.0, 0.97, 0.92) * min(Dt * Vt * Ft * nDotL * specMask * sunVis * 0.35, 0.65);
+            }
+        }
+    }
+
     if (fogMode.z != 0)
         current.rgb = fogMode.w != 0 ? clamp(current.rgb + litSpecular.rgb, 0.0, 4.0)
                                      : clamp(current.rgb + litSpecular.rgb, 0.0, 1.0);
@@ -436,8 +698,16 @@ void main()
         current.rgb = fogMode.w != 0 ? clamp(current.rgb + clearcoatSpec, 0.0, 4.0)
                                      : clamp(current.rgb + clearcoatSpec, 0.0, 1.0);
 
-    if (alphaTest.x != 0 && !Compare(alphaTest.y, floor(current.a * 255.0 + 0.5), floor(alphaRef.x * 255.0 + 0.5)))
+    if (alphaTest.x == 2) {
+        // Stage 14: Hardware Alpha-to-Coverage MSAA for foliage, trees, and fences.
+        // Rescale alpha around alphaRef using screen-space derivative so silhouettes stay crisp at all mips.
+        float fw = max(fwidth(current.a), 0.0001);
+        current.a = clamp((current.a - alphaRef.x) / max(fw, 0.22) + 0.5, 0.0, 1.0);
+        if (current.a < 0.02)
+            discard;
+    } else if (alphaTest.x != 0 && !Compare(alphaTest.y, floor(current.a * 255.0 + 0.5), floor(alphaRef.x * 255.0 + 0.5))) {
         discard;
+    }
 
     // Apply real-time sun shadows to vertex-lit 3D scenery (track/terrain sectors).
     if (lightFlags.x == 0 && shadowParams.x > 0.5 && fogParams.z > 0.5 && enhanceParams.w > 0.5) {
@@ -452,7 +722,36 @@ void main()
             float range = fogParams.y - fogParams.x;
             f = range != 0.0 ? clamp((fogParams.y - inEyeDepth) / range, 0.0, 1.0) : 1.0;
         }
-        current.rgb = mix(fogColor.rgb, current.rgb, f);
+        vec3 fc = fogColor.rgb;
+        // Subtle Mie sun in-scattering inside stage fog when atmospheric_fog is enabled.
+        if (enhanceParams.w > 0.5 && pbrParams.w > 0.5 && atmoParams.w > 0.01 && length(inEyePosition) > 1.0) {
+            float sunCos = max(dot(normalize(inEyePosition), sunDirEye.xyz), 0.0);
+            float mie = (pow(sunCos, 6.0) * 0.28 + pow(sunCos, 24.0) * 0.22) * atmoParams.w;
+            fc = clamp(fc + vec3(1.0, 0.88, 0.68) * mie, 0.0, fogMode.w != 0 ? 2.5 : 1.0);
+        }
+        current.rgb = mix(fc, current.rgb, f);
+    }
+
+    // Stage 13: Atmospheric / Height Fog + Horizon Sun In-Scattering (Mie glow).
+    if (enhanceParams.w > 0.5 && pbrParams.w > 0.5 && fogParams.z > 0.5) {
+        float eyeDist = length(inEyePosition);
+        if (eyeDist > 16.0) {
+            vec3 viewDir = inEyePosition / eyeDist;
+            float relHeight = dot(inEyePosition, worldUpEye);
+            // Denser haze near valley floors/ground, clearer on high ridges.
+            float heightAtten = exp(-max(relHeight + 3.0, 0.0) * 0.018);
+            float baseDensity = (fogMode.x != 0 ? 0.0018 : 0.0028) + pbrParams.z * 0.0022;
+            float haze = 1.0 - exp(-(eyeDist - 16.0) * baseDensity * heightAtten);
+            haze = clamp(haze, 0.0, fogMode.x != 0 ? 0.30 : 0.46);
+
+            vec3 scatterCol = fogMode.x != 0 ? mix(fogColor.rgb, atmoParams.rgb, 0.35) : atmoParams.rgb;
+            if (atmoParams.w > 0.01) {
+                float sunCos = max(dot(viewDir, sunDirEye.xyz), 0.0);
+                float mie = (pow(sunCos, 6.0) * 0.34 + pow(sunCos, 24.0) * 0.28) * atmoParams.w;
+                scatterCol = mix(scatterCol, vec3(1.05, 0.92, 0.72), clamp(mie, 0.0, 0.72));
+            }
+            current.rgb = mix(current.rgb, scatterCol, haze);
+        }
     }
 
     // Toward the far plane the scenery dissolves into the sky and backdrop
@@ -464,5 +763,22 @@ void main()
         if (f > 0.0)
             current.rgb = mix(current.rgb, texelFetch(backdrop, ivec2(gl_FragCoord.xy), 0).rgb, f);
     }
+    // Stage 14: Soft Particles — smoothly feather dust/smoke/snow intersections against 3D scene depth.
+    if (enhanceParams.w > 0.5 && abs(alphaRef.y) > 0.001) {
+        vec2 spUV = clamp(gl_FragCoord.xy * alphaRef.zw, vec2(0.0), vec2(1.0));
+        float sceneZ = texture(sceneDepthTex, spUV).r;
+        if (sceneZ > 0.05 && sceneZ < 5000.0) {
+            float depthDelta = sceneZ - inEyeDepth;
+            float softFade = smoothstep(0.0, abs(alphaRef.y), depthDelta);
+            if (alphaRef.y < 0.0)
+                current.rgb *= softFade;
+            else
+                current.a *= softFade;
+        }
+    }
+
     outColor = current;
+#ifdef OPENCMR2_MRT_DEPTH
+    outLinearDepth = inEyeDepth;
+#endif
 }

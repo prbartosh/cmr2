@@ -69,9 +69,12 @@ struct FragmentLightingUniforms {
     int32_t texCoordIndex[4];
     float viewUp[4];
     float enhanceParams[4];
-    float eyeToLightClip[16];
+    float eyeToLightClip[2][16];
     float shadowParams[4];
+    float shadowParams2[4];
     float sunDirEye[4];
+    float pbrParams[4];
+    float atmoParams[4];
 };
 
 struct ClearUniforms {
@@ -81,6 +84,11 @@ struct ClearUniforms {
 
 struct PostUniforms {
     float params[4];
+};
+
+struct PostUniforms2 {
+    float a[4];
+    float b[4];
 };
 
 struct ShadowVertexUniforms {
@@ -159,34 +167,26 @@ bool InvertAffineMatrix(const GfxMatrix &m, GfxMatrix &out)
     return true;
 }
 
-bool BuildSunLightMatrix(const GfxMatrix &camView, const GfxVector &sunLightDir, float shadowDist, int mapSize,
-                         GfxMatrix &outLightVP, GfxVector &outToSunWorld)
+struct ShadowCascade {
+    GfxMatrix lightVP;
+    GfxVector center;
+    float radius;
+    float zRange;
+};
+
+struct ShadowSetup {
+    int count = 0;
+    ShadowCascade cascades[2] = {};
+    GfxVector toSunWorld = { 0.0f, 1.0f, 0.0f };
+    GfxVector lightRight = { 1.0f, 0.0f, 0.0f };
+    GfxVector lightUp = { 0.0f, 1.0f, 0.0f };
+    GfxVector lightFwd = { 0.0f, 0.0f, 1.0f };
+};
+
+void BuildSingleCascade(const GfxVector &focus, float radius, float zRange, int mapSize,
+                        const GfxVector &lightRight, const GfxVector &lightUp, const GfxVector &lightFwd,
+                        ShadowCascade &out)
 {
-    GfxMatrix invCam;
-    if (!InvertAffineMatrix(camView, invCam))
-        return false;
-    GfxVector camPos = { invCam._41, invCam._42, invCam._43 };
-    GfxVector camFwd = VecNormalize({ camView._13, camView._23, camView._33 });
-
-    GfxVector toSun = VecNormalize({ -sunLightDir.x, -sunLightDir.y, -sunLightDir.z });
-    if (toSun.y < 0.24f) {
-        toSun.y = 0.24f;
-        toSun = VecNormalize(toSun);
-    }
-    outToSunWorld = toSun;
-
-    GfxVector lightFwd = { -toSun.x, -toSun.y, -toSun.z };
-    GfxVector upRef = fabsf(lightFwd.y) > 0.98f ? GfxVector{ 0.0f, 0.0f, 1.0f } : GfxVector{ 0.0f, 1.0f, 0.0f };
-    GfxVector lightRight = VecNormalize(VecCross(upRef, lightFwd));
-    GfxVector lightUp = VecNormalize(VecCross(lightFwd, lightRight));
-
-    float radius = std::clamp(shadowDist, 25.0f, 200.0f);
-    float zRange = std::max(radius * 2.5f, 200.0f);
-    GfxVector focus = {
-        camPos.x + camFwd.x * (radius * 0.35f),
-        camPos.y + camFwd.y * (radius * 0.35f),
-        camPos.z + camFwd.z * (radius * 0.35f),
-    };
     float texelSize = (2.0f * radius) / (float)std::max(mapSize, 256);
     float fx = floorf(VecDot(focus, lightRight) / texelSize) * texelSize;
     float fy = floorf(VecDot(focus, lightUp) / texelSize) * texelSize;
@@ -213,8 +213,120 @@ bool BuildSunLightMatrix(const GfxMatrix &camView, const GfxVector &sunLightDir,
     lightOrtho._43 = 0.5f;
     lightOrtho._44 = 1.0f;
 
-    Multiply(lightView, lightOrtho, &outLightVP._11);
+    Multiply(lightView, lightOrtho, &out.lightVP._11);
+    out.center = center;
+    out.radius = radius;
+    out.zRange = zRange;
+}
+
+bool BuildSunCascades(const GfxMatrix &camView, const GfxVector &sunLightDir, float shadowDist, int mapSize,
+                      int cascadeCount, ShadowSetup &out)
+{
+    GfxMatrix invCam;
+    if (!InvertAffineMatrix(camView, invCam))
+        return false;
+    GfxVector camPos = { invCam._41, invCam._42, invCam._43 };
+    GfxVector camFwd = VecNormalize({ camView._13, camView._23, camView._33 });
+
+    GfxVector toSun = VecNormalize({ -sunLightDir.x, -sunLightDir.y, -sunLightDir.z });
+    if (toSun.y < 0.24f) {
+        toSun.y = 0.24f;
+        toSun = VecNormalize(toSun);
+    }
+    GfxVector lightFwd = { -toSun.x, -toSun.y, -toSun.z };
+    GfxVector upRef = fabsf(lightFwd.y) > 0.98f ? GfxVector{ 0.0f, 0.0f, 1.0f } : GfxVector{ 0.0f, 1.0f, 0.0f };
+    GfxVector lightRight = VecNormalize(VecCross(upRef, lightFwd));
+    GfxVector lightUp = VecNormalize(VecCross(lightFwd, lightRight));
+
+    out.toSunWorld = toSun;
+    out.lightRight = lightRight;
+    out.lightUp = lightUp;
+    out.lightFwd = lightFwd;
+    out.count = (cascadeCount >= 2) ? 2 : 1;
+
+    if (out.count == 2) {
+        // Cascade 0: 0..20m tight high-res frustum around the rally car (~1.75 cm/texel at 2048).
+        const float radius0 = 18.0f;
+        const float zRange0 = 160.0f;
+        GfxVector focus0 = {
+            camPos.x + camFwd.x * 9.0f,
+            camPos.y + camFwd.y * 9.0f,
+            camPos.z + camFwd.z * 9.0f,
+        };
+        BuildSingleCascade(focus0, radius0, zRange0, mapSize, lightRight, lightUp, lightFwd, out.cascades[0]);
+
+        // Cascade 1: 20..110m extended frustum for roadside trees, buildings, and hills.
+        const float farDist = std::clamp(shadowDist, 55.0f, 200.0f);
+        const float radius1 = farDist * 0.60f;
+        const float zRange1 = std::max(radius1 * 2.5f, 220.0f);
+        GfxVector focus1 = {
+            camPos.x + camFwd.x * (farDist * 0.40f),
+            camPos.y + camFwd.y * (farDist * 0.40f),
+            camPos.z + camFwd.z * (farDist * 0.40f),
+        };
+        BuildSingleCascade(focus1, radius1, zRange1, mapSize, lightRight, lightUp, lightFwd, out.cascades[1]);
+    } else {
+        const float radius = std::clamp(shadowDist, 25.0f, 200.0f);
+        const float zRange = std::max(radius * 2.5f, 200.0f);
+        GfxVector focus = {
+            camPos.x + camFwd.x * (radius * 0.35f),
+            camPos.y + camFwd.y * (radius * 0.35f),
+            camPos.z + camFwd.z * (radius * 0.35f),
+        };
+        BuildSingleCascade(focus, radius, zRange, mapSize, lightRight, lightUp, lightFwd, out.cascades[0]);
+        out.cascades[1] = out.cascades[0];
+    }
     return true;
+}
+
+struct CachedSphere {
+    uint32_t version = 0;
+    GfxVector center = { 0.0f, 0.0f, 0.0f };
+    float radius = 0.0f;
+};
+
+struct DrawBoundsKey {
+    const GfxVertexBuffer *buffer;
+    uint32_t firstVertexByte;
+    uint32_t vertexCount;
+    bool operator==(const DrawBoundsKey &o) const
+    {
+        return buffer == o.buffer && firstVertexByte == o.firstVertexByte && vertexCount == o.vertexCount;
+    }
+};
+
+struct DrawBoundsKeyHash {
+    size_t operator()(const DrawBoundsKey &k) const noexcept
+    {
+        size_t h = (size_t)(uintptr_t)k.buffer * 11400714819323198485ull;
+        h ^= (size_t)k.firstVertexByte * 2654435761u;
+        h ^= (size_t)k.vertexCount * 2246822519u;
+        return h;
+    }
+};
+
+CachedSphere ComputeVertexSphere(const GfxVertex *verts, uint32_t count, uint32_t stride, float pad)
+{
+    CachedSphere s = {};
+    if (verts == NULL || count == 0)
+        return s;
+    float minX = verts[0].x, maxX = verts[0].x;
+    float minY = verts[0].y, maxY = verts[0].y;
+    float minZ = verts[0].z, maxZ = verts[0].z;
+    for (uint32_t i = stride; i < count; i += stride) {
+        const GfxVertex &v = verts[i];
+        minX = std::min(minX, v.x); maxX = std::max(maxX, v.x);
+        minY = std::min(minY, v.y); maxY = std::max(maxY, v.y);
+        minZ = std::min(minZ, v.z); maxZ = std::max(maxZ, v.z);
+    }
+    const GfxVertex &last = verts[count - 1];
+    minX = std::min(minX, last.x); maxX = std::max(maxX, last.x);
+    minY = std::min(minY, last.y); maxY = std::max(maxY, last.y);
+    minZ = std::min(minZ, last.z); maxZ = std::max(maxZ, last.z);
+    s.center = { (minX + maxX) * 0.5f, (minY + maxY) * 0.5f, (minZ + maxZ) * 0.5f };
+    float dx = maxX - s.center.x, dy = maxY - s.center.y, dz = maxZ - s.center.z;
+    s.radius = sqrtf(dx * dx + dy * dy + dz * dz) + pad;
+    return s;
 }
 
 void Color(DWORD c, float out[4])
@@ -283,6 +395,7 @@ struct GpuTexture {
     // into the cube, which is then only sampled. Drawing in the cube's layers
     // directly broke the whole picture on the Adreno 840 (#46).
     SDL_GPUTexture *faces[6] = {};
+    SDL_GPUTexture *cubeMips[4] = {};      // prefiltered roughness mip scratch targets (w/2..w/16)
     SDL_GPUTextureFormat format;
     bool cpuDecode = false;                // BC data decoded on the CPU (no BC support or compressed_mipmaps)
     int mipLevels = 1;                     // actual mip levels created on the GPU
@@ -325,20 +438,27 @@ SDL_PropertiesID DeviceProperties()
 struct Executor : GfxExecutor {
     SDL_GPUDevice *device = nullptr;
     SDL_Window *window = nullptr;
-    SDL_GPUShader *vs3d = nullptr, *vsTL = nullptr, *fs = nullptr, *vsClear = nullptr, *fsClear = nullptr;
-    SDL_GPUShader *vsPost = nullptr, *fsPostBright = nullptr, *fsPostBlur = nullptr, *fsPostComposite = nullptr;
+    SDL_GPUShader *vs3d = nullptr, *vsTL = nullptr, *fs = nullptr, *fsMrt = nullptr;
+    SDL_GPUShader *vsClear = nullptr, *fsClear = nullptr, *fsClearMrt = nullptr;
+    SDL_GPUShader *vsPost = nullptr, *fsPostBright = nullptr, *fsPostBlur = nullptr, *fsCubeBlur = nullptr;
+    SDL_GPUShader *fsPostGtao = nullptr, *fsPostAoBlur = nullptr, *fsPostComposite = nullptr;
     SDL_GPUShader *vsShadow = nullptr, *fsShadow = nullptr;
-    SDL_GPUGraphicsPipeline *postBrightPipeline = nullptr, *postBlurPipeline = nullptr, *postCompositePipeline = nullptr;
-    SDL_GPUSampler *postSampler = nullptr, *shadowSampler = nullptr;
+    SDL_GPUGraphicsPipeline *postBrightPipeline = nullptr, *postBlurPipeline = nullptr, *cubeBlurPipeline = nullptr;
+    SDL_GPUGraphicsPipeline *postGtaoPipeline = nullptr, *postAoBlurPipeline = nullptr, *postCompositePipeline = nullptr;
+    SDL_GPUSampler *postSampler = nullptr, *depthSampler = nullptr, *shadowSampler = nullptr;
     SDL_GPUTexture *shadowMap = nullptr;
     int shadowMapSize = 0;
+    int shadowMapCascades = 0;
     bool shadowSupported = false;
     SDL_GPUTextureFormat shadowDepthFormat = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     std::unordered_map<uint32_t, SDL_GPUGraphicsPipeline *> shadowPipelines;
+    std::unordered_map<DrawBoundsKey, CachedSphere, DrawBoundsKeyHash> staticBoundsCache;
     SDL_GPUTexture *backColor = nullptr, *backDepth = nullptr;
     SDL_GPUTexture *backColorMsaa = nullptr, *backDepthMsaa = nullptr;
     SDL_GPUTexture *backdrop = nullptr;    // the copy of backColor the distance fade reads
     SDL_GPUTexture *hdrColor = nullptr, *hdrColorMsaa = nullptr, *hdrBackdrop = nullptr;
+    SDL_GPUTexture *hdrDepth = nullptr, *hdrDepthMsaa = nullptr, *sceneDepthCopy = nullptr;
+    SDL_GPUTexture *aoHalfA = nullptr, *aoHalfB = nullptr;
     SDL_GPUTexture *bloomHalfA = nullptr, *bloomHalfB = nullptr;
     SDL_GPUTexture *bloomQuarterA = nullptr, *bloomQuarterB = nullptr;
     int backWidth = 0, backHeight = 0;
@@ -346,8 +466,11 @@ struct Executor : GfxExecutor {
     SDL_GPUSampleCount msaaSamples = SDL_GPU_SAMPLECOUNT_1;
     SDL_GPUSampleCount hdrMsaaSamples = SDL_GPU_SAMPLECOUNT_1;
     bool hdrSupported = false;
+    bool ssaoSupported = false;
     SDL_GPUTextureFormat colorFormat = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
     SDL_GPUTextureFormat hdrFormat = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+    SDL_GPUTextureFormat linearDepthFormat = SDL_GPU_TEXTUREFORMAT_R32_FLOAT;
+    SDL_GPUTextureFormat aoFormat = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
     SDL_GPUTextureFormat depthFormat = SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT;
     SDL_GPUBuffer *vertexBuffer = nullptr, *indexBuffer = nullptr;
     uint32_t vertexCapacity = 0, indexCapacity = 0;
@@ -357,6 +480,7 @@ struct Executor : GfxExecutor {
     std::unordered_map<uint32_t, SDL_GPUGraphicsPipeline *> pipelines;
     std::unordered_map<uint32_t, SDL_GPUSampler *> samplers;
     bool bcSupported = true;
+    bool bc7Supported = false;
     bool presentModeVsync = true;
     int anisotropy = 16, smoothScaling = 1;   // video.anisotropy, video.smooth_scaling
     bool compressedMipmaps = true;            // video.compressed_mipmaps
@@ -398,14 +522,23 @@ struct Executor : GfxExecutor {
         SDL_ReleaseGPUTexture(device, hdrColor);
         SDL_ReleaseGPUTexture(device, hdrColorMsaa);
         SDL_ReleaseGPUTexture(device, hdrBackdrop);
+        SDL_ReleaseGPUTexture(device, hdrDepth);
+        SDL_ReleaseGPUTexture(device, hdrDepthMsaa);
+        SDL_ReleaseGPUTexture(device, sceneDepthCopy);
+        SDL_ReleaseGPUTexture(device, aoHalfA);
+        SDL_ReleaseGPUTexture(device, aoHalfB);
         SDL_ReleaseGPUTexture(device, bloomHalfA);
         SDL_ReleaseGPUTexture(device, bloomHalfB);
         SDL_ReleaseGPUTexture(device, bloomQuarterA);
         SDL_ReleaseGPUTexture(device, bloomQuarterB);
         SDL_ReleaseGPUGraphicsPipeline(device, postBrightPipeline);
         SDL_ReleaseGPUGraphicsPipeline(device, postBlurPipeline);
+        SDL_ReleaseGPUGraphicsPipeline(device, cubeBlurPipeline);
+        SDL_ReleaseGPUGraphicsPipeline(device, postGtaoPipeline);
+        SDL_ReleaseGPUGraphicsPipeline(device, postAoBlurPipeline);
         SDL_ReleaseGPUGraphicsPipeline(device, postCompositePipeline);
         SDL_ReleaseGPUSampler(device, postSampler);
+        SDL_ReleaseGPUSampler(device, depthSampler);
         SDL_ReleaseGPUSampler(device, shadowSampler);
         SDL_ReleaseGPUTexture(device, shadowMap);
         SDL_ReleaseGPUTexture(device, white2D);
@@ -417,11 +550,16 @@ struct Executor : GfxExecutor {
         SDL_ReleaseGPUShader(device, vs3d);
         SDL_ReleaseGPUShader(device, vsTL);
         SDL_ReleaseGPUShader(device, fs);
+        SDL_ReleaseGPUShader(device, fsMrt);
         SDL_ReleaseGPUShader(device, vsClear);
         SDL_ReleaseGPUShader(device, fsClear);
+        SDL_ReleaseGPUShader(device, fsClearMrt);
         SDL_ReleaseGPUShader(device, vsPost);
         SDL_ReleaseGPUShader(device, fsPostBright);
         SDL_ReleaseGPUShader(device, fsPostBlur);
+        SDL_ReleaseGPUShader(device, fsCubeBlur);
+        SDL_ReleaseGPUShader(device, fsPostGtao);
+        SDL_ReleaseGPUShader(device, fsPostAoBlur);
         SDL_ReleaseGPUShader(device, fsPostComposite);
         SDL_ReleaseGPUShader(device, vsShadow);
         SDL_ReleaseGPUShader(device, fsShadow);
@@ -528,10 +666,14 @@ struct Executor : GfxExecutor {
         }
         bcSupported = SDL_GPUTextureSupportsFormat(device, SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM,
                                                    SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        bc7Supported = SDL_GPUTextureSupportsFormat(device, SDL_GPU_TEXTUREFORMAT_BC7_RGBA_UNORM,
+                                                    SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        if (bc7Supported)
+            Sys_Log("gfx: native GPU BC7 textures enabled");
 
         vs3d = Shader(SHADER_CODE(fixed3d_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         vsTL = Shader(SHADER_CODE(fixedtl_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
-        fs = Shader(SHADER_CODE(fixed_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 10, 2);
+        fs = Shader(SHADER_CODE(fixed_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 11, 2);
         vsClear = Shader(SHADER_CODE(clear_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
         fsClear = Shader(SHADER_CODE(clear_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1);
         if (!vs3d || !vsTL || !fs || !vsClear || !fsClear)
@@ -543,7 +685,7 @@ struct Executor : GfxExecutor {
             vsPost = Shader(SHADER_CODE(post_vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
             fsPostBright = Shader(SHADER_CODE(post_bright_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
             fsPostBlur = Shader(SHADER_CODE(post_blur_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
-            fsPostComposite = Shader(SHADER_CODE(post_composite_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 1);
+            fsPostComposite = Shader(SHADER_CODE(post_composite_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 4, 1);
             SDL_GPUSamplerCreateInfo psi = {};
             psi.min_filter = SDL_GPU_FILTER_LINEAR;
             psi.mag_filter = SDL_GPU_FILTER_LINEAR;
@@ -556,11 +698,67 @@ struct Executor : GfxExecutor {
                 postCompositePipeline = CreatePostPipeline(fsPostComposite, colorFormat);
             }
             if (postBrightPipeline && postBlurPipeline && postCompositePipeline) {
+                fsCubeBlur = Shader(SHADER_CODE(post_cube_blur_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
+                if (fsCubeBlur != NULL)
+                    cubeBlurPipeline = CreatePostPipeline(fsCubeBlur, colorFormat);
+                if (cubeBlurPipeline != NULL)
+                    Sys_Log("gfx: Cook-Torrance GGX PBR + prefiltered cubemap IBL enabled");
                 hdrMsaaSamples = (msaaSamples != SDL_GPU_SAMPLECOUNT_1 &&
                                   SDL_GPUTextureSupportsSampleCount(device, hdrFormat, msaaSamples))
                                      ? msaaSamples
                                      : SDL_GPU_SAMPLECOUNT_1;
-                Sys_Log("gfx: HDR 3D post-processing enabled");
+                Sys_Log("gfx: HDR 3D post-processing + FidelityFX CAS enabled");
+
+                // Stage 12: MRT linear eye-depth (hardware MSAA resolved) + Half-Res GTAO + Bilateral Blur.
+                auto depthFmtSupported = [&](SDL_GPUTextureFormat fmt) {
+                    if (!SDL_GPUTextureSupportsFormat(device, fmt, SDL_GPU_TEXTURETYPE_2D,
+                                                      SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER))
+                        return false;
+                    if (hdrMsaaSamples != SDL_GPU_SAMPLECOUNT_1 &&
+                        !SDL_GPUTextureSupportsSampleCount(device, fmt, hdrMsaaSamples))
+                        return false;
+                    return true;
+                };
+                bool depthFmtOk = false;
+                if (depthFmtSupported(SDL_GPU_TEXTUREFORMAT_R32_FLOAT)) {
+                    linearDepthFormat = SDL_GPU_TEXTUREFORMAT_R32_FLOAT;
+                    depthFmtOk = true;
+                } else if (depthFmtSupported(SDL_GPU_TEXTUREFORMAT_R16_FLOAT)) {
+                    linearDepthFormat = SDL_GPU_TEXTUREFORMAT_R16_FLOAT;
+                    depthFmtOk = true;
+                }
+                bool aoFmtOk = false;
+                if (SDL_GPUTextureSupportsFormat(device, SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT, SDL_GPU_TEXTURETYPE_2D,
+                                                 SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER)) {
+                    aoFormat = SDL_GPU_TEXTUREFORMAT_R16G16_FLOAT;
+                    aoFmtOk = true;
+                } else if (SDL_GPUTextureSupportsFormat(device, hdrFormat, SDL_GPU_TEXTURETYPE_2D,
+                                                        SDL_GPU_TEXTUREUSAGE_COLOR_TARGET |
+                                                            SDL_GPU_TEXTUREUSAGE_SAMPLER)) {
+                    aoFormat = hdrFormat;
+                    aoFmtOk = true;
+                }
+                if (depthFmtOk && aoFmtOk) {
+                    fsMrt = Shader(SHADER_CODE(fixed_mrt_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 11, 2);
+                    fsClearMrt = Shader(SHADER_CODE(clear_mrt_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1);
+                    fsPostGtao = Shader(SHADER_CODE(post_gtao_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
+                    fsPostAoBlur = Shader(SHADER_CODE(post_ao_blur_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
+                    SDL_GPUSamplerCreateInfo dsi = {};
+                    dsi.min_filter = SDL_GPU_FILTER_NEAREST;
+                    dsi.mag_filter = SDL_GPU_FILTER_NEAREST;
+                    dsi.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+                    dsi.address_mode_u = dsi.address_mode_v = dsi.address_mode_w =
+                        SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+                    depthSampler = SDL_CreateGPUSampler(device, &dsi);
+                    if (fsMrt && fsClearMrt && fsPostGtao && fsPostAoBlur && depthSampler) {
+                        postGtaoPipeline = CreatePostPipeline(fsPostGtao, aoFormat);
+                        postAoBlurPipeline = CreatePostPipeline(fsPostAoBlur, aoFormat);
+                    }
+                    if (postGtaoPipeline && postAoBlurPipeline) {
+                        ssaoSupported = true;
+                        Sys_Log("gfx: Half-res GTAO + bilateral blur + Soft Particles + A2C enabled");
+                    }
+                }
             } else {
                 hdrSupported = false;
                 Sys_Log("gfx: HDR 3D post-processing unavailable, falling back to SDR");
@@ -582,9 +780,11 @@ struct Executor : GfxExecutor {
             if (!vsShadow || !fsShadow || !shadowSampler) {
                 shadowSupported = false;
             } else {
-                EnsureShadowMap(Platform_GetSettingInt("video.shadow_map_size", 2048));
+                int initCascades = std::clamp(Platform_GetSettingInt("video.shadow_cascades", 2), 1, 2);
+                EnsureShadowMap(Platform_GetSettingInt("video.shadow_map_size", 2048), initCascades);
                 if (shadowMap != NULL)
-                    Sys_Log("gfx: real-time sun shadow mapping enabled (%dx%d)", shadowMapSize, shadowMapSize);
+                    Sys_Log("gfx: real-time sun CSM enabled (%d cascade%s, %dx%d per cascade)", shadowMapCascades,
+                            shadowMapCascades > 1 ? "s" : "", shadowMapSize, shadowMapSize);
                 else
                     shadowSupported = false;
             }
@@ -633,16 +833,26 @@ struct Executor : GfxExecutor {
                 Pipeline(key | (1u << 23));
                 if (hdrMsaaSamples != SDL_GPU_SAMPLECOUNT_1)
                     Pipeline(key | ((uint32_t)hdrMsaaSamples << 21) | (1u << 23));
+                if (ssaoSupported) {
+                    Pipeline(key | (1u << 23) | (1u << 24));
+                    if (hdrMsaaSamples != SDL_GPU_SAMPLECOUNT_1)
+                        Pipeline(key | ((uint32_t)hdrMsaaSamples << 21) | (1u << 23) | (1u << 24));
+                }
             }
         }
         for (int clear = 1; clear < 4; clear++) {
-            ClearPipeline((clear & 1) != 0, (clear & 2) != 0, SDL_GPU_SAMPLECOUNT_1, false);
+            ClearPipeline((clear & 1) != 0, (clear & 2) != 0, SDL_GPU_SAMPLECOUNT_1, false, false);
             if (msaaSamples != SDL_GPU_SAMPLECOUNT_1)
-                ClearPipeline((clear & 1) != 0, (clear & 2) != 0, msaaSamples, false);
+                ClearPipeline((clear & 1) != 0, (clear & 2) != 0, msaaSamples, false, false);
             if (hdrSupported) {
-                ClearPipeline((clear & 1) != 0, (clear & 2) != 0, SDL_GPU_SAMPLECOUNT_1, true);
+                ClearPipeline((clear & 1) != 0, (clear & 2) != 0, SDL_GPU_SAMPLECOUNT_1, true, false);
                 if (hdrMsaaSamples != SDL_GPU_SAMPLECOUNT_1)
-                    ClearPipeline((clear & 1) != 0, (clear & 2) != 0, hdrMsaaSamples, true);
+                    ClearPipeline((clear & 1) != 0, (clear & 2) != 0, hdrMsaaSamples, true, false);
+                if (ssaoSupported) {
+                    ClearPipeline((clear & 1) != 0, (clear & 2) != 0, SDL_GPU_SAMPLECOUNT_1, true, true);
+                    if (hdrMsaaSamples != SDL_GPU_SAMPLECOUNT_1)
+                        ClearPipeline((clear & 1) != 0, (clear & 2) != 0, hdrMsaaSamples, true, true);
+                }
             }
         }
         return true;
@@ -662,6 +872,11 @@ struct Executor : GfxExecutor {
             SDL_ReleaseGPUTexture(device, hdrColor);
             SDL_ReleaseGPUTexture(device, hdrColorMsaa);
             SDL_ReleaseGPUTexture(device, hdrBackdrop);
+            SDL_ReleaseGPUTexture(device, hdrDepth);
+            SDL_ReleaseGPUTexture(device, hdrDepthMsaa);
+            SDL_ReleaseGPUTexture(device, sceneDepthCopy);
+            SDL_ReleaseGPUTexture(device, aoHalfA);
+            SDL_ReleaseGPUTexture(device, aoHalfB);
             SDL_ReleaseGPUTexture(device, bloomHalfA);
             SDL_ReleaseGPUTexture(device, bloomHalfB);
             SDL_ReleaseGPUTexture(device, bloomQuarterA);
@@ -669,6 +884,7 @@ struct Executor : GfxExecutor {
             backColorMsaa = nullptr;
             backDepthMsaa = nullptr;
             hdrColor = hdrColorMsaa = hdrBackdrop = nullptr;
+            hdrDepth = hdrDepthMsaa = sceneDepthCopy = aoHalfA = aoHalfB = nullptr;
             bloomHalfA = bloomHalfB = bloomQuarterA = bloomQuarterB = nullptr;
             backColor = CreateTexture(SDL_GPU_TEXTURETYPE_2D, colorFormat, width, height, 1, 1,
                                       SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
@@ -723,6 +939,31 @@ struct Executor : GfxExecutor {
                     hdrColor = hdrColorMsaa = hdrBackdrop = nullptr;
                     bloomHalfA = bloomHalfB = bloomQuarterA = bloomQuarterB = nullptr;
                     hdrSupported = false;
+                    ssaoSupported = false;
+                } else if (ssaoSupported) {
+                    hdrDepth = CreateTexture(SDL_GPU_TEXTURETYPE_2D, linearDepthFormat, width, height, 1, 1,
+                                             SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+                    sceneDepthCopy = CreateTexture(SDL_GPU_TEXTURETYPE_2D, linearDepthFormat, width, height, 1, 1,
+                                                   SDL_GPU_TEXTUREUSAGE_SAMPLER);
+                    aoHalfA = CreateTexture(SDL_GPU_TEXTURETYPE_2D, aoFormat, bloomHalfW, bloomHalfH, 1, 1,
+                                            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+                    aoHalfB = CreateTexture(SDL_GPU_TEXTURETYPE_2D, aoFormat, bloomHalfW, bloomHalfH, 1, 1,
+                                            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+                    if (hdrMsaaSamples != SDL_GPU_SAMPLECOUNT_1 && hdrColorMsaa != NULL) {
+                        hdrDepthMsaa = CreateTexture(SDL_GPU_TEXTURETYPE_2D, linearDepthFormat, width, height, 1, 1,
+                                                     SDL_GPU_TEXTUREUSAGE_COLOR_TARGET, hdrMsaaSamples);
+                    }
+                    bool msaaMismatch = (hdrMsaaSamples != SDL_GPU_SAMPLECOUNT_1 && hdrColorMsaa != NULL &&
+                                         hdrDepthMsaa == NULL);
+                    if (!hdrDepth || !sceneDepthCopy || !aoHalfA || !aoHalfB || msaaMismatch) {
+                        SDL_ReleaseGPUTexture(device, hdrDepth);
+                        SDL_ReleaseGPUTexture(device, hdrDepthMsaa);
+                        SDL_ReleaseGPUTexture(device, sceneDepthCopy);
+                        SDL_ReleaseGPUTexture(device, aoHalfA);
+                        SDL_ReleaseGPUTexture(device, aoHalfB);
+                        hdrDepth = hdrDepthMsaa = sceneDepthCopy = aoHalfA = aoHalfB = nullptr;
+                        ssaoSupported = false;
+                    }
                 }
             }
             backWidth = width;
@@ -741,6 +982,8 @@ struct Executor : GfxExecutor {
         Gfx_SetWindowMode(window, fullscreen, backWidth, backHeight);
     }
 
+    bool SupportsBC7() const override { return bc7Supported; }
+
     // ---- textures ----
 
     SDL_GPUTextureFormat GpuFormat(int format, bool &cpuDecode)
@@ -757,6 +1000,8 @@ struct Executor : GfxExecutor {
                 return SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM;
             cpuDecode = true;
             return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+        case GFX_FORMAT_BC7:
+            return SDL_GPU_TEXTUREFORMAT_BC7_RGBA_UNORM;
         case GFX_FORMAT_BUMP_DUDVL:
             return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
         default:
@@ -805,6 +1050,11 @@ struct Executor : GfxExecutor {
         g->format = GpuFormat(t->format, g->cpuDecode);
         bool cube = (t->flags & GFX_TEXTURE_CUBE) != 0;
         bool target = (t->flags & GFX_TEXTURE_RENDER_TARGET) != 0;
+        if (t->format == GFX_FORMAT_BC7 && !bc7Supported) {
+            t->gpu = g;
+            t->dirty = false;
+            return g;
+        }
         bool isCompressed = (t->format == GFX_FORMAT_BC1 || t->format == GFX_FORMAT_BC3);
         g->mipLevels = t->mipLevels;
         g->generatedMips = false;
@@ -823,9 +1073,23 @@ struct Executor : GfxExecutor {
             usage |= SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
         if (cube && target) {
             usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+            int cubeMipCount = 1;
+            if (t->width >= 64 && t->width == t->height && cubeBlurPipeline != NULL) {
+                int m = 1;
+                while ((t->width >> m) >= 16 && m < 5)
+                    m++;
+                cubeMipCount = m;
+            }
+            g->mipLevels = cubeMipCount;
             for (int f = 0; f < 6; f++)
                 g->faces[f] = CreateTexture(SDL_GPU_TEXTURETYPE_2D, g->format, t->width, t->height, 1, 1,
-                                            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET);
+                                            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+            for (int m = 1; m < cubeMipCount; m++) {
+                int mw = std::max(1, t->width >> m);
+                int mh = std::max(1, t->height >> m);
+                g->cubeMips[m - 1] = CreateTexture(SDL_GPU_TEXTURETYPE_2D, g->format, mw, mh, 1, 1,
+                                                   SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+            }
         }
         g->texture = CreateTexture(cube ? SDL_GPU_TEXTURETYPE_CUBE : SDL_GPU_TEXTURETYPE_2D, g->format, t->width,
                                    t->height, cube ? 6 : 1, g->mipLevels, usage);
@@ -840,7 +1104,8 @@ struct Executor : GfxExecutor {
     // Bytes of a level as uploaded (after conversion).
     size_t UploadSize(GfxTexture *t, GpuTexture *g, int w, int h)
     {
-        if ((t->format == GFX_FORMAT_BC1 || t->format == GFX_FORMAT_BC3) && !g->cpuDecode)
+        if (t->format == GFX_FORMAT_BC7 ||
+            ((t->format == GFX_FORMAT_BC1 || t->format == GFX_FORMAT_BC3) && !g->cpuDecode))
             return Gfx_LevelSize(t->format, w, h, NULL);
         return (size_t)w * h * 4;
     }
@@ -860,6 +1125,9 @@ struct Executor : GfxExecutor {
                 dst[i * 4 + 2] = src[i * 3 + 2];
                 dst[i * 4 + 3] = 0xff;
             }
+            break;
+        case GFX_FORMAT_BC7:
+            memcpy(dst, src, Gfx_LevelSize(t->format, w, h, NULL));
             break;
         case GFX_FORMAT_BC1:
         case GFX_FORMAT_BC3:
@@ -898,8 +1166,12 @@ struct Executor : GfxExecutor {
             }
             int faces = (t->flags & GFX_TEXTURE_CUBE) ? 6 : 1;
             for (int f = 0; f < faces; f++)
-                for (int m = 0; m < g->mipLevels; m++)
+                for (int m = 0; m < g->mipLevels; m++) {
+                    if ((!g->generatedMips || m == 0) && t->levels[f][m].empty())
+                        continue;
+                    total = (total + 15u) & ~size_t(15u);
                     total += UploadSize(t, g, std::max(1, t->width >> m), std::max(1, t->height >> m));
+                }
         }
         if (total == 0)
             return;
@@ -922,6 +1194,9 @@ struct Executor : GfxExecutor {
                 size_t prevOffset = offset;
                 int prevW = t->width, prevH = t->height;
                 for (int m = 0; m < g->mipLevels; m++) {
+                    if ((!g->generatedMips || m == 0) && t->levels[f][m].empty())
+                        continue;
+                    offset = (offset + 15u) & ~size_t(15u);
                     int w = std::max(1, t->width >> m), h = std::max(1, t->height >> m);
                     if (g->generatedMips && m > 0) {
                         DownsampleBGRA(map + prevOffset, prevW, prevH, map + offset, w, h);
@@ -936,6 +1211,11 @@ struct Executor : GfxExecutor {
                 }
             }
             t->dirty = false;
+            // Immutable native BC7 overrides never need CPU readback: drop CPU mip copies once staged.
+            if ((t->flags & GFX_TEXTURE_OVERRIDE) && t->format == GFX_FORMAT_BC7) {
+                for (int m = 0; m < t->mipLevels; m++)
+                    std::vector<uint8_t>().swap(t->levels[0][m]);
+            }
         }
         SDL_UnmapGPUTransferBuffer(device, tb);
         SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
@@ -963,6 +1243,8 @@ struct Executor : GfxExecutor {
         SDL_ReleaseGPUTexture(device, g->depth);
         for (SDL_GPUTexture *face : g->faces)
             SDL_ReleaseGPUTexture(device, face);
+        for (SDL_GPUTexture *mipTex : g->cubeMips)
+            SDL_ReleaseGPUTexture(device, mipTex);
         delete g;
         t->gpu = NULL;
     }
@@ -1031,21 +1313,31 @@ struct Executor : GfxExecutor {
         return 1024;
     }
 
-    void EnsureShadowMap(int requestedSize)
+    void EnsureShadowMap(int requestedSize, int requestedCascades)
     {
         if (!shadowSupported)
             return;
         int sz = SanitizeShadowMapSize(requestedSize);
-        if (shadowMap != NULL && shadowMapSize == sz)
+        int cascades = std::clamp(requestedCascades, 1, 2);
+        if (shadowMap != NULL && shadowMapSize == sz && shadowMapCascades == cascades)
             return;
         if (shadowMap != NULL) {
             SDL_WaitForGPUIdle(device);
             SDL_ReleaseGPUTexture(device, shadowMap);
             shadowMap = nullptr;
         }
-        shadowMap = CreateTexture(SDL_GPU_TEXTURETYPE_2D, shadowDepthFormat, sz, sz, 1, 1,
+        int atlasW = sz * cascades;
+        shadowMap = CreateTexture(SDL_GPU_TEXTURETYPE_2D, shadowDepthFormat, atlasW, sz, 1, 1,
                                   SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        if (shadowMap == NULL && cascades > 1) {
+            // Fall back to smaller per-cascade size if atlas exceeds GPU limits (e.g. 8192px).
+            sz = std::min(sz, 2048);
+            atlasW = sz * cascades;
+            shadowMap = CreateTexture(SDL_GPU_TEXTURETYPE_2D, shadowDepthFormat, atlasW, sz, 1, 1,
+                                      SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        }
         shadowMapSize = shadowMap != NULL ? sz : 0;
+        shadowMapCascades = shadowMap != NULL ? cascades : 0;
     }
 
     SDL_GPUGraphicsPipeline *ShadowPipeline(int primitive)
@@ -1099,13 +1391,15 @@ struct Executor : GfxExecutor {
 
     // A draw's pipeline: everything of it the state can change.
     static uint32_t PipelineKey(const GfxCommand &cmd, const GfxDrawState &s,
-                                SDL_GPUSampleCount samples = SDL_GPU_SAMPLECOUNT_1, bool hdr = false)
+                                SDL_GPUSampleCount samples = SDL_GPU_SAMPLECOUNT_1, bool hdr = false,
+                                bool mrtDepth = false, bool alphaToCoverage = false)
     {
         bool depthTest = s.depthTest;
         return (cmd.transformed ? 1u : 0u) | (uint32_t)(cmd.primitive & 7) << 1 | (s.alphaBlend ? 1u : 0u) << 4 |
                (uint32_t)(s.srcBlend & 15) << 5 | (uint32_t)(s.destBlend & 15) << 9 | (depthTest ? 1u : 0u) << 13 |
                ((depthTest && s.depthWrite) ? 1u : 0u) << 14 | (uint32_t)(s.depthFunc & 15) << 15 |
-               (uint32_t)(s.cull & 3) << 19 | (uint32_t)(samples & 3) << 21 | (hdr ? 1u : 0u) << 23;
+               (uint32_t)(s.cull & 3) << 19 | (uint32_t)(samples & 3) << 21 | (hdr ? 1u : 0u) << 23 |
+               (mrtDepth ? 1u : 0u) << 24 | (alphaToCoverage ? 1u : 0u) << 25;
     }
 
     SDL_GPUGraphicsPipeline *Pipeline(uint32_t key)
@@ -1119,6 +1413,8 @@ struct Executor : GfxExecutor {
         int cull = key >> 19 & 3;
         SDL_GPUSampleCount samples = (SDL_GPUSampleCount)((key >> 21) & 3);
         bool hdr = (key >> 23 & 1) != 0;
+        bool mrtDepth = (key >> 24 & 1) != 0;
+        bool alphaToCoverage = (key >> 25 & 1) != 0;
 
         SDL_GPUVertexBufferDescription vb = {};
         vb.slot = 0;
@@ -1143,19 +1439,25 @@ struct Executor : GfxExecutor {
             attrCount = 6;
         }
 
-        SDL_GPUColorTargetDescription color = {};
-        color.format = hdr ? hdrFormat : colorFormat;
-        color.blend_state.enable_blend = alphaBlend;
-        color.blend_state.src_color_blendfactor = BlendFactor(srcBlend);
-        color.blend_state.dst_color_blendfactor = BlendFactor(destBlend);
-        color.blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
-        color.blend_state.src_alpha_blendfactor = BlendFactor(srcBlend);
-        color.blend_state.dst_alpha_blendfactor = BlendFactor(destBlend);
-        color.blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+        SDL_GPUColorTargetDescription targets[2] = {};
+        targets[0].format = hdr ? hdrFormat : colorFormat;
+        targets[0].blend_state.enable_blend = alphaBlend;
+        targets[0].blend_state.src_color_blendfactor = BlendFactor(srcBlend);
+        targets[0].blend_state.dst_color_blendfactor = BlendFactor(destBlend);
+        targets[0].blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
+        targets[0].blend_state.src_alpha_blendfactor = BlendFactor(srcBlend);
+        targets[0].blend_state.dst_alpha_blendfactor = BlendFactor(destBlend);
+        targets[0].blend_state.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+        if (mrtDepth) {
+            targets[1].format = linearDepthFormat;
+            targets[1].blend_state.enable_blend = false;
+            targets[1].blend_state.enable_color_write_mask = true;
+            targets[1].blend_state.color_write_mask = (depthTest && depthWrite && !transformed) ? 0x1 : 0;
+        }
 
         SDL_GPUGraphicsPipelineCreateInfo info = {};
         info.vertex_shader = transformed ? vsTL : vs3d;
-        info.fragment_shader = fs;
+        info.fragment_shader = (mrtDepth && fsMrt != NULL) ? fsMrt : fs;
         info.vertex_input_state.vertex_buffer_descriptions = &vb;
         info.vertex_input_state.num_vertex_buffers = 1;
         info.vertex_input_state.vertex_attributes = attrs;
@@ -1173,8 +1475,9 @@ struct Executor : GfxExecutor {
         info.depth_stencil_state.enable_depth_write = depthTest && depthWrite;
         info.depth_stencil_state.compare_op = CompareOp(depthFunc);
         info.multisample_state.sample_count = samples;
-        info.target_info.color_target_descriptions = &color;
-        info.target_info.num_color_targets = 1;
+        info.multisample_state.enable_alpha_to_coverage = alphaToCoverage && (samples != SDL_GPU_SAMPLECOUNT_1);
+        info.target_info.color_target_descriptions = targets;
+        info.target_info.num_color_targets = mrtDepth ? 2 : 1;
         info.target_info.depth_stencil_format = depthFormat;
         info.target_info.has_depth_stencil_target = true;
         SDL_GPUGraphicsPipeline *p = SDL_CreateGPUGraphicsPipeline(device, &info);
@@ -1185,20 +1488,25 @@ struct Executor : GfxExecutor {
     }
 
     SDL_GPUGraphicsPipeline *ClearPipeline(bool color, bool depth, SDL_GPUSampleCount samples = SDL_GPU_SAMPLECOUNT_1,
-                                           bool hdr = false)
+                                           bool hdr = false, bool mrtDepth = false)
     {
         uint32_t key = 0x80000000u | (color ? 1u : 0u) | (depth ? 2u : 0u) | (uint32_t)(samples & 3) << 2 |
-                       (hdr ? 1u : 0u) << 4;
+                       (hdr ? 1u : 0u) << 4 | (mrtDepth ? 1u : 0u) << 5;
         auto it = pipelines.find(key);
         if (it != pipelines.end())
             return it->second;
-        SDL_GPUColorTargetDescription target = {};
-        target.format = hdr ? hdrFormat : colorFormat;
-        target.blend_state.enable_color_write_mask = true;
-        target.blend_state.color_write_mask = color ? 0xf : 0;
+        SDL_GPUColorTargetDescription targets[2] = {};
+        targets[0].format = hdr ? hdrFormat : colorFormat;
+        targets[0].blend_state.enable_color_write_mask = true;
+        targets[0].blend_state.color_write_mask = color ? 0xf : 0;
+        if (mrtDepth) {
+            targets[1].format = linearDepthFormat;
+            targets[1].blend_state.enable_color_write_mask = true;
+            targets[1].blend_state.color_write_mask = depth ? 0x1 : 0;
+        }
         SDL_GPUGraphicsPipelineCreateInfo info = {};
         info.vertex_shader = vsClear;
-        info.fragment_shader = fsClear;
+        info.fragment_shader = (mrtDepth && fsClearMrt != NULL) ? fsClearMrt : fsClear;
         info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
         info.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
         info.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
@@ -1208,8 +1516,8 @@ struct Executor : GfxExecutor {
         info.depth_stencil_state.enable_depth_test = depth;
         info.depth_stencil_state.enable_depth_write = depth;
         info.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_ALWAYS;
-        info.target_info.color_target_descriptions = &target;
-        info.target_info.num_color_targets = 1;
+        info.target_info.color_target_descriptions = targets;
+        info.target_info.num_color_targets = mrtDepth ? 2 : 1;
         info.target_info.depth_stencil_format = depthFormat;
         info.target_info.has_depth_stencil_target = true;
         SDL_GPUGraphicsPipeline *p = SDL_CreateGPUGraphicsPipeline(device, &info);
@@ -1264,6 +1572,7 @@ struct Executor : GfxExecutor {
                a.ambientSource == b.ambientSource && a.emissiveSource == b.emissiveSource && a.fog == b.fog &&
                a.fogTableMode == b.fogTableMode && a.fogVertexMode == b.fogVertexMode &&
                a.fogStart == b.fogStart && a.fogEnd == b.fogEnd && a.ambient == b.ambient &&
+               a.weatherKind == b.weatherKind && a.weatherIntensity == b.weatherIntensity &&
                memcmp(&a.world, &b.world, sizeof(a.world)) == 0 && memcmp(&a.view, &b.view, sizeof(a.view)) == 0 &&
                memcmp(&a.projection, &b.projection, sizeof(a.projection)) == 0 &&
                memcmp(a.texture, b.texture, sizeof(a.texture)) == 0 &&
@@ -1384,8 +1693,10 @@ struct Executor : GfxExecutor {
     }
 
     void FillFragmentLightingUniforms(const GfxDrawState &s, const VertexUniforms &vu, bool overhaul,
-                                      bool perPixel, bool hemisphere, float fresnelStrength, bool shadowActive,
-                                      const GfxMatrix &lightViewProj, const GfxVector &toSunWorld, float shadowStrength,
+                                      bool perPixel, bool hemisphere, float fresnelStrength, bool pbrShading,
+                                      bool wetSurfaces, bool atmoFog, bool shadowActive,
+                                      const ShadowSetup &shadowSetup, float shadowStrength, int pcfQuality,
+                                      bool foundSun, const GfxVector &sunLightDir, float sunLuma,
                                       FragmentLightingUniforms &fl)
     {
         memset(&fl, 0, sizeof(fl));
@@ -1406,29 +1717,70 @@ struct Executor : GfxExecutor {
         fl.enhanceParams[1] = hemisphere ? 1.0f : 0.0f;
         fl.enhanceParams[2] = fresnelStrength;
         fl.enhanceParams[3] = overhaul ? 1.0f : 0.0f;
-        if (shadowActive && shadowMapSize > 0) {
+
+        GfxVector toSunWorld = foundSun ? VecNormalize({ -sunLightDir.x, -sunLightDir.y, -sunLightDir.z })
+                                        : GfxVector{ 0.3f, 0.85f, 0.4f };
+        if (shadowActive && shadowMapSize > 0 && shadowSetup.count > 0) {
+            toSunWorld = shadowSetup.toSunWorld;
             GfxMatrix invView;
             if (InvertAffineMatrix(s.view, invView)) {
-                Multiply(invView, lightViewProj, fl.eyeToLightClip);
+                Multiply(invView, shadowSetup.cascades[0].lightVP, fl.eyeToLightClip[0]);
+                Multiply(invView, shadowSetup.cascades[shadowSetup.count > 1 ? 1 : 0].lightVP, fl.eyeToLightClip[1]);
                 fl.shadowParams[0] = 1.0f;
                 fl.shadowParams[1] = shadowStrength;
                 fl.shadowParams[2] = 1.0f / (float)shadowMapSize;
-                fl.shadowParams[3] = 1.0f;
-                TransformPoint(toSunWorld, 0.0f, s.view, fl.sunDirEye);
-                float slen = sqrtf(fl.sunDirEye[0] * fl.sunDirEye[0] + fl.sunDirEye[1] * fl.sunDirEye[1] +
-                                   fl.sunDirEye[2] * fl.sunDirEye[2]);
-                if (slen > 1e-5f) {
-                    fl.sunDirEye[0] /= slen;
-                    fl.sunDirEye[1] /= slen;
-                    fl.sunDirEye[2] /= slen;
-                }
+                fl.shadowParams[3] = (float)shadowSetup.count;
+                fl.shadowParams2[0] = (float)std::clamp(pcfQuality, 0, 2);
+                fl.shadowParams2[1] = shadowSetup.count > 1 ? 1.75f : 1.50f;
+                fl.shadowParams2[2] = 1.35f;
+                fl.shadowParams2[3] = 0.0f;
             }
         }
+        TransformPoint(toSunWorld, 0.0f, s.view, fl.sunDirEye);
+        float slen = sqrtf(fl.sunDirEye[0] * fl.sunDirEye[0] + fl.sunDirEye[1] * fl.sunDirEye[1] +
+                           fl.sunDirEye[2] * fl.sunDirEye[2]);
+        if (slen > 1e-5f) {
+            fl.sunDirEye[0] /= slen;
+            fl.sunDirEye[1] /= slen;
+            fl.sunDirEye[2] /= slen;
+        }
+        fl.sunDirEye[3] = foundSun ? std::clamp(sunLuma, 0.0f, 1.0f) : 0.0f;
+
+        // Stage 13: PBR + Prefiltered Cubemap IBL + Wet Surfaces + Atmospheric/Height Fog.
+        float maxCubeMip = 0.0f;
+        for (int st = 0; st < 2; st++) {
+            GfxTexture *t = Gfx_DrawnTexture(s.stages[st].texture, overhaul);
+            if (t != NULL && (t->flags & GFX_TEXTURE_CUBE) && t->gpu != NULL) {
+                GpuTexture *cg = (GpuTexture *)t->gpu;
+                if (cg->mipLevels > 1)
+                    maxCubeMip = std::max(maxCubeMip, (float)(cg->mipLevels - 1));
+            }
+        }
+        float rainWet = (overhaul && wetSurfaces && s.weatherKind == 1)
+                            ? std::clamp(s.weatherIntensity * 1.15f, 0.0f, 1.0f)
+                            : 0.0f;
+        fl.pbrParams[0] = (overhaul && pbrShading) ? 1.0f : 0.0f;
+        fl.pbrParams[1] = maxCubeMip;
+        fl.pbrParams[2] = rainWet;
+        fl.pbrParams[3] = (overhaul && atmoFog) ? 1.0f : 0.0f;
+
+        // Horizon atmospheric scatter tint scales with stage daylight brightness (respects dusk/night/fog).
+        float dayFactor = foundSun ? std::clamp((sunLuma - 0.12f) / 0.65f, 0.0f, 1.0f) : 0.5f;
+        float skyR = (0.10f + 0.56f * dayFactor) * (1.0f - 0.22f * rainWet);
+        float skyG = (0.13f + 0.63f * dayFactor) * (1.0f - 0.18f * rainWet);
+        float skyB = (0.20f + 0.68f * dayFactor) * (1.0f - 0.12f * rainWet);
+        fl.atmoParams[0] = skyR;
+        fl.atmoParams[1] = skyG;
+        fl.atmoParams[2] = skyB;
+        fl.atmoParams[3] = (overhaul && atmoFog && foundSun && dayFactor > 0.2f)
+                               ? (0.48f * dayFactor * (1.0f - 0.55f * rainWet))
+                               : 0.0f;
     }
 
     // fade: the draw is a 3D one into the back buffer, which the distance
     // fade applies to.
     void FillFragmentUniforms(const GfxDrawState &s, bool fade, bool hdr, bool materialMaps, bool receiveShadows,
+                              bool alphaToCoverage, float softParticleRange, int targetW, int targetH,
                               FragmentUniforms &u)
     {
         memset(&u, 0, sizeof(u));
@@ -1450,12 +1802,15 @@ struct Executor : GfxExecutor {
         u.stage1b[2] = TextureKind(b);
         u.stage1b[3] = ScaledPoint(b);
         Color(s.textureFactor, u.textureFactor);
-        u.alphaTest[0] = s.alphaTest;
+        u.alphaTest[0] = alphaToCoverage ? 2 : (s.alphaTest ? 1 : 0);
         u.alphaTest[1] = s.alphaFunc;
         GfxTexture *root0 = a.texture != NULL && a.texture->cube != NULL ? a.texture->cube : a.texture;
         u.alphaTest[2] = (materialMaps && root0 != NULL && root0->normalMap != NULL) ? 1 : 0;
         u.alphaTest[3] = (materialMaps && root0 != NULL && root0->specularMap != NULL) ? 1 : 0;
         u.alphaRef[0] = (s.alphaRef & 0xff) / 255.0f;
+        u.alphaRef[1] = softParticleRange;
+        u.alphaRef[2] = targetW > 0 ? 1.0f / (float)targetW : 0.0f;
+        u.alphaRef[3] = targetH > 0 ? 1.0f / (float)targetH : 0.0f;
         Color(s.fogColor, u.fogColor);
         u.fogMode[0] = s.fog;
         u.fogMode[1] = s.fogTableMode;
@@ -1475,9 +1830,9 @@ struct Executor : GfxExecutor {
         u.distanceFade[3] = 0.85f;
     }
 
-    // The stages' textures (2D and cube for each), backdrop, native icons, material maps, and shadow map.
-    void TextureBindings(const GfxDrawState &s, bool is3D, bool hdr, bool materialMaps,
-                         SDL_GPUTextureSamplerBinding bindings[10])
+    // The stages' textures (2D and cube for each), backdrop, native icons, material maps, shadow map, and scene depth.
+    void TextureBindings(const GfxDrawState &s, bool is3D, bool hdr, bool materialMaps, bool bindSoftDepth,
+                         SDL_GPUTextureSamplerBinding bindings[11])
     {
         bool overhaul = Platform_IsVisualOverhaulEnabled();
         SDL_GPUSampler *stage0Sampler = NULL;
@@ -1500,6 +1855,14 @@ struct Executor : GfxExecutor {
                     sampled.minFilter = sampled.magFilter = GFX_FILTER_LINEAR;
                     sampled.mipFilter = GFX_MIPFILTER_LINEAR;
                 } else if (g->generatedMips) {
+                    sampled.mipFilter = GFX_MIPFILTER_NONE;
+                }
+            }
+            if (is3D && kind == 2 && g != NULL && g->mipLevels > 1) {
+                if (overhaul) {
+                    sampled.minFilter = sampled.magFilter = GFX_FILTER_LINEAR;
+                    sampled.mipFilter = GFX_MIPFILTER_LINEAR;
+                } else {
                     sampled.mipFilter = GFX_MIPFILTER_NONE;
                 }
             }
@@ -1529,6 +1892,8 @@ struct Executor : GfxExecutor {
         bindings[8] = { (specGpu != NULL && specGpu->texture != NULL) ? specGpu->texture : white2D, matSampler };
         bindings[9] = { shadowMap != NULL ? shadowMap : white2D,
                         shadowSampler != NULL ? shadowSampler : Sampler(GfxStageState()) };
+        bindings[10] = { (bindSoftDepth && sceneDepthCopy != NULL) ? sceneDepthCopy : white2D,
+                         depthSampler != NULL ? depthSampler : Sampler(GfxStageState()) };
     }
 
     // What a render pass has bound: each draw sets only what differs from the
@@ -1538,7 +1903,7 @@ struct Executor : GfxExecutor {
         bool viewportSet = false, texturesSet = false, indicesSet = false;
         SDL_GPUViewport viewport = {};
         SDL_Rect scissor = {};
-        SDL_GPUTextureSamplerBinding textures[10] = {};
+        SDL_GPUTextureSamplerBinding textures[11] = {};
         SDL_GPUBuffer *vertices = nullptr;
     };
 
@@ -1643,6 +2008,12 @@ struct Executor : GfxExecutor {
 
     void DestroyVertexBuffer(GfxVertexBuffer *b) override
     {
+        for (auto it = staticBoundsCache.begin(); it != staticBoundsCache.end(); ) {
+            if (it->first.buffer == b)
+                it = staticBoundsCache.erase(it);
+            else
+                ++it;
+        }
         GpuVertexBuffer *g = (GpuVertexBuffer *)b->gpu;
         if (g == NULL)
             return;
@@ -1656,10 +2027,11 @@ struct Executor : GfxExecutor {
     // target there, before any draw, become the pass's load operations (the
     // GPU's fast clears) instead of drawn quads; *cleared counts them.
     SDL_GPURenderPass *BeginPass(SDL_GPUCommandBuffer *cmd, GfxTexture *target, SDL_GPUSampleCount passSamples,
-                                 bool hdrTarget, int &w, int &h, const std::vector<GfxCommand> &commands, size_t first,
-                                 size_t *cleared)
+                                 bool hdrTarget, bool mrtDepth, bool &hdrDepthCleared, int &w, int &h,
+                                 const std::vector<GfxCommand> &commands, size_t first, size_t *cleared)
     {
-        SDL_GPUColorTargetInfo color = {};
+        SDL_GPUColorTargetInfo colors[2] = {};
+        SDL_GPUColorTargetInfo &color = colors[0];
         SDL_GPUDepthStencilTargetInfo depth = {};
         color.load_op = SDL_GPU_LOADOP_LOAD;
         color.store_op = SDL_GPU_STOREOP_STORE;
@@ -1669,6 +2041,7 @@ struct Executor : GfxExecutor {
         // discarded stencil may take the depth with it on some tilers.
         depth.stencil_load_op = SDL_GPU_LOADOP_LOAD;
         depth.stencil_store_op = SDL_GPU_STOREOP_STORE;
+        Uint32 numColorTargets = 1;
         if (target == NULL) {
             if (hdrTarget && hdrColor != NULL) {
                 if (passSamples != SDL_GPU_SAMPLECOUNT_1 && hdrColorMsaa != NULL && backDepthMsaa != NULL) {
@@ -1679,6 +2052,20 @@ struct Executor : GfxExecutor {
                 } else {
                     color.texture = hdrColor;
                     depth.texture = backDepth;
+                }
+                if (mrtDepth && hdrDepth != NULL) {
+                    SDL_GPUColorTargetInfo &dcol = colors[1];
+                    if (passSamples != SDL_GPU_SAMPLECOUNT_1 && hdrDepthMsaa != NULL) {
+                        dcol.texture = hdrDepthMsaa;
+                        dcol.resolve_texture = hdrDepth;
+                        dcol.store_op = SDL_GPU_STOREOP_RESOLVE_AND_STORE;
+                    } else {
+                        dcol.texture = hdrDepth;
+                        dcol.store_op = SDL_GPU_STOREOP_STORE;
+                    }
+                    dcol.load_op = hdrDepthCleared ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR;
+                    dcol.clear_color = { 10000.0f, 0.0f, 0.0f, 1.0f };
+                    numColorTargets = 2;
                 }
             } else if (passSamples != SDL_GPU_SAMPLECOUNT_1 && backColorMsaa != NULL) {
                 color.texture = backColorMsaa;
@@ -1721,14 +2108,20 @@ struct Executor : GfxExecutor {
             if (c.clearFlags & GFX_CLEAR_ZBUFFER) {
                 depth.load_op = SDL_GPU_LOADOP_CLEAR;
                 depth.clear_depth = c.clearZ;
+                if (numColorTargets == 2) {
+                    colors[1].load_op = SDL_GPU_LOADOP_CLEAR;
+                    colors[1].clear_color = { 10000.0f, 0.0f, 0.0f, 1.0f };
+                }
             }
             (*cleared)++;
         }
-        return SDL_BeginGPURenderPass(cmd, &color, 1, &depth);
+        if (numColorTargets == 2)
+            hdrDepthCleared = true;
+        return SDL_BeginGPURenderPass(cmd, colors, numColorTargets, &depth);
     }
 
-    // Ends the render pass on target; a cube face's goes on into the cube.
-    void EndPass(SDL_GPUCommandBuffer *cmd, SDL_GPURenderPass *pass, GfxTexture *target)
+    // Ends the render pass on target; a cube face's goes on into the cube (plus prefiltered roughness mips).
+    void EndPass(SDL_GPUCommandBuffer *cmd, SDL_GPURenderPass *pass, GfxTexture *target, bool prefilterCube = false)
     {
         SDL_EndGPURenderPass(pass);
         if (target == NULL)
@@ -1746,10 +2139,36 @@ struct Executor : GfxExecutor {
         dst.layer = (Uint32)face;
         SDL_CopyGPUTextureToTexture(copy, &src, &dst, root->width, root->height, 1, false);
         SDL_EndGPUCopyPass(copy);
+
+        // Stage 13: Generate prefiltered roughness mipmap chain (levels 1..4) for dynamic cube reflections.
+        if (prefilterCube && g->mipLevels > 1 && cubeBlurPipeline != NULL && postSampler != NULL) {
+            for (int m = 1; m < g->mipLevels && m <= 4; m++) {
+                SDL_GPUTexture *srcTex = (m == 1) ? g->faces[face] : g->cubeMips[m - 2];
+                SDL_GPUTexture *dstTex = g->cubeMips[m - 1];
+                if (srcTex == NULL || dstTex == NULL)
+                    break;
+                int sw = std::max(1, root->width >> (m - 1));
+                int sh = std::max(1, root->height >> (m - 1));
+                int mw = std::max(1, root->width >> m);
+                int mh = std::max(1, root->height >> m);
+                SDL_GPUTextureSamplerBinding bind = { srcTex, postSampler };
+                PostUniforms blurU = { { 1.0f / (float)sw, 1.0f / (float)sh, 1.35f, 0.0f } };
+                DrawPostPass(cmd, cubeBlurPipeline, dstTex, mw, mh, &bind, 1, &blurU, sizeof(blurU));
+
+                SDL_GPUCopyPass *mcopy = SDL_BeginGPUCopyPass(cmd);
+                SDL_GPUTextureLocation msrc = {}, mdst = {};
+                msrc.texture = dstTex;
+                mdst.texture = g->texture;
+                mdst.layer = (Uint32)face;
+                mdst.mip_level = (Uint32)m;
+                SDL_CopyGPUTextureToTexture(mcopy, &msrc, &mdst, mw, mh, 1, false);
+                SDL_EndGPUCopyPass(mcopy);
+            }
+        }
     }
 
     void DrawPostPass(SDL_GPUCommandBuffer *cmd, SDL_GPUGraphicsPipeline *pipeline, SDL_GPUTexture *dst, int w, int h,
-                      const SDL_GPUTextureSamplerBinding *bindings, int numBindings, const PostUniforms &u)
+                      const SDL_GPUTextureSamplerBinding *bindings, int numBindings, const void *uData, size_t uSize)
     {
         SDL_GPUColorTargetInfo color = {};
         color.texture = dst;
@@ -1761,74 +2180,138 @@ struct Executor : GfxExecutor {
         SDL_Rect scissor = { 0, 0, w, h };
         SDL_SetGPUViewport(pass, &vp);
         SDL_SetGPUScissor(pass, &scissor);
-        SDL_PushGPUFragmentUniformData(cmd, 0, &u, sizeof(u));
+        SDL_PushGPUFragmentUniformData(cmd, 0, uData, (Uint32)uSize);
         SDL_BindGPUFragmentSamplers(pass, 0, bindings, numBindings);
         SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
         SDL_EndGPURenderPass(pass);
     }
 
-    void RunPostProcess(SDL_GPUCommandBuffer *cmd, bool toneMap, bool bloomOn, float bloomIntensity)
+    void RunPostProcess(SDL_GPUCommandBuffer *cmd, bool toneMap, bool bloomOn, float bloomIntensity, bool ssaoActive,
+                        float ssaoStrength, bool casOn, float casStrength, const GfxMatrix &mainProj, bool hasMainProj)
     {
+        bool ssaoRan = false;
+        if (ssaoActive && ssaoStrength > 0.001f && hasMainProj && hdrDepth != NULL && aoHalfA != NULL &&
+            aoHalfB != NULL && postGtaoPipeline != NULL && postAoBlurPipeline != NULL &&
+            fabsf(mainProj._11) > 1e-4f && fabsf(mainProj._22) > 1e-4f) {
+            SDL_GPUTextureSamplerBinding depthBind = { hdrDepth, depthSampler };
+            PostUniforms2 gtaoU = {
+                { 1.0f / mainProj._11, 1.0f / mainProj._22, mainProj._22 * (float)bloomHalfH * 0.5f, 0.85f },
+                { 1.0f / (float)bloomHalfW, 1.0f / (float)bloomHalfH, 1.0f / (float)backWidth, 1.0f / (float)backHeight },
+            };
+            DrawPostPass(cmd, postGtaoPipeline, aoHalfA, bloomHalfW, bloomHalfH, &depthBind, 1, &gtaoU, sizeof(gtaoU));
+
+            SDL_GPUTextureSamplerBinding aoA = { aoHalfA, depthSampler };
+            PostUniforms blurAoH = { { 1.0f / (float)bloomHalfW, 0.0f, 0.0f, 0.0f } };
+            DrawPostPass(cmd, postAoBlurPipeline, aoHalfB, bloomHalfW, bloomHalfH, &aoA, 1, &blurAoH, sizeof(blurAoH));
+
+            SDL_GPUTextureSamplerBinding aoB = { aoHalfB, depthSampler };
+            PostUniforms blurAoV = { { 0.0f, 1.0f / (float)bloomHalfH, 0.0f, 0.0f } };
+            DrawPostPass(cmd, postAoBlurPipeline, aoHalfA, bloomHalfW, bloomHalfH, &aoB, 1, &blurAoV, sizeof(blurAoV));
+            ssaoRan = true;
+        }
+
         if (bloomOn && bloomIntensity > 0.0f) {
             SDL_GPUTextureSamplerBinding src = { hdrColor, postSampler };
             PostUniforms brightU = { { 0.92f, 0.35f, 4.0f, 0.0f } };
-            DrawPostPass(cmd, postBrightPipeline, bloomHalfA, bloomHalfW, bloomHalfH, &src, 1, brightU);
+            DrawPostPass(cmd, postBrightPipeline, bloomHalfA, bloomHalfW, bloomHalfH, &src, 1, &brightU, sizeof(brightU));
 
             SDL_GPUTextureSamplerBinding halfA = { bloomHalfA, postSampler };
             PostUniforms blurHalfH = { { 1.0f / (float)bloomHalfW, 0.0f, 0.0f, 0.0f } };
-            DrawPostPass(cmd, postBlurPipeline, bloomHalfB, bloomHalfW, bloomHalfH, &halfA, 1, blurHalfH);
+            DrawPostPass(cmd, postBlurPipeline, bloomHalfB, bloomHalfW, bloomHalfH, &halfA, 1, &blurHalfH,
+                         sizeof(blurHalfH));
 
             SDL_GPUTextureSamplerBinding halfB = { bloomHalfB, postSampler };
             PostUniforms blurHalfV = { { 0.0f, 1.0f / (float)bloomHalfH, 0.0f, 0.0f } };
-            DrawPostPass(cmd, postBlurPipeline, bloomHalfA, bloomHalfW, bloomHalfH, &halfB, 1, blurHalfV);
+            DrawPostPass(cmd, postBlurPipeline, bloomHalfA, bloomHalfW, bloomHalfH, &halfB, 1, &blurHalfV,
+                         sizeof(blurHalfV));
 
             // Downsample + blur to quarter resolution for wider, softer glow.
             PostUniforms blurQtrH1 = { { 1.0f / (float)bloomHalfW, 0.0f, 0.0f, 0.0f } };
-            DrawPostPass(cmd, postBlurPipeline, bloomQuarterB, bloomQuarterW, bloomQuarterH, &halfA, 1, blurQtrH1);
+            DrawPostPass(cmd, postBlurPipeline, bloomQuarterB, bloomQuarterW, bloomQuarterH, &halfA, 1, &blurQtrH1,
+                         sizeof(blurQtrH1));
 
             SDL_GPUTextureSamplerBinding qtrB = { bloomQuarterB, postSampler };
             PostUniforms blurQtrV1 = { { 0.0f, 1.0f / (float)bloomQuarterH, 0.0f, 0.0f } };
-            DrawPostPass(cmd, postBlurPipeline, bloomQuarterA, bloomQuarterW, bloomQuarterH, &qtrB, 1, blurQtrV1);
+            DrawPostPass(cmd, postBlurPipeline, bloomQuarterA, bloomQuarterW, bloomQuarterH, &qtrB, 1, &blurQtrV1,
+                         sizeof(blurQtrV1));
 
             SDL_GPUTextureSamplerBinding qtrA = { bloomQuarterA, postSampler };
             PostUniforms blurQtrH2 = { { 1.25f / (float)bloomQuarterW, 0.0f, 0.0f, 0.0f } };
-            DrawPostPass(cmd, postBlurPipeline, bloomQuarterB, bloomQuarterW, bloomQuarterH, &qtrA, 1, blurQtrH2);
+            DrawPostPass(cmd, postBlurPipeline, bloomQuarterB, bloomQuarterW, bloomQuarterH, &qtrA, 1, &blurQtrH2,
+                         sizeof(blurQtrH2));
 
             PostUniforms blurQtrV2 = { { 0.0f, 1.25f / (float)bloomQuarterH, 0.0f, 0.0f } };
-            DrawPostPass(cmd, postBlurPipeline, bloomQuarterA, bloomQuarterW, bloomQuarterH, &qtrB, 1, blurQtrV2);
+            DrawPostPass(cmd, postBlurPipeline, bloomQuarterA, bloomQuarterW, bloomQuarterH, &qtrB, 1, &blurQtrV2,
+                         sizeof(blurQtrV2));
         }
 
-        SDL_GPUTextureSamplerBinding compBindings[3] = {
+        SDL_GPUTextureSamplerBinding compBindings[4] = {
             { hdrColor, postSampler },
             { (bloomOn && bloomIntensity > 0.0f) ? bloomHalfA : white2D, postSampler },
             { (bloomOn && bloomIntensity > 0.0f) ? bloomQuarterA : white2D, postSampler },
+            { ssaoRan ? aoHalfA : white2D, postSampler },
         };
-        PostUniforms compU = { { toneMap ? 1.0f : 0.0f, bloomOn ? bloomIntensity : 0.0f, 0.92f, 0.0f } };
-        DrawPostPass(cmd, postCompositePipeline, backColor, backWidth, backHeight, compBindings, 3, compU);
+        PostUniforms2 compU = {
+            { toneMap ? 1.0f : 0.0f, bloomOn ? bloomIntensity : 0.0f, 0.92f, ssaoRan ? ssaoStrength : 0.0f },
+            { casOn ? 1.0f : 0.0f, casOn ? casStrength : 0.0f, 1.0f / (float)backWidth, 1.0f / (float)backHeight },
+        };
+        DrawPostPass(cmd, postCompositePipeline, backColor, backWidth, backHeight, compBindings, 4, &compU,
+                     sizeof(compU));
+    }
+
+    CachedSphere GetDrawWorldBounds(const GfxFrame &frame, const GfxCommand &c, const GfxDrawState &s)
+    {
+        CachedSphere local = {};
+        if (c.buffer != NULL) {
+            DrawBoundsKey key = { c.buffer, c.firstVertexByte, c.vertexCount };
+            auto it = staticBoundsCache.find(key);
+            if (it != staticBoundsCache.end() && it->second.version == c.buffer->version) {
+                local = it->second;
+            } else {
+                uint32_t firstVert = c.firstVertexByte / sizeof(GfxVertex);
+                if (firstVert + c.vertexCount <= c.buffer->vertices.size()) {
+                    local = ComputeVertexSphere(c.buffer->vertices.data() + firstVert, c.vertexCount, 1, 0.5f);
+                }
+                local.version = c.buffer->version;
+                staticBoundsCache[key] = local;
+            }
+        } else {
+            size_t availBytes = frame.vertices.size();
+            size_t endByte = (size_t)c.firstVertexByte + (size_t)c.vertexCount * sizeof(GfxVertex);
+            if (endByte <= availBytes && c.vertexCount > 0) {
+                const GfxVertex *verts = (const GfxVertex *)(frame.vertices.data() + c.firstVertexByte);
+                uint32_t stride = c.vertexCount <= 96 ? 1u : std::max(1u, c.vertexCount / 48u);
+                float pad = stride > 1u ? 3.5f : 0.5f;
+                local = ComputeVertexSphere(verts, c.vertexCount, stride, pad);
+            }
+        }
+        CachedSphere world = {};
+        float wc[3];
+        TransformPoint(local.center, 1.0f, s.world, wc);
+        world.center = { wc[0], wc[1], wc[2] };
+        const GfxMatrix &m = s.world;
+        float sx = sqrtf(m._11 * m._11 + m._12 * m._12 + m._13 * m._13);
+        float sy = sqrtf(m._21 * m._21 + m._22 * m._22 + m._23 * m._23);
+        float sz = sqrtf(m._31 * m._31 + m._32 * m._32 + m._33 * m._33);
+        float maxScale = std::max(sx, std::max(sy, sz));
+        world.radius = local.radius * (maxScale > 1e-4f ? maxScale : 1.0f);
+        return world;
     }
 
     void RenderShadowPass(SDL_GPUCommandBuffer *cmd, const GfxFrame &frame, size_t backdropIndex,
-                          const GfxMatrix &lightViewProj, bool overhaul)
+                          const ShadowSetup &setup, bool overhaul)
     {
-        if (shadowMap == NULL || shadowMapSize <= 0)
-            return;
-        SDL_GPUDepthStencilTargetInfo depth = {};
-        depth.texture = shadowMap;
-        depth.load_op = SDL_GPU_LOADOP_CLEAR;
-        depth.store_op = SDL_GPU_STOREOP_STORE;
-        depth.clear_depth = 1.0f;
-        SDL_GPURenderPass *spass = SDL_BeginGPURenderPass(cmd, NULL, 0, &depth);
-        if (spass == NULL)
+        if (shadowMap == NULL || shadowMapSize <= 0 || setup.count <= 0)
             return;
 
-        SDL_GPUViewport vp = { 0.0f, 0.0f, (float)shadowMapSize, (float)shadowMapSize, 0.0f, 1.0f };
-        SDL_Rect scissor = { 0, 0, shadowMapSize, shadowMapSize };
-        SDL_SetGPUViewport(spass, &vp);
-        SDL_SetGPUScissor(spass, &scissor);
-
-        SDL_GPUGraphicsPipeline *curPipe = NULL;
-        SDL_GPUBuffer *curVB = NULL;
-        bool indicesBound = false;
+        // Gather shadow-casting 3D draws + their world bounding spheres once for all cascades.
+        struct ShadowCaster {
+            size_t cmdIndex;
+            GfxVector center;
+            float radius;
+        };
+        std::vector<ShadowCaster> casters;
+        casters.reserve(256);
         GfxTexture *scanTarget = NULL;
         for (size_t i = 0; i < frame.commands.size(); i++) {
             const GfxCommand &c = frame.commands[i];
@@ -1845,57 +2328,107 @@ struct Executor : GfxExecutor {
                 continue;
             if (s.alphaBlend && !s.alphaTest)
                 continue;
+            CachedSphere wb = GetDrawWorldBounds(frame, c, s);
+            casters.push_back({ i, wb.center, wb.radius });
+        }
 
-            SDL_GPUGraphicsPipeline *pipe = ShadowPipeline(c.primitive);
-            if (pipe == NULL)
-                continue;
-            if (pipe != curPipe) {
-                SDL_BindGPUGraphicsPipeline(spass, pipe);
-                curPipe = pipe;
-            }
+        // Single render pass over the 2x1 CSM atlas (zero pass-switch overhead on Apple Silicon TBDR).
+        SDL_GPUDepthStencilTargetInfo depth = {};
+        depth.texture = shadowMap;
+        depth.load_op = SDL_GPU_LOADOP_CLEAR;
+        depth.store_op = SDL_GPU_STOREOP_STORE;
+        depth.clear_depth = 1.0f;
+        SDL_GPURenderPass *spass = SDL_BeginGPURenderPass(cmd, NULL, 0, &depth);
+        if (spass == NULL)
+            return;
 
-            ShadowVertexUniforms svu;
-            Multiply(s.world, lightViewProj, svu.lightWorldViewProj);
-            SDL_PushGPUVertexUniformData(cmd, 0, &svu, sizeof(svu));
+        SDL_GPUGraphicsPipeline *curPipe = NULL;
+        SDL_GPUBuffer *curVB = NULL;
+        SDL_GPUTexture *curTex = NULL;
+        SDL_GPUSampler *curSamp = NULL;
+        bool indicesBound = false;
 
-            ShadowFragmentUniforms sfu = {};
-            const bool alphaTestOn = s.alphaTest && s.stages[0].texture != NULL;
-            if (alphaTestOn) {
-                sfu.alphaParams[0] = 1.0f;
-                sfu.alphaParams[1] = (s.alphaRef & 0xff) / 255.0f;
-                sfu.alphaParams[2] = (float)s.alphaFunc;
-            }
-            SDL_PushGPUFragmentUniformData(cmd, 0, &sfu, sizeof(sfu));
+        for (int ci = 0; ci < setup.count; ci++) {
+            const ShadowCascade &casc = setup.cascades[ci];
+            SDL_GPUViewport vp = {
+                (float)(ci * shadowMapSize), 0.0f, (float)shadowMapSize, (float)shadowMapSize, 0.0f, 1.0f
+            };
+            SDL_Rect scissor = { ci * shadowMapSize, 0, shadowMapSize, shadowMapSize };
+            SDL_SetGPUViewport(spass, &vp);
+            SDL_SetGPUScissor(spass, &scissor);
 
-            SDL_GPUTexture *tex = white2D;
-            SDL_GPUSampler *samp = Sampler(GfxStageState());
-            if (alphaTestOn) {
-                GfxTexture *t = Gfx_DrawnTexture(s.stages[0].texture, overhaul);
-                GpuTexture *g = t != NULL ? Ensure(t) : NULL;
-                if (g != NULL && g->texture != NULL && !(t->flags & GFX_TEXTURE_CUBE)) {
-                    tex = g->texture;
-                    samp = Sampler(s.stages[0]);
+            for (const ShadowCaster &sc : casters) {
+                // Lightweight light-space ortho frustum culling on CPU: skips ~85% of draws for Cascade 0.
+                if (sc.radius > 0.0f) {
+                    GfxVector diff = {
+                        sc.center.x - casc.center.x,
+                        sc.center.y - casc.center.y,
+                        sc.center.z - casc.center.z,
+                    };
+                    float dx = fabsf(VecDot(diff, setup.lightRight));
+                    float dy = fabsf(VecDot(diff, setup.lightUp));
+                    if (dx > casc.radius + sc.radius || dy > casc.radius + sc.radius)
+                        continue;
                 }
-            }
-            SDL_GPUTextureSamplerBinding tb = { tex, samp };
-            SDL_BindGPUFragmentSamplers(spass, 0, &tb, 1);
 
-            SDL_GPUBuffer *vb = c.buffer != NULL ? ((GpuVertexBuffer *)c.buffer->gpu)->buffer : vertexBuffer;
-            uint32_t firstVertex = c.firstVertexByte / sizeof(GfxVertex);
-            if (vb != curVB) {
-                SDL_GPUBufferBinding vbb = { vb, 0 };
-                SDL_BindGPUVertexBuffers(spass, 0, &vbb, 1);
-                curVB = vb;
-            }
-            if (c.firstIndex != ~0u) {
-                if (!indicesBound) {
-                    SDL_GPUBufferBinding ib = { indexBuffer, 0 };
-                    SDL_BindGPUIndexBuffer(spass, &ib, SDL_GPU_INDEXELEMENTSIZE_16BIT);
-                    indicesBound = true;
+                const GfxCommand &c = frame.commands[sc.cmdIndex];
+                const GfxDrawState &s = frame.states[c.state];
+
+                SDL_GPUGraphicsPipeline *pipe = ShadowPipeline(c.primitive);
+                if (pipe == NULL)
+                    continue;
+                if (pipe != curPipe) {
+                    SDL_BindGPUGraphicsPipeline(spass, pipe);
+                    curPipe = pipe;
                 }
-                SDL_DrawGPUIndexedPrimitives(spass, c.indexCount, 1, c.firstIndex, (Sint32)firstVertex, 0);
-            } else {
-                SDL_DrawGPUPrimitives(spass, c.vertexCount, 1, firstVertex, 0);
+
+                ShadowVertexUniforms svu;
+                Multiply(s.world, casc.lightVP, svu.lightWorldViewProj);
+                SDL_PushGPUVertexUniformData(cmd, 0, &svu, sizeof(svu));
+
+                ShadowFragmentUniforms sfu = {};
+                const bool alphaTestOn = s.alphaTest && s.stages[0].texture != NULL;
+                if (alphaTestOn) {
+                    sfu.alphaParams[0] = 1.0f;
+                    sfu.alphaParams[1] = (s.alphaRef & 0xff) / 255.0f;
+                    sfu.alphaParams[2] = (float)s.alphaFunc;
+                }
+                SDL_PushGPUFragmentUniformData(cmd, 0, &sfu, sizeof(sfu));
+
+                SDL_GPUTexture *tex = white2D;
+                SDL_GPUSampler *samp = Sampler(GfxStageState());
+                if (alphaTestOn) {
+                    GfxTexture *t = Gfx_DrawnTexture(s.stages[0].texture, overhaul);
+                    GpuTexture *g = t != NULL ? Ensure(t) : NULL;
+                    if (g != NULL && g->texture != NULL && !(t->flags & GFX_TEXTURE_CUBE)) {
+                        tex = g->texture;
+                        samp = Sampler(s.stages[0]);
+                    }
+                }
+                if (tex != curTex || samp != curSamp) {
+                    SDL_GPUTextureSamplerBinding tb = { tex, samp };
+                    SDL_BindGPUFragmentSamplers(spass, 0, &tb, 1);
+                    curTex = tex;
+                    curSamp = samp;
+                }
+
+                SDL_GPUBuffer *vb = c.buffer != NULL ? ((GpuVertexBuffer *)c.buffer->gpu)->buffer : vertexBuffer;
+                uint32_t firstVertex = c.firstVertexByte / sizeof(GfxVertex);
+                if (vb != curVB) {
+                    SDL_GPUBufferBinding vbb = { vb, 0 };
+                    SDL_BindGPUVertexBuffers(spass, 0, &vbb, 1);
+                    curVB = vb;
+                }
+                if (c.firstIndex != ~0u) {
+                    if (!indicesBound) {
+                        SDL_GPUBufferBinding ib = { indexBuffer, 0 };
+                        SDL_BindGPUIndexBuffer(spass, &ib, SDL_GPU_INDEXELEMENTSIZE_16BIT);
+                        indicesBound = true;
+                    }
+                    SDL_DrawGPUIndexedPrimitives(spass, c.indexCount, 1, c.firstIndex, (Sint32)firstVertex, 0);
+                } else {
+                    SDL_DrawGPUPrimitives(spass, c.vertexCount, 1, firstVertex, 0);
+                }
             }
         }
         SDL_EndGPURenderPass(spass);
@@ -1953,6 +2486,9 @@ struct Executor : GfxExecutor {
         const bool perPixel = overhaul && Platform_GetSettingInt("video.per_pixel_lighting", 1) != 0;
         const bool hemisphere = overhaul && Platform_GetSettingInt("video.hemisphere_ambient", 1) != 0;
         const bool carFresnel = overhaul && Platform_GetSettingInt("video.car_fresnel", 1) != 0;
+        const bool pbrShading = overhaul && Platform_GetSettingInt("video.pbr_shading", 1) != 0;
+        const bool wetSurfaces = overhaul && Platform_GetSettingInt("video.wet_surfaces", 1) != 0;
+        const bool atmoFog = overhaul && Platform_GetSettingInt("video.atmospheric_fog", 1) != 0;
         const bool materialMaps = overhaul && Platform_GetSettingInt("video.override_material_maps", 1) != 0;
         const float fresnelStrength =
             carFresnel ? std::clamp(Platform_GetSettingFloat("video.car_fresnel_strength", 0.65f), 0.0f, 1.0f) : 0.0f;
@@ -1961,7 +2497,9 @@ struct Executor : GfxExecutor {
         bool foundSun = false;
         GfxVector sunLightDir = { 0.3f, -0.8f, 0.4f };
         GfxMatrix mainCamView = {};
+        GfxMatrix mainCamProj = {};
         bool foundMainCam = false;
+        bool foundMainProj = false;
         float bestSunLuma = 0.0f;
         {
             GfxTexture *scanTarget = NULL;
@@ -1983,6 +2521,10 @@ struct Executor : GfxExecutor {
                     if (s.depthTest && s.depthWrite && (!foundMainCam || backdropIndex != SIZE_MAX)) {
                         mainCamView = s.view;
                         foundMainCam = true;
+                        if (fabsf(s.projection._11) > 1e-4f && fabsf(s.projection._22) > 1e-4f) {
+                            mainCamProj = s.projection;
+                            foundMainProj = true;
+                        }
                     }
                     if (s.lighting) {
                         for (int li = 0; li < 8; li++) {
@@ -2001,17 +2543,18 @@ struct Executor : GfxExecutor {
             }
         }
         bool shadowActive = false;
-        GfxMatrix lightViewProj = {};
-        GfxVector toSunWorld = { 0.0f, 1.0f, 0.0f };
+        ShadowSetup shadowSetup = {};
         const float shadowStrength =
             std::clamp(Platform_GetSettingFloat("video.shadow_strength", 0.65f), 0.0f, 1.0f);
+        const int shadowCascades = std::clamp(Platform_GetSettingInt("video.shadow_cascades", 2), 1, 2);
+        const int shadowPcfQuality = std::clamp(Platform_GetSettingInt("video.shadow_pcf_quality", 2), 0, 2);
         if (overhaul && shadowSupported && foundSun && foundMainCam && shadowStrength > 0.01f &&
             Platform_GetSettingInt("video.shadow_map", 1) != 0) {
-            EnsureShadowMap(Platform_GetSettingInt("video.shadow_map_size", 2048));
-            float shadowDist = std::clamp(Platform_GetSettingFloat("video.shadow_distance", 75.0f), 25.0f, 200.0f);
+            EnsureShadowMap(Platform_GetSettingInt("video.shadow_map_size", 2048), shadowCascades);
+            float shadowDist = std::clamp(Platform_GetSettingFloat("video.shadow_distance", 110.0f), 25.0f, 200.0f);
             if (shadowMap != NULL &&
-                BuildSunLightMatrix(mainCamView, sunLightDir, shadowDist, shadowMapSize, lightViewProj, toSunWorld)) {
-                RenderShadowPass(cmd, frame, backdropIndex, lightViewProj, overhaul);
+                BuildSunCascades(mainCamView, sunLightDir, shadowDist, shadowMapSize, shadowMapCascades, shadowSetup)) {
+                RenderShadowPass(cmd, frame, backdropIndex, shadowSetup, overhaul);
                 shadowActive = true;
                 vertexUniformState = NULL;
                 fragmentUniformsSet = false;
@@ -2021,9 +2564,22 @@ struct Executor : GfxExecutor {
         const bool bloomOn = overhaul && Platform_GetSettingInt("video.bloom", 1) != 0;
         const float bloomIntensity =
             bloomOn ? std::clamp(Platform_GetSettingFloat("video.bloom_intensity", 0.25f), 0.0f, 1.5f) : 0.0f;
+        const bool ssaoOn = overhaul && ssaoSupported && hdrDepth != NULL &&
+                            Platform_GetSettingInt("video.ssao", 1) != 0;
+        const float ssaoStrength =
+            ssaoOn ? std::clamp(Platform_GetSettingFloat("video.ssao_strength", 0.55f), 0.0f, 1.0f) : 0.0f;
+        const bool casOn = overhaul && Platform_GetSettingInt("video.cas_sharpening", 1) != 0;
+        const float casStrength =
+            casOn ? std::clamp(Platform_GetSettingFloat("video.cas_strength", 0.40f), 0.0f, 1.0f) : 0.0f;
+        const bool alphaToCoverageOn = overhaul && Platform_GetSettingInt("video.alpha_to_coverage", 1) != 0;
+        const bool softParticlesOn = overhaul && ssaoSupported && hdrDepth != NULL && sceneDepthCopy != NULL &&
+                                     Platform_GetSettingInt("video.soft_particles", 1) != 0;
         const bool postEnabled = overhaul && hdrSupported && hdrColor != NULL &&
                                  Platform_GetSettingInt("video.post_process", 1) != 0 && last3D != SIZE_MAX &&
-                                 (toneMap || bloomIntensity > 0.0f);
+                                 (toneMap || bloomIntensity > 0.0f || ssaoStrength > 0.001f || casStrength > 0.001f ||
+                                  softParticlesOn);
+        const bool useMrtDepth =
+            postEnabled && hdrDepth != NULL && ((ssaoOn && ssaoStrength > 0.001f && foundMainProj) || softParticlesOn);
         SDL_GPUSampleCount backSamples =
             (msaaSamples != SDL_GPU_SAMPLECOUNT_1 && backColorMsaa != NULL && overhaul)
                 ? msaaSamples
@@ -2037,14 +2593,17 @@ struct Executor : GfxExecutor {
             vertexUniformState = NULL;
             fragmentUniformsSet = false;
             bool inHdr3D = (phase == 1 && postEnabled);
+            bool hdrDepthCleared = false;
+            bool depthSnapshotTaken = false;
             for (size_t i = 0; i < frame.commands.size(); i++) {
                 const GfxCommand &c = frame.commands[i];
                 if (c.type == GFX_CMD_TARGET) {
                     // The back buffer's pass stays open over the texture
                     // drawing skipped in its phase.
                     if (pass != NULL && phase == 0) {
-                        EndPass(cmd, pass, passTarget);
+                        EndPass(cmd, pass, passTarget, pbrShading);
                         pass = NULL;
+                        fragmentUniformsSet = false;
                     }
                     target = c.target;
                     continue;
@@ -2055,6 +2614,7 @@ struct Executor : GfxExecutor {
                                                  : inHdr3D      ? hdrBackSamples
                                                  : postEnabled  ? SDL_GPU_SAMPLECOUNT_1
                                                                 : backSamples;
+                const bool passMrtDepth = (target == NULL && inHdr3D && useMrtDepth);
                 if (c.type == GFX_CMD_BACKDROP) {
                     // A copy pass between render passes; the next draw starts a
                     // render pass that loads the back buffer as it is.
@@ -2074,7 +2634,8 @@ struct Executor : GfxExecutor {
                 }
                 if (pass == NULL) {
                     size_t cleared;
-                    pass = BeginPass(cmd, target, passSamples, inHdr3D, targetW, targetH, frame.commands, i, &cleared);
+                    pass = BeginPass(cmd, target, passSamples, inHdr3D, passMrtDepth, hdrDepthCleared, targetW, targetH,
+                                     frame.commands, i, &cleared);
                     passTarget = target;
                     bound = PassBindings();
                     if (cleared > 0) {
@@ -2087,7 +2648,8 @@ struct Executor : GfxExecutor {
                     bool depthClear = (c.clearFlags & GFX_CLEAR_ZBUFFER) != 0;
                     if (!colorClear && !depthClear)
                         continue;
-                    SDL_GPUGraphicsPipeline *pipeline = ClearPipeline(colorClear, depthClear, passSamples, inHdr3D);
+                    SDL_GPUGraphicsPipeline *pipeline =
+                        ClearPipeline(colorClear, depthClear, passSamples, inHdr3D, passMrtDepth);
                     if (pipeline != bound.pipeline) {
                         SDL_BindGPUGraphicsPipeline(pass, pipeline);
                         bound.pipeline = pipeline;
@@ -2108,7 +2670,33 @@ struct Executor : GfxExecutor {
                     continue;
                 }
                 const GfxDrawState &s = frame.states[c.state];
-                SDL_GPUGraphicsPipeline *pipeline = Pipeline(PipelineKey(c, s, passSamples, inHdr3D));
+                // Stage 14: Snapshot resolved linear depth once before the first soft-particle draw.
+                const bool isSoftParticle = passMrtDepth && softParticlesOn && !c.transformed && s.alphaBlend &&
+                                            s.depthTest && !s.depthWrite && !s.alphaTest &&
+                                            (backdropIndex == SIZE_MAX || i > backdropIndex);
+                if (isSoftParticle && !depthSnapshotTaken && hdrDepthCleared && sceneDepthCopy != NULL) {
+                    if (pass != NULL) {
+                        SDL_EndGPURenderPass(pass);
+                        pass = NULL;
+                    }
+                    SDL_GPUCopyPass *dcopy = SDL_BeginGPUCopyPass(cmd);
+                    SDL_GPUTextureLocation dsrc = {}, ddst = {};
+                    dsrc.texture = hdrDepth;
+                    ddst.texture = sceneDepthCopy;
+                    SDL_CopyGPUTextureToTexture(dcopy, &dsrc, &ddst, backWidth, backHeight, 1, false);
+                    SDL_EndGPUCopyPass(dcopy);
+                    depthSnapshotTaken = true;
+                    size_t clearedIgnored;
+                    pass = BeginPass(cmd, target, passSamples, inHdr3D, passMrtDepth, hdrDepthCleared, targetW, targetH,
+                                     frame.commands, i, &clearedIgnored);
+                    passTarget = target;
+                    bound = PassBindings();
+                }
+                const bool drawA2C = alphaToCoverageOn && passSamples != SDL_GPU_SAMPLECOUNT_1 && !c.transformed &&
+                                     !s.alphaBlend && s.alphaTest && s.depthTest && s.depthWrite &&
+                                     (s.alphaFunc == GFX_CMP_GREATER || s.alphaFunc == GFX_CMP_GREATEREQUAL);
+                SDL_GPUGraphicsPipeline *pipeline =
+                    Pipeline(PipelineKey(c, s, passSamples, inHdr3D, passMrtDepth, drawA2C));
                 if (pipeline == NULL)
                     continue;
                 if (pipeline != bound.pipeline) {
@@ -2132,9 +2720,10 @@ struct Executor : GfxExecutor {
                     FillVertexUniforms(c, s, targetW, targetH, viewport, scaled, vu);
                     SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof(vu));
                     FragmentLightingUniforms fl;
-                    FillFragmentLightingUniforms(s, vu, overhaul, perPixel, hemisphere, fresnelStrength,
-                                                 shadowActive && target == NULL, lightViewProj, toSunWorld,
-                                                 shadowStrength, fl);
+                    FillFragmentLightingUniforms(s, vu, overhaul, perPixel, hemisphere, fresnelStrength, pbrShading,
+                                                 wetSurfaces, atmoFog, shadowActive && target == NULL, shadowSetup,
+                                                 shadowStrength, shadowPcfQuality, foundSun, sunLightDir, bestSunLuma,
+                                                 fl);
                     SDL_PushGPUFragmentUniformData(cmd, 1, &fl, sizeof(fl));
                     vertexUniformState = &s;
                     vertexUniformW = targetW;
@@ -2144,18 +2733,23 @@ struct Executor : GfxExecutor {
                 const bool receiveShadows = shadowActive && target == NULL && !c.transformed && s.depthTest &&
                                             !(s.alphaBlend && s.destBlend == GFX_BLEND_ONE) &&
                                             (backdropIndex == SIZE_MAX || i > backdropIndex);
+                const float softRange = (isSoftParticle && depthSnapshotTaken)
+                                            ? (s.destBlend == GFX_BLEND_ONE ? -0.65f : 0.65f)
+                                            : 0.0f;
                 FragmentUniforms fu;
                 FillFragmentUniforms(s, target == NULL && !c.transformed, inHdr3D && !c.transformed,
-                                     materialMaps && !c.transformed, receiveShadows, fu);
+                                     materialMaps && !c.transformed, receiveShadows, drawA2C, softRange, targetW,
+                                     targetH, fu);
                 if (!fragmentUniformsSet || memcmp(&fu, &fragmentUniforms, sizeof(fu)) != 0) {
                     SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
                     fragmentUniforms = fu;
                     fragmentUniformsSet = true;
                 }
-                SDL_GPUTextureSamplerBinding textures[10];
-                TextureBindings(s, !c.transformed, inHdr3D, materialMaps && !c.transformed, textures);
+                SDL_GPUTextureSamplerBinding textures[11];
+                TextureBindings(s, !c.transformed, inHdr3D, materialMaps && !c.transformed,
+                                isSoftParticle && depthSnapshotTaken, textures);
                 if (!bound.texturesSet || memcmp(textures, bound.textures, sizeof(textures)) != 0) {
-                    SDL_BindGPUFragmentSamplers(pass, 0, textures, 10);
+                    SDL_BindGPUFragmentSamplers(pass, 0, textures, 11);
                     memcpy(bound.textures, textures, sizeof(textures));
                     bound.texturesSet = true;
                 }
@@ -2182,14 +2776,15 @@ struct Executor : GfxExecutor {
                         EndPass(cmd, pass, passTarget);
                         pass = NULL;
                     }
-                    RunPostProcess(cmd, toneMap, bloomOn, bloomIntensity);
+                    RunPostProcess(cmd, toneMap, bloomOn, bloomIntensity, ssaoOn && useMrtDepth, ssaoStrength, casOn,
+                                   casStrength, mainCamProj, foundMainProj);
                     vertexUniformState = NULL;
                     fragmentUniformsSet = false;
                     inHdr3D = false;
                 }
             }
             if (pass != NULL) {
-                EndPass(cmd, pass, passTarget);
+                EndPass(cmd, pass, passTarget, phase == 0 && pbrShading);
                 pass = NULL;
             }
         }

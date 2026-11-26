@@ -20,15 +20,29 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _image_io import HAS_NUMPY, HAS_PIL, RGBAImage, load_png, save_png
+    from ai_upscaler import UPSCALER_BACKENDS, upscale_image
+    from bc7_dds import BC7_QUALITY_CHOICES, save_dds_bc7
     from classify_textures import CATEGORIES, ClassificationResult, classify_texture
+    from neural_maps import (
+        NORMAL_BACKENDS,
+        generate_neural_normal_map,
+        generate_pbr_specular_map,
+    )
 else:
     from ._image_io import HAS_NUMPY, HAS_PIL, RGBAImage, load_png, save_png
+    from .ai_upscaler import UPSCALER_BACKENDS, upscale_image
+    from .bc7_dds import BC7_QUALITY_CHOICES, save_dds_bc7
     from .classify_textures import CATEGORIES, ClassificationResult, classify_texture
+    from .neural_maps import (
+        NORMAL_BACKENDS,
+        generate_neural_normal_map,
+        generate_pbr_specular_map,
+    )
 
 if HAS_NUMPY:
     import numpy as np  # type: ignore
@@ -130,6 +144,30 @@ class UpscaleResult:
     src_size: Tuple[int, int]
     dst_size: Tuple[int, int]
     category: str
+    sub_profile: str = ""
+    upscaler_used: str = "lanczos"
+    normal_backend_used: str = "scharr"
+
+
+def is_hero_asset(category: str, sub_profile: str = "") -> bool:
+    """Return True for hero assets eligible for `--hero-max-size` (2K/4K) resolution tiering."""
+    if category == "road_surface":
+        return True
+    if category == "car_livery" and sub_profile in ("", "car_body", "car_cockpit"):
+        return True
+    return False
+
+
+def compute_effective_max_size(
+    category: str,
+    sub_profile: str = "",
+    max_size: int = 2048,
+    hero_max_size: Optional[int] = None,
+) -> int:
+    """Resolve effective max output dimension using hero tiering when enabled."""
+    if hero_max_size is not None and hero_max_size > 0 and is_hero_asset(category, sub_profile):
+        return max(int(max_size), int(hero_max_size))
+    return int(max_size)
 
 
 def compute_target_size(
@@ -137,12 +175,13 @@ def compute_target_size(
     height: int,
     scale: Optional[int] = None,
     max_size: int = 2048,
+    prefer_4x_up_to: int = 256,
 ) -> Tuple[int, int]:
     """Choose target HD resolution (2x or 4x) capped at max_size, keeping aspect ratio."""
     max_dim = max(width, height)
     if scale is None:
-        # Target 1K/2K: 4x for <= 256px textures, 2x for 512-1024px textures
-        chosen = 4 if max_dim <= 256 else 2
+        # Target 1K/2K (or 4K for hero assets): 4x up to prefer_4x_up_to, else 2x
+        chosen = 4 if max_dim <= prefer_4x_up_to else 2
     else:
         chosen = max(1, int(scale))
 
@@ -624,11 +663,27 @@ def generate_normal_map(
     wrap_x: bool = False,
     wrap_y: bool = False,
     strength_override: Optional[float] = None,
+    sub_profile: str = "",
+    backend: str = "scharr",
+    deepbump_model: Optional[Union[str, Path]] = None,
 ) -> RGBAImage:
-    """Generate a tangent-space normal map from multi-scale Scharr luminance gradients.
+    """Generate a tangent-space normal map (Scharr, DeepBump256, or Hybrid).
 
     Neutral flat normal is encoded as (128, 128, 255, 255).
     """
+    if backend != "scharr":
+        normal_img, _ = generate_neural_normal_map(
+            image,
+            category=category,
+            sub_profile=sub_profile,
+            wrap_x=wrap_x,
+            wrap_y=wrap_y,
+            backend=backend,
+            deepbump_model=deepbump_model,
+            strength_override=strength_override,
+        )
+        return normal_img
+
     profile = CATEGORY_PROFILES.get(category, CATEGORY_PROFILES["buildings_props"])
     strength = profile.normal_strength if strength_override is None else float(strength_override)
     fine_w = profile.normal_fine_weight
@@ -815,110 +870,25 @@ def generate_normal_map(
 def generate_specular_map(
     image: RGBAImage,
     category: str = "buildings_props",
+    sub_profile: str = "",
+    wrap_x: bool = False,
+    wrap_y: bool = False,
 ) -> RGBAImage:
-    """Generate a specular/reflection mask RGBA image tuned per category.
+    """Generate a Stage 10 PBR specular/roughness/reflection/clearcoat RGBA image.
 
     Channel layout:
-      R = specular strength [0..255]
-      G = cubemap / Fresnel reflection multiplier [0..255]
-      B = clearcoat / gloss accent [0..255]
+      R = specular / gloss (inverse roughness) [0..255]
+      G = cubemap / Fresnel reflection & metallic multiplier [0..255]
+      B = clearcoat (cars/glass/lights) or micro-cavity AO (roads/props; 0 for foliage)
       A = 255
     """
-    profile = CATEGORY_PROFILES.get(category, CATEGORY_PROFILES["buildings_props"])
-    w, h = image.width, image.height
-
-    if HAS_NUMPY:
-        arr = image.to_numpy().astype(np.float32)
-        r = arr[:, :, 0] / 255.0
-        g = arr[:, :, 1] / 255.0
-        b = arr[:, :, 2] / 255.0
-        a = arr[:, :, 3] / 255.0
-
-        luma = 0.299 * r + 0.587 * g + 0.114 * b
-        cmax = np.maximum(np.maximum(r, g), b)
-        cmin = np.minimum(np.minimum(r, g), b)
-        sat = np.where(cmax > 1e-4, (cmax - cmin) / np.maximum(cmax, 1e-4), 0.0)
-
-        if category == "car_livery":
-            # Glossy paint (saturated or bright) and dark reflective glass both reflect strongly
-            glass_boost = np.clip((0.28 - luma) / 0.28, 0.0, 1.0) * (1.0 - sat) * 36.0
-            paint_boost = sat * 24.0
-            spec = profile.spec_base + luma * profile.spec_luma_gain + paint_boost + glass_boost * 0.5
-            refl = profile.refl_base + luma * profile.refl_luma_gain + paint_boost * 0.8 + glass_boost
-            coat = profile.clearcoat_base + (0.5 * luma + 0.5 * sat) * profile.clearcoat_gain
-        elif category == "road_surface":
-            # Slightly higher sheen on darker smooth asphalt and bright icy patches
-            ice_boost = np.clip((luma - 0.65) / 0.35, 0.0, 1.0) * (1.0 - sat) * 55.0
-            spec = profile.spec_base + (1.0 - sat * 0.5) * luma * profile.spec_luma_gain + ice_boost
-            refl = profile.refl_base + (1.0 - sat * 0.6) * luma * profile.refl_luma_gain + ice_boost * 0.8
-            coat = profile.clearcoat_base + ice_boost * 0.6
-        elif category == "foliage_alpha":
-            mask = np.clip((a - 0.06) / 0.25, 0.0, 1.0)
-            spec = (profile.spec_base + luma * profile.spec_luma_gain) * mask
-            refl = (profile.refl_base + luma * profile.refl_luma_gain) * mask
-            coat = np.zeros_like(luma)
-        else:
-            # buildings_props: matte walls with mild sheen on bright metallic/glass areas
-            spec = profile.spec_base + luma * profile.spec_luma_gain
-            refl = profile.refl_base + luma * (1.0 - sat * 0.4) * profile.refl_luma_gain
-            coat = profile.clearcoat_base + np.clip((luma - 0.5) * 2.0, 0.0, 1.0) * profile.clearcoat_gain
-
-        out = np.empty((h, w, 4), dtype=np.float32)
-        out[:, :, 0] = np.clip(spec, 0.0, 255.0)
-        out[:, :, 1] = np.clip(refl, 0.0, 255.0)
-        out[:, :, 2] = np.clip(coat, 0.0, 255.0)
-        out[:, :, 3] = 255.0
-        return RGBAImage.from_numpy(out)
-
-    # Pure-Python path
-    src = image.data
-    n = w * h
-    out = bytearray(n * 4)
-    inv255 = 1.0 / 255.0
-
-    for i in range(n):
-        p = i * 4
-        r = src[p] * inv255
-        g = src[p + 1] * inv255
-        b = src[p + 2] * inv255
-        a = src[p + 3] * inv255
-
-        luma = 0.299 * r + 0.587 * g + 0.114 * b
-        cmax = r if r >= g else g
-        if b > cmax:
-            cmax = b
-        cmin = r if r <= g else g
-        if b < cmin:
-            cmin = b
-        sat = ((cmax - cmin) / cmax) if cmax > 1e-4 else 0.0
-
-        if category == "car_livery":
-            glass_boost = (max(0.0, min(1.0, (0.28 - luma) / 0.28))) * (1.0 - sat) * 36.0
-            paint_boost = sat * 24.0
-            spec = profile.spec_base + luma * profile.spec_luma_gain + paint_boost + glass_boost * 0.5
-            refl = profile.refl_base + luma * profile.refl_luma_gain + paint_boost * 0.8 + glass_boost
-            coat = profile.clearcoat_base + (0.5 * luma + 0.5 * sat) * profile.clearcoat_gain
-        elif category == "road_surface":
-            ice_boost = max(0.0, min(1.0, (luma - 0.65) / 0.35)) * (1.0 - sat) * 55.0
-            spec = profile.spec_base + (1.0 - sat * 0.5) * luma * profile.spec_luma_gain + ice_boost
-            refl = profile.refl_base + (1.0 - sat * 0.6) * luma * profile.refl_luma_gain + ice_boost * 0.8
-            coat = profile.clearcoat_base + ice_boost * 0.6
-        elif category == "foliage_alpha":
-            mask = max(0.0, min(1.0, (a - 0.06) / 0.25))
-            spec = (profile.spec_base + luma * profile.spec_luma_gain) * mask
-            refl = (profile.refl_base + luma * profile.refl_luma_gain) * mask
-            coat = 0.0
-        else:
-            spec = profile.spec_base + luma * profile.spec_luma_gain
-            refl = profile.refl_base + luma * (1.0 - sat * 0.4) * profile.refl_luma_gain
-            coat = profile.clearcoat_base + max(0.0, min(1.0, (luma - 0.5) * 2.0)) * profile.clearcoat_gain
-
-        out[p] = _clamp_byte(spec)
-        out[p + 1] = _clamp_byte(refl)
-        out[p + 2] = _clamp_byte(coat)
-        out[p + 3] = 255
-
-    return RGBAImage(w, h, out)
+    return generate_pbr_specular_map(
+        image,
+        category=category,
+        sub_profile=sub_profile,
+        wrap_x=wrap_x,
+        wrap_y=wrap_y,
+    )
 
 
 def process_texture(
@@ -928,6 +898,14 @@ def process_texture(
     has_alpha_cutout: Optional[bool] = None,
     scale: Optional[int] = None,
     max_size: int = 2048,
+    sub_profile: str = "",
+    hero_max_size: Optional[int] = None,
+    upscaler: str = "lanczos",
+    normal_backend: str = "scharr",
+    ai_model: Optional[Union[str, Path]] = None,
+    deepbump_model: Optional[Union[str, Path]] = None,
+    tile_size: int = 256,
+    tile_overlap: int = 16,
 ) -> Optional[UpscaleResult]:
     """Run the complete HD enhancement + material-map generation for one texture.
 
@@ -947,28 +925,80 @@ def process_texture(
     # 1. Color bleeding before upscaling on alpha-cutout textures to eliminate dark/white fringes
     pre = dilate_alpha_rgb(image) if is_alpha_cutout else image
 
-    # 2. Target resolution (2x or 4x, capped at max_size, exact aspect ratio)
-    out_w, out_h = compute_target_size(pre.width, pre.height, scale=scale, max_size=max_size)
+    # 2. Target resolution (2x or 4x, hero resolution tiering when configured, exact aspect ratio)
+    eff_max = compute_effective_max_size(
+        category,
+        sub_profile=sub_profile,
+        max_size=max_size,
+        hero_max_size=hero_max_size,
+    )
+    prefer_4x_up_to = max(256, eff_max // 4) if (hero_max_size is not None and is_hero_asset(category, sub_profile)) else 256
+    out_w, out_h = compute_target_size(
+        pre.width,
+        pre.height,
+        scale=scale,
+        max_size=eff_max,
+        prefer_4x_up_to=prefer_4x_up_to,
+    )
 
-    # 3. Detail-preserving Lanczos-3 upscale with periodic wrap for seamless tiles
-    upscaled = lanczos_resize(pre, out_w, out_h, wrap_x=wrap_x, wrap_y=wrap_y)
-
-    # 4. Faithful+ local contrast & subtle category-appropriate micro-grain
-    albedo = _sharpen_and_detail(
-        upscaled,
-        unsharp_amount=profile.unsharp_amount,
-        grain_amount=profile.grain_amount,
+    # 3. Upscale (Apple Silicon MPS ESRGAN / NCNN / Lanczos-3) with periodic wrap & alpha protection
+    upscaled, upscaler_used = upscale_image(
+        pre,
+        out_w,
+        out_h,
+        backend=upscaler,
         wrap_x=wrap_x,
         wrap_y=wrap_y,
-        preserve_alpha_cutout=is_alpha_cutout,
+        has_alpha_cutout=is_alpha_cutout,
+        ai_model=ai_model,
+        tile_size=tile_size,
+        tile_overlap=tile_overlap,
     )
+
+    # 4. Faithful+ local contrast & subtle micro-grain (AI super-res already provides crisp detail)
+    if upscaler_used == "lanczos":
+        albedo = _sharpen_and_detail(
+            upscaled,
+            unsharp_amount=profile.unsharp_amount,
+            grain_amount=profile.grain_amount,
+            wrap_x=wrap_x,
+            wrap_y=wrap_y,
+            preserve_alpha_cutout=is_alpha_cutout,
+        )
+    elif is_alpha_cutout:
+        # Preserve crisp antialiased alpha edge contrast without oversharpening AI RGB
+        albedo = _sharpen_and_detail(
+            upscaled,
+            unsharp_amount=0.0,
+            grain_amount=0.0,
+            wrap_x=wrap_x,
+            wrap_y=wrap_y,
+            preserve_alpha_cutout=True,
+        )
+    else:
+        albedo = upscaled
 
     # 5. Material maps (skip for sky_backdrop & ui_skip)
     normal_map: Optional[RGBAImage] = None
     specular_map: Optional[RGBAImage] = None
+    normal_used = "none"
     if profile.generate_material_maps:
-        normal_map = generate_normal_map(albedo, category=category, wrap_x=wrap_x, wrap_y=wrap_y)
-        specular_map = generate_specular_map(albedo, category=category)
+        normal_map, normal_used = generate_neural_normal_map(
+            albedo,
+            category=category,
+            sub_profile=sub_profile,
+            wrap_x=wrap_x,
+            wrap_y=wrap_y,
+            backend=normal_backend,
+            deepbump_model=deepbump_model,
+        )
+        specular_map = generate_specular_map(
+            albedo,
+            category=category,
+            sub_profile=sub_profile,
+            wrap_x=wrap_x,
+            wrap_y=wrap_y,
+        )
 
     return UpscaleResult(
         albedo=albedo,
@@ -977,13 +1007,70 @@ def process_texture(
         src_size=(image.width, image.height),
         dst_size=(out_w, out_h),
         category=category,
+        sub_profile=sub_profile,
+        upscaler_used=upscaler_used,
+        normal_backend_used=normal_used,
     )
 
 
-def save_upscale_result(result: UpscaleResult, output_dir: Path, key: str) -> Dict[str, str]:
-    """Save `<key>.png`, and (when present) `<key>_n.png` and `<key>_s.png`."""
+def save_upscale_result(
+    result: UpscaleResult,
+    output_dir: Path,
+    key: str,
+    output_format: str = "png",
+    bc7_quality: str = "fast",
+    bc7_backend: str = "auto",
+    bc7_threads: int = 0,
+) -> Dict[str, str]:
+    """Save `<key>.<ext>`, and (when present) `<key>_n.<ext>` and `<key>_s.<ext>`.
+
+    `output_format`: `'png'` (default) or `'dds'` / `'bc7'` (DX10 BC7 with full mipmap chain).
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
+    fmt = (output_format or "png").lower()
     written: Dict[str, str] = {}
+
+    if fmt in ("dds", "bc7"):
+        written["albedo"] = str(
+            save_dds_bc7(
+                result.albedo,
+                output_dir / f"{key}.dds",
+                is_normal_map=False,
+                is_specular_map=False,
+                quality=bc7_quality,
+                backend=bc7_backend,
+                num_threads=bc7_threads,
+            )
+        )
+        if result.normal is not None:
+            written["normal"] = str(
+                save_dds_bc7(
+                    result.normal,
+                    output_dir / f"{key}_n.dds",
+                    is_normal_map=True,
+                    is_specular_map=False,
+                    quality=bc7_quality,
+                    backend=bc7_backend,
+                    num_threads=bc7_threads,
+                )
+            )
+        if result.specular is not None:
+            written["specular"] = str(
+                save_dds_bc7(
+                    result.specular,
+                    output_dir / f"{key}_s.dds",
+                    is_normal_map=False,
+                    is_specular_map=True,
+                    quality=bc7_quality,
+                    backend=bc7_backend,
+                    num_threads=bc7_threads,
+                )
+            )
+        return written
+
+    if fmt != "png":
+        raise ValueError(f"Unsupported output format '{output_format}' (expected png, dds, or bc7)")
+
     written["albedo"] = str(save_png(result.albedo, output_dir / f"{key}.png"))
     if result.normal is not None:
         written["normal"] = str(save_png(result.normal, output_dir / f"{key}_n.png"))
@@ -1006,6 +1093,39 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     )
     parser.add_argument("--scale", type=int, default=None, help="Upscale factor (default: auto 2x/4x)")
     parser.add_argument("--max-size", type=int, default=2048, help="Max output dimension in pixels (default: 2048)")
+    parser.add_argument(
+        "--hero-max-size",
+        type=int,
+        default=2048,
+        help="Max output dimension for hero car_livery/road_surface assets (default: 2048)",
+    )
+    parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("png", "dds", "bc7"),
+        default="png",
+        help="Output texture format (png, dds, or bc7; default: png)",
+    )
+    parser.add_argument(
+        "--upscaler",
+        choices=UPSCALER_BACKENDS,
+        default="auto",
+        help="Super-resolution backend (default: auto)",
+    )
+    parser.add_argument(
+        "--normal-backend",
+        choices=NORMAL_BACKENDS,
+        default="auto",
+        help="Normal map generator backend (default: auto)",
+    )
+    parser.add_argument("--ai-model", default=None, help="Path to ESRGAN .pth model checkpoint")
+    parser.add_argument("--deepbump-model", default=None, help="Path to deepbump256.onnx model")
+    parser.add_argument(
+        "--bc7-quality",
+        choices=BC7_QUALITY_CHOICES,
+        default="fast",
+        help="BC7 compression quality preset (default: fast)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     in_path = Path(args.input)
@@ -1019,11 +1139,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if args.category is None:
             cls: ClassificationResult = classify_texture(png.name, str(png.parent), image=img)
             cat = cls.category
+            sub_profile = cls.sub_profile
             seamless = cls.seamless
             alpha_cutout = cls.has_alpha_cutout
             key = cls.key
         else:
             cat = args.category
+            sub_profile = ""
             seamless = None
             alpha_cutout = None
             key = png.stem.lower()
@@ -1035,15 +1157,31 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             has_alpha_cutout=alpha_cutout,
             scale=args.scale,
             max_size=args.max_size,
+            sub_profile=sub_profile,
+            hero_max_size=args.hero_max_size,
+            upscaler=args.upscaler,
+            normal_backend=args.normal_backend,
+            ai_model=args.ai_model,
+            deepbump_model=args.deepbump_model,
         )
         if res is None:
             skipped += 1
             print(f"[skip] {key} ({cat})")
             continue
-        written = save_upscale_result(res, out_dir, key)
+        written = save_upscale_result(
+            res,
+            out_dir,
+            key,
+            output_format=args.output_format,
+            bc7_quality=args.bc7_quality,
+        )
         processed += 1
         maps = "+".join(written.keys())
-        print(f"[ok]   {key} ({cat}) {res.src_size[0]}x{res.src_size[1]} -> {res.dst_size[0]}x{res.dst_size[1]} [{maps}]")
+        sub_txt = f"/{res.sub_profile}" if res.sub_profile else ""
+        print(
+            f"[ok]   {key} ({cat}{sub_txt}) {res.src_size[0]}x{res.src_size[1]} -> "
+            f"{res.dst_size[0]}x{res.dst_size[1]} [{maps}] ({res.upscaler_used}/{res.normal_backend_used})"
+        )
 
     print(f"Done: {processed} processed, {skipped} skipped.")
     return 0

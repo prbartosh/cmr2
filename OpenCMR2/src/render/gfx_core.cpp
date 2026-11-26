@@ -235,7 +235,7 @@ int Gfx_BytesPerPixel(int format)
 
 size_t Gfx_LevelSize(int format, int width, int height, LONG *pitch)
 {
-    if (format == GFX_FORMAT_BC1 || format == GFX_FORMAT_BC3) {
+    if (format == GFX_FORMAT_BC1 || format == GFX_FORMAT_BC3 || format == GFX_FORMAT_BC7) {
         int blockBytes = format == GFX_FORMAT_BC1 ? 8 : 16;
         int bw = (width + 3) / 4, bh = (height + 3) / 4;
         if (pitch)
@@ -275,6 +275,10 @@ extern "C" void Gfx_GetPixelFormat(int format, GfxPixelFormat *out)
         out->flags = GFX_PF_FOURCC;
         out->fourCC = MAKEFOURCC('D', 'X', 'T', '5');
         break;
+    case GFX_FORMAT_BC7:
+        out->flags = GFX_PF_FOURCC;
+        out->fourCC = MAKEFOURCC('D', 'X', '1', '0');
+        break;
     case GFX_FORMAT_BUMP_DUDVL:
         out->flags = GFX_PF_BUMP;
         out->bitsPerPixel = 24;
@@ -283,6 +287,11 @@ extern "C" void Gfx_GetPixelFormat(int format, GfxPixelFormat *out)
         out->blueMask = 0xff0000;
         break;
     }
+}
+
+bool Gfx_SupportsBC7(void)
+{
+    return s_executor == NULL || s_executor->SupportsBC7();
 }
 
 // ---- renderer choice -------------------------------------------------------------------
@@ -525,6 +534,15 @@ extern "C" void Gfx_SetDistanceFade(float start, float end)
     Touch();
 }
 
+extern "C" void Gfx_SetWeatherState(int kind, float intensity)
+{
+    if (s_state.weatherKind == kind && s_state.weatherIntensity == intensity)
+        return;
+    s_state.weatherKind = kind;
+    s_state.weatherIntensity = intensity;
+    Touch();
+}
+
 // ---- fixed-function state --------------------------------------------------------------
 
 extern "C" void Gfx_SetTransform(int type, const GfxMatrix *matrix)
@@ -747,9 +765,10 @@ extern "C" GfxTexture *Gfx_CreateTexture(int width, int height, int format, int 
 {
     if (width <= 0 || height <= 0)
         return NULL;
-    // Compressed and bump textures keep one level: the original's mip
+    // Compressed (BC1/BC3) and bump textures keep one level: the original's mip
     // generation (a DirectDraw stretch blit) only worked on plain RGB.
-    if (format != GFX_FORMAT_BGRX8 && format != GFX_FORMAT_BGRA8)
+    // BC7 overrides carry pre-generated GPU mipmap chains straight from DDS DX10.
+    if (format != GFX_FORMAT_BGRX8 && format != GFX_FORMAT_BGRA8 && format != GFX_FORMAT_BC7)
         mipLevels = 1;
     if (flags & (GFX_TEXTURE_RENDER_TARGET | GFX_TEXTURE_CUBE))
         mipLevels = 1;
@@ -1003,7 +1022,7 @@ extern "C" void Gfx_CopyTexture(GfxTexture *dst, GfxTexture *src)
         dst->dirty = true;
         return;
     }
-    if (dst->format == GFX_FORMAT_BC1 || dst->format == GFX_FORMAT_BC3) {
+    if (dst->format == GFX_FORMAT_BC1 || dst->format == GFX_FORMAT_BC3 || dst->format == GFX_FORMAT_BC7) {
         Sys_Log("gfx: cannot convert a texture to a compressed format");
         return;
     }

@@ -2654,6 +2654,8 @@ void Game_QueueVisibleSectorNodes(int param1);
 void Game_DrawDeferredObjects(void);
 extern FixMatrix g_cubeFaceViewMatrix;
 GfxMatrix *FixMatrix_ToFloat(GfxMatrix *pOut, FixMatrix *pIn);
+extern BYTE StageObject_GetViewWeatherStateByte(int index);
+extern int StageObject_GetViewWeatherField54(int index);
 
 // PORT: the original cut the scenery at the far plane, so whatever entered
 // the view distance appeared at once on the horizon. Over the last 15% of the
@@ -2674,6 +2676,13 @@ static void Game_BeginDistanceFade(void)
         startFactor = (int)(fadeStart * 65536.0f + 0.5f);
     }
     int start = FixMul(end, startFactor);
+
+    int weatherKind = (int)StageObject_GetViewWeatherStateByte(0);
+    int weatherRaw = StageObject_GetViewWeatherField54(0);
+    float weatherIntensity = weatherRaw > 0 ? (float)weatherRaw / 65536.0f : 0.0f;
+    if (weatherIntensity > 1.0f)
+        weatherIntensity = 1.0f;
+    Gfx_SetWeatherState(weatherKind, weatherIntensity);
 
     Gfx_CaptureBackdrop();
     Gfx_SetDistanceFade(X87S_MUL(X87S_FILD(float, start), CGraphics::m_oneOver65536),
@@ -2797,6 +2806,7 @@ int Game_DrawSceneViewport(SceneNode *pRoot, SceneNode *pCamera, void *pRect, in
                 Game_DrawDeferredObjects();
             }
             Gfx_SetDistanceFade(0.0f, 0.0f);
+            Gfx_SetWeatherState(0, 0.0f);
         } else {
             Game_DrawWorldMeshNodesAnd2DLayer();
         }
