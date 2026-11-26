@@ -83,7 +83,7 @@ inline std::string Format(const lobby::Code &code)
     return text;
 }
 
-} // namespace joincode
-} // namespace net
+}
+}
 
 #endif

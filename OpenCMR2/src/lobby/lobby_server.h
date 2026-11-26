@@ -41,6 +41,6 @@ private:
     std::unique_ptr<State> state;
 };
 
-} // namespace lobby
+}
 
 #endif

@@ -38,6 +38,7 @@ enum Kind : uint8_t {
     KIND_BOUND,
     KIND_PUNCH,
     KIND_FAILURE,
+    KIND_CHALLENGE,
 };
 
 enum Failure : uint8_t {
@@ -92,18 +93,21 @@ struct Register {
     static constexpr Kind kKind = KIND_REGISTER;
     static constexpr bool kRequest = true;
     uint32_t nonce = 0;
+    Key cookie = {};
     Guid instance = {};
     Endpoint local;
 
     void Write(Writer &w) const
     {
         w.U32(nonce);
+        WriteArray(w, cookie);
         WriteArray(w, instance);
         WriteEndpoint(w, local);
     }
     void Read(Reader &r)
     {
         nonce = r.U32();
+        ReadArray(r, cookie);
         ReadArray(r, instance);
         local = ReadEndpoint(r);
     }
@@ -134,6 +138,7 @@ struct Refresh {
     static constexpr Kind kKind = KIND_REFRESH;
     static constexpr bool kRequest = true;
     uint32_t nonce = 0;
+    Key cookie = {};
     Code code = {};
     Key secret = {};
     Endpoint local;
@@ -141,6 +146,7 @@ struct Refresh {
     void Write(Writer &w) const
     {
         w.U32(nonce);
+        WriteArray(w, cookie);
         WriteArray(w, code);
         WriteArray(w, secret);
         WriteEndpoint(w, local);
@@ -148,6 +154,7 @@ struct Refresh {
     void Read(Reader &r)
     {
         nonce = r.U32();
+        ReadArray(r, cookie);
         ReadArray(r, code);
         ReadArray(r, secret);
         local = ReadEndpoint(r);
@@ -185,18 +192,21 @@ struct Resolve {
     static constexpr Kind kKind = KIND_RESOLVE;
     static constexpr bool kRequest = true;
     uint32_t nonce = 0;
+    Key cookie = {};
     Code code = {};
     Endpoint local;
 
     void Write(Writer &w) const
     {
         w.U32(nonce);
+        WriteArray(w, cookie);
         WriteArray(w, code);
         WriteEndpoint(w, local);
     }
     void Read(Reader &r)
     {
         nonce = r.U32();
+        ReadArray(r, cookie);
         ReadArray(r, code);
         local = ReadEndpoint(r);
     }
@@ -251,16 +261,19 @@ struct Relay {
     static constexpr Kind kKind = KIND_RELAY;
     static constexpr bool kRequest = true;
     uint32_t nonce = 0;
+    Key cookie = {};
     Code code = {};
 
     void Write(Writer &w) const
     {
         w.U32(nonce);
+        WriteArray(w, cookie);
         WriteArray(w, code);
     }
     void Read(Reader &r)
     {
         nonce = r.U32();
+        ReadArray(r, cookie);
         ReadArray(r, code);
     }
 };
@@ -352,11 +365,29 @@ struct Failed {
     }
 };
 
+struct Challenge {
+    static constexpr Kind kKind = KIND_CHALLENGE;
+    static constexpr bool kRequest = false;
+    uint32_t nonce = 0;
+    Key cookie = {};
+
+    void Write(Writer &w) const
+    {
+        w.U32(nonce);
+        WriteArray(w, cookie);
+    }
+    void Read(Reader &r)
+    {
+        nonce = r.U32();
+        ReadArray(r, cookie);
+    }
+};
+
 inline bool Peek(const uint8_t *data, size_t size, Kind &kind)
 {
     if (data == nullptr || size < kHeaderSize || size > kMaxDatagram || memcmp(data, kMagic, sizeof(kMagic)) != 0)
         return false;
-    if (data[4] < KIND_REGISTER || data[4] > KIND_FAILURE)
+    if (data[4] < KIND_REGISTER || data[4] > KIND_CHALLENGE)
         return false;
     kind = (Kind)data[4];
     return true;
@@ -388,7 +419,7 @@ inline bool Decode(const uint8_t *data, size_t size, Message &message)
     return r.ok();
 }
 
-} // namespace lobby
-} // namespace net
+}
+}
 
 #endif
