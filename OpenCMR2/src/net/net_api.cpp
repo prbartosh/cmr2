@@ -163,3 +163,24 @@ extern "C" HRESULT Net_Receive(NetPlayerID *from, NetPlayerID *to, void *data, D
 {
     return s_session ? s_session->Receive(from, to, data, dataSize) : NET_ERR_NOMESSAGES;
 }
+
+extern "C" NetCodeStatus Net_GetHostCode(char *code, DWORD size)
+{
+    if (code != NULL && size > 0)
+        code[0] = '\0';
+    return NET_CODE_NO_LOBBY;
+}
+
+extern "C" NetCodeStatus Net_FindByCode(const char *)
+{
+    return NET_CODE_NO_LOBBY;
+}
+
+extern "C" NetCodeStatus Net_GetCodeSession(NetGuid *, BOOL *)
+{
+    return NET_CODE_IDLE;
+}
+
+extern "C" void Net_CancelFind(void)
+{
+}

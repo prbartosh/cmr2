@@ -259,6 +259,10 @@ target_include_directories(opencmr2_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 find_package(Threads REQUIRED)
 target_link_libraries(opencmr2_net PUBLIC enet Threads::Threads)
 
+if(NOT WIN32 AND NOT ANDROID)
+    add_subdirectory(lobby)
+endif()
+
 # ---- platform subsystems ---------------------------------------------------------
 set(POTRACE_DIR ${PROJECT_SOURCE_DIR}/third_party/potrace)
 add_library(opencmr2_potrace STATIC ${POTRACE_DIR}/curve.c ${POTRACE_DIR}/trace.c
