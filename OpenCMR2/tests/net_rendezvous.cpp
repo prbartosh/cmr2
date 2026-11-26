@@ -1385,6 +1385,50 @@ void SlowLobbyResolution()
     ServesWhileLobbyResolves("nonexistent.invalid", nullptr);
 }
 
+void ReleaseResolverSoon(std::thread &release)
+{
+    release = std::thread([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        s_resolverRelease = true;
+    });
+}
+
+void ShutdownWhileResolving()
+{
+    s_resolverRelease = false;
+    s_resolverCalls = 0;
+    std::unique_ptr<net::Session> host = NamedLobbySession("lobby.example", BlockingResolve);
+    Host(*host);
+    CHECK(WaitFor([] { return s_resolverBlocked.load(); }));
+    std::thread release;
+    ReleaseResolverSoon(release);
+    host.reset();
+    release.join();
+    CHECK(!s_resolverBlocked);
+    CHECK(s_resolverCalls == 1);
+}
+
+void AbandonWhileResolving()
+{
+    s_resolverRelease = false;
+    s_resolverCalls = 0;
+    std::unique_ptr<net::Session> host = NamedLobbySession("lobby.example", BlockingResolve);
+    Host(*host);
+    CHECK(WaitFor([] { return s_resolverBlocked.load(); }));
+    std::thread release;
+    ReleaseResolverSoon(release);
+    host->Abandon();
+    release.join();
+    CHECK(!s_resolverBlocked);
+    CHECK(s_resolverCalls == 1);
+    CHECK(host->Start() == NET_OK);
+    Host(*host);
+    CHECK(WaitFor([] { return s_resolverCalls >= 2; }));
+    std::string code;
+    NetCodeStatus status = host->HostCode(&code);
+    CHECK(status == NET_CODE_CONTACTING || status == NET_CODE_LOBBY_UNREACHABLE);
+}
+
 void LiteralLobbyAddress()
 {
     FakeLobby fake;
@@ -1429,6 +1473,8 @@ int main()
     AbandonIsSilent();
     MigrationRegisters();
     SlowLobbyResolution();
+    ShutdownWhileResolving();
+    AbandonWhileResolving();
     LiteralLobbyAddress();
 
     if (s_failures != 0) {

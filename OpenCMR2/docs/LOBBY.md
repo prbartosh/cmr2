@@ -173,3 +173,9 @@ functions (`Net_GetHostCode`, `Net_FindByCode` in `src/port/net.h`) return
 loopback and covers registration, resolve and introduction, the local
 address rule, refresh, expiry, the rate limits and caps, relays (binding,
 rebinding, forwarding, bandwidth, idle expiry) and random input.
+
+`tests/net_lobby_e2e.cpp` (`ctest -R net_lobby_e2e`) runs real sessions
+against the server on the loopback: a direct and a relayed join by code with
+messages both ways, two guests on one code, code input variants and wrong or
+malformed codes, unregistering on close, an unreachable lobby and the lookup
+rate limit.

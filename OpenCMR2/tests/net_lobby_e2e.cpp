@@ -328,10 +328,10 @@ void CodeVariants()
         host = MakeSession(*lobby, net::RelayMode::Auto);
         hosted = Host(*host);
         code = HostCode(*host);
-        if (code.find_first_of("01") != std::string::npos)
+        if (code.find('0') != std::string::npos)
             break;
     }
-    CHECK(code.find_first_of("01") != std::string::npos);
+    CHECK(code.find('0') != std::string::npos);
     std::unique_ptr<net::Session> guest = MakeSession(*lobby, net::RelayMode::Never);
 
     std::string lower = code;
