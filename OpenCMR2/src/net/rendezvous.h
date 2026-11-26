@@ -18,7 +18,9 @@ enum class RelayMode { Auto, Always, Never };
 
 bool IsPrivateAddress(uint32_t address);
 bool IsLoopbackAddress(uint32_t address);
+bool IsPublicAddress(uint32_t address);
 bool ReplacesPath(bool currentRelayed, bool currentFresh, bool incomingRelayed);
+bool Elapsed(uint32_t now, uint32_t since, uint32_t ms);
 
 class Rendezvous {
 public:
@@ -27,7 +29,9 @@ public:
     Rendezvous(Sender sender, RelayMode relayMode, std::mt19937_64 &rng);
 
     void SetLobby(const lobby::Endpoint &lobby, const lobby::Endpoint &local);
+    void LobbyUnresolved();
     bool NeedsLobby() const;
+    bool LobbyUnreachable() const;
 
     void Host(const lobby::Guid &instance);
     void StopHosting(bool notifyLobby);
@@ -61,13 +65,20 @@ private:
         uint32_t sentAt = 0;
     };
 
-    void Send(const lobby::Endpoint &to, const std::vector<uint8_t> &data);
+    bool Send(const lobby::Endpoint &to, const std::vector<uint8_t> &data);
+    bool SendRegister();
+    bool SendRefresh();
+    bool SendResolve();
+    bool SendRelay();
     uint32_t NewNonce();
+    bool LobbyPinned() const;
+    void UseLobby(const lobby::Endpoint &lobby);
     void TickHost(uint32_t now);
     void TickFind(uint32_t now);
     bool TickBind(RelayLink &link, uint32_t now);
     bool HandleLobby(lobby::Kind kind, const uint8_t *data, size_t size, uint32_t now);
     bool HandleFailure(const lobby::Failed &message);
+    bool HandleChallenge(const lobby::Challenge &message, uint32_t now);
     bool HandleBound(const uint8_t *data, size_t size, const lobby::Endpoint &from);
     bool Introduce(const lobby::Introduce &message, uint32_t now);
     bool OfferRelay(const lobby::RelayOffer &message);
@@ -82,7 +93,9 @@ private:
     RelayMode relayMode;
     std::mt19937_64 &rng;
     lobby::Endpoint lobbyEndpoint;
+    lobby::Endpoint pendingLobby;
     lobby::Endpoint localEndpoint;
+    lobby::Key cookie = {};
 
     bool hosting = false;
     lobby::Guid hostInstance = {};
@@ -90,12 +103,15 @@ private:
     bool hostUnreachable = false;
     uint32_t registerNonce = 0;
     int registerAttempts = 0;
+    int registerChallenges = 0;
     bool registerDue = false;
     uint32_t registerSentAt = 0;
     lobby::Code hostCode = {};
     lobby::Key hostSecret = {};
     uint32_t refreshNonce = 0;
     uint32_t refreshSentAt = 0;
+    int refreshChallenges = 0;
+    int refreshMisses = 0;
     std::deque<uint32_t> introduceTimes;
     std::deque<PunchJob> punches;
     std::deque<RelayLink> hostRelays;
@@ -104,14 +120,18 @@ private:
     lobby::Code findCode = {};
     uint32_t resolveNonce = 0;
     int resolveAttempts = 0;
+    int resolveChallenges = 0;
     bool resolveDue = false;
     uint32_t resolveSentAt = 0;
+    bool contactStarted = false;
+    uint32_t contactSince = 0;
     lobby::Guid findInstance = {};
     std::vector<lobby::Endpoint> direct;
     uint32_t resolvedAt = 0;
     RelayPhase relayPhase = RelayPhase::None;
     uint32_t relayNonce = 0;
     int relayAttempts = 0;
+    int relayChallenges = 0;
     uint32_t relaySentAt = 0;
     RelayLink guestRelay;
     lobby::Endpoint foundAt;

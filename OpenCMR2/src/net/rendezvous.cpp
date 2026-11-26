@@ -24,11 +24,9 @@ const uint32_t kFindTimeoutMs = 15000;
 const uint32_t kBindIntervalMs = 500;
 const int kMaxBindTries = 10;
 const size_t kMaxHostRelays = 8;
-
-bool Elapsed(uint32_t now, uint32_t since, uint32_t ms)
-{
-    return (uint32_t)(now - since) >= ms;
-}
+const int kMaxChallenges = 3;
+const int kMaxRefreshMisses = 3;
+const uint32_t kContactTimeoutMs = 10000;
 
 bool UsableLocal(const lobby::Endpoint &candidate, const lobby::Endpoint &observed)
 {
@@ -51,9 +49,24 @@ bool IsLoopbackAddress(uint32_t address)
     return b[0] == 127;
 }
 
+bool IsPublicAddress(uint32_t address)
+{
+    uint8_t b[4];
+    memcpy(b, &address, sizeof(b));
+    bool linkLocal = b[0] == 169 && b[1] == 254;
+    bool shared = b[0] == 100 && (b[1] & 0xC0) == 64;
+    return !IsPrivateAddress(address) && !IsLoopbackAddress(address) && !linkLocal && !shared;
+}
+
 bool ReplacesPath(bool currentRelayed, bool currentFresh, bool incomingRelayed)
 {
     return !incomingRelayed || currentRelayed || !currentFresh;
+}
+
+bool Elapsed(uint32_t now, uint32_t since, uint32_t ms)
+{
+    int32_t passed = (int32_t)(now - since);
+    return passed >= 0 && (uint32_t)passed >= ms;
 }
 
 Rendezvous::Rendezvous(Sender sender, RelayMode relayMode, std::mt19937_64 &rng)
@@ -61,10 +74,52 @@ Rendezvous::Rendezvous(Sender sender, RelayMode relayMode, std::mt19937_64 &rng)
 {
 }
 
-void Rendezvous::Send(const lobby::Endpoint &to, const std::vector<uint8_t> &data)
+bool Rendezvous::Send(const lobby::Endpoint &to, const std::vector<uint8_t> &data)
 {
-    if (to.Valid() && sender)
-        sender(to, data);
+    if (!to.Valid() || !sender)
+        return false;
+    sender(to, data);
+    return true;
+}
+
+bool Rendezvous::SendRegister()
+{
+    lobby::Register message;
+    message.nonce = registerNonce;
+    message.cookie = cookie;
+    message.instance = hostInstance;
+    message.local = localEndpoint;
+    return Send(lobbyEndpoint, lobby::Encode(message));
+}
+
+bool Rendezvous::SendRefresh()
+{
+    lobby::Refresh message;
+    message.nonce = refreshNonce;
+    message.cookie = cookie;
+    message.code = hostCode;
+    message.secret = hostSecret;
+    message.local = localEndpoint;
+    return Send(lobbyEndpoint, lobby::Encode(message));
+}
+
+bool Rendezvous::SendResolve()
+{
+    lobby::Resolve message;
+    message.nonce = resolveNonce;
+    message.cookie = cookie;
+    message.code = findCode;
+    message.local = localEndpoint;
+    return Send(lobbyEndpoint, lobby::Encode(message));
+}
+
+bool Rendezvous::SendRelay()
+{
+    lobby::Relay message;
+    message.nonce = relayNonce;
+    message.cookie = cookie;
+    message.code = findCode;
+    return Send(lobbyEndpoint, lobby::Encode(message));
 }
 
 uint32_t Rendezvous::NewNonce()
@@ -74,11 +129,22 @@ uint32_t Rendezvous::NewNonce()
 
 void Rendezvous::SetLobby(const lobby::Endpoint &lobby, const lobby::Endpoint &local)
 {
-    bool changed = lobby != lobbyEndpoint;
-    lobbyEndpoint = lobby;
     localEndpoint = local;
-    if (!changed || !lobby.Valid())
+    if (!lobby.Valid() || lobby == lobbyEndpoint) {
+        pendingLobby = lobby::Endpoint();
         return;
+    }
+    if (LobbyPinned())
+        pendingLobby = lobby;
+    else
+        UseLobby(lobby);
+}
+
+void Rendezvous::UseLobby(const lobby::Endpoint &lobby)
+{
+    lobbyEndpoint = lobby;
+    pendingLobby = lobby::Endpoint();
+    cookie = {};
     if (hosting && !registered) {
         registerAttempts = 0;
         hostUnreachable = false;
@@ -90,9 +156,35 @@ void Rendezvous::SetLobby(const lobby::Endpoint &lobby, const lobby::Endpoint &l
     }
 }
 
+bool Rendezvous::LobbyPinned() const
+{
+    if (!lobbyEndpoint.Valid())
+        return false;
+    return (registered && refreshMisses < kMaxRefreshMisses) || Finding();
+}
+
+void Rendezvous::LobbyUnresolved()
+{
+    if (lobbyEndpoint.Valid())
+        return;
+    if (hosting && !registered)
+        hostUnreachable = true;
+    if (findStatus == NET_CODE_CONTACTING)
+        FinishFind(NET_CODE_LOBBY_UNREACHABLE);
+}
+
 bool Rendezvous::NeedsLobby() const
 {
     return hosting || findStatus == NET_CODE_CONTACTING || Finding();
+}
+
+bool Rendezvous::LobbyUnreachable() const
+{
+    if (findStatus == NET_CODE_LOBBY_UNREACHABLE)
+        return true;
+    if (!hosting)
+        return false;
+    return registered ? refreshMisses >= kMaxRefreshMisses : hostUnreachable;
 }
 
 void Rendezvous::Host(const lobby::Guid &instance)
@@ -105,7 +197,9 @@ void Rendezvous::Host(const lobby::Guid &instance)
     hostUnreachable = false;
     registerNonce = NewNonce();
     registerAttempts = 0;
+    registerChallenges = 0;
     registerDue = true;
+    refreshMisses = 0;
 }
 
 void Rendezvous::StopHosting(bool notifyLobby)
@@ -121,8 +215,11 @@ void Rendezvous::StopHosting(bool notifyLobby)
     hostUnreachable = false;
     registerNonce = 0;
     registerAttempts = 0;
+    registerChallenges = 0;
     registerDue = false;
     refreshNonce = 0;
+    refreshChallenges = 0;
+    refreshMisses = 0;
     hostInstance = {};
     hostCode = {};
     hostSecret = {};
@@ -136,6 +233,8 @@ NetCodeStatus Rendezvous::HostStatus(lobby::Code *code) const
     if (!hosting)
         return NET_CODE_IDLE;
     if (registered) {
+        if (refreshMisses >= kMaxRefreshMisses)
+            return NET_CODE_LOBBY_UNREACHABLE;
         if (code != nullptr)
             *code = hostCode;
         return NET_CODE_READY;
@@ -150,6 +249,7 @@ void Rendezvous::Find(const lobby::Code &code)
     findCode = code;
     resolveNonce = NewNonce();
     resolveAttempts = 0;
+    resolveChallenges = 0;
     resolveDue = true;
 }
 
@@ -159,12 +259,16 @@ void Rendezvous::CancelFind()
     findCode = {};
     resolveNonce = 0;
     resolveAttempts = 0;
+    resolveChallenges = 0;
     resolveDue = false;
+    contactStarted = false;
+    contactSince = 0;
     findInstance = {};
     direct.clear();
     relayPhase = RelayPhase::None;
     relayNonce = 0;
     relayAttempts = 0;
+    relayChallenges = 0;
     guestRelay = RelayLink();
     foundAt = lobby::Endpoint();
     foundRelayed = false;
@@ -195,6 +299,8 @@ void Rendezvous::FinishFind(NetCodeStatus status)
 
 void Rendezvous::Tick(uint32_t now)
 {
+    if (pendingLobby.Valid() && !LobbyPinned())
+        UseLobby(pendingLobby);
     TickHost(now);
     TickFind(now);
 }
@@ -205,26 +311,19 @@ void Rendezvous::TickHost(uint32_t now)
         return;
     if (!registered) {
         uint32_t interval = hostUnreachable ? kSlowRetryMs : kRetryMs;
-        if (registerDue || Elapsed(now, registerSentAt, interval)) {
-            if (registerAttempts >= kMaxAttempts)
+        if ((registerDue || Elapsed(now, registerSentAt, interval)) && SendRegister()) {
+            if (++registerAttempts > kMaxAttempts)
                 hostUnreachable = true;
-            lobby::Register message;
-            message.nonce = registerNonce;
-            message.instance = hostInstance;
-            message.local = localEndpoint;
-            Send(lobbyEndpoint, lobby::Encode(message));
-            registerAttempts++;
+            registerChallenges = 0;
             registerSentAt = now;
             registerDue = false;
         }
     } else if (Elapsed(now, refreshSentAt, kRefreshMs)) {
-        lobby::Refresh message;
+        if (refreshNonce != 0 && refreshMisses < kMaxRefreshMisses)
+            refreshMisses++;
         refreshNonce = NewNonce();
-        message.nonce = refreshNonce;
-        message.code = hostCode;
-        message.secret = hostSecret;
-        message.local = localEndpoint;
-        Send(lobbyEndpoint, lobby::Encode(message));
+        refreshChallenges = 0;
+        SendRefresh();
         refreshSentAt = now;
     }
 
@@ -268,19 +367,25 @@ bool Rendezvous::TickBind(RelayLink &link, uint32_t now)
 void Rendezvous::TickFind(uint32_t now)
 {
     if (findStatus == NET_CODE_CONTACTING) {
+        if (!contactStarted) {
+            contactStarted = true;
+            contactSince = now;
+        }
+        if (Elapsed(now, contactSince, kContactTimeoutMs)) {
+            FinishFind(NET_CODE_LOBBY_UNREACHABLE);
+            return;
+        }
         if (resolveDue || Elapsed(now, resolveSentAt, kRetryMs)) {
             if (resolveAttempts >= kMaxAttempts) {
                 FinishFind(NET_CODE_LOBBY_UNREACHABLE);
                 return;
             }
-            lobby::Resolve message;
-            message.nonce = resolveNonce;
-            message.code = findCode;
-            message.local = localEndpoint;
-            Send(lobbyEndpoint, lobby::Encode(message));
-            resolveAttempts++;
-            resolveSentAt = now;
-            resolveDue = false;
+            if (SendResolve()) {
+                resolveAttempts++;
+                resolveChallenges = 0;
+                resolveSentAt = now;
+                resolveDue = false;
+            }
         }
         return;
     }
@@ -296,12 +401,9 @@ void Rendezvous::TickFind(uint32_t now)
     if (relayPhase == RelayPhase::Requested && Elapsed(now, relaySentAt, kRetryMs)) {
         if (relayAttempts >= kMaxAttempts) {
             AbandonRelay();
-        } else {
-            lobby::Relay message;
-            message.nonce = relayNonce;
-            message.code = findCode;
-            Send(lobbyEndpoint, lobby::Encode(message));
+        } else if (SendRelay()) {
             relayAttempts++;
+            relayChallenges = 0;
             relaySentAt = now;
         }
     } else if (relayPhase == RelayPhase::Assigned && !TickBind(guestRelay, now)) {
@@ -314,11 +416,8 @@ void Rendezvous::RequestRelay(uint32_t now)
     relayPhase = RelayPhase::Requested;
     relayNonce = NewNonce();
     findStatus = NET_CODE_RELAYING;
-    lobby::Relay message;
-    message.nonce = relayNonce;
-    message.code = findCode;
-    Send(lobbyEndpoint, lobby::Encode(message));
-    relayAttempts = 1;
+    relayAttempts = SendRelay() ? 1 : 0;
+    relayChallenges = 0;
     relaySentAt = now;
 }
 
@@ -365,11 +464,16 @@ bool Rendezvous::HandleLobby(lobby::Kind kind, const uint8_t *data, size_t size,
         if (!lobby::Decode(data, size, m) || !registered || refreshNonce == 0 || m.nonce != refreshNonce)
             return false;
         refreshNonce = 0;
+        refreshMisses = 0;
         return true;
     }
     case lobby::KIND_FAILURE: {
         lobby::Failed m;
         return lobby::Decode(data, size, m) && m.nonce != 0 && HandleFailure(m);
+    }
+    case lobby::KIND_CHALLENGE: {
+        lobby::Challenge m;
+        return lobby::Decode(data, size, m) && m.nonce != 0 && HandleChallenge(m, now);
     }
     case lobby::KIND_RESOLVED: {
         lobby::Resolved m;
@@ -421,6 +525,7 @@ bool Rendezvous::HandleFailure(const lobby::Failed &m)
     }
     if (registered && m.nonce == refreshNonce) {
         refreshNonce = 0;
+        refreshMisses = 0;
         if (m.reason == lobby::FAILURE_UNKNOWN_SESSION)
             Reregister();
         return true;
@@ -441,6 +546,41 @@ bool Rendezvous::HandleFailure(const lobby::Failed &m)
     return false;
 }
 
+bool Rendezvous::HandleChallenge(const lobby::Challenge &m, uint32_t now)
+{
+    if (hosting && !registered && m.nonce == registerNonce) {
+        cookie = m.cookie;
+        if (++registerChallenges > kMaxChallenges)
+            hostUnreachable = true;
+        else if (SendRegister())
+            registerSentAt = now;
+        return true;
+    }
+    if (registered && m.nonce == refreshNonce) {
+        cookie = m.cookie;
+        if (++refreshChallenges <= kMaxChallenges)
+            SendRefresh();
+        return true;
+    }
+    if (findStatus == NET_CODE_CONTACTING && m.nonce == resolveNonce) {
+        cookie = m.cookie;
+        if (++resolveChallenges > kMaxChallenges)
+            FinishFind(NET_CODE_LOBBY_UNREACHABLE);
+        else if (SendResolve())
+            resolveSentAt = now;
+        return true;
+    }
+    if (relayPhase == RelayPhase::Requested && m.nonce == relayNonce && Finding()) {
+        cookie = m.cookie;
+        if (++relayChallenges > kMaxChallenges)
+            AbandonRelay();
+        else if (SendRelay())
+            relaySentAt = now;
+        return true;
+    }
+    return false;
+}
+
 void Rendezvous::Reregister()
 {
     registered = false;
@@ -449,7 +589,10 @@ void Rendezvous::Reregister()
     hostSecret = {};
     registerNonce = NewNonce();
     registerAttempts = 0;
+    registerChallenges = 0;
     registerDue = true;
+    refreshNonce = 0;
+    refreshMisses = 0;
     introduceTimes.clear();
     punches.clear();
     hostRelays.clear();

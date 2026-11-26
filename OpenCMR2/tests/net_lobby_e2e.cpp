@@ -89,6 +89,7 @@ public:
     }
 
     std::string Address() const { return "127.0.0.1:" + std::to_string(server->Port()); }
+    uint16_t Port() const { return server->Port(); }
     size_t Sessions() const { return server->SessionCount(); }
     size_t Relays() const { return server->RelayCount(); }
 
@@ -100,19 +101,24 @@ private:
 
 const NetGuid kApp = { { 0x43, 0x4d, 0x52, 0x32, 0xe2, 0xe0, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2 } };
 
-std::unique_ptr<net::Session> MakeSession(const Lobby &lobby, net::RelayMode mode)
+std::unique_ptr<net::Session> MakeSessionAt(const std::string &lobbyAddress, net::RelayMode mode)
 {
     net::Config config;
     config.port = 0;
     config.broadcast = false;
     config.timeoutMs = 3000;
     config.joinTimeoutMs = 3000;
-    config.lobby = lobby.Address();
+    config.lobby = lobbyAddress;
     config.relay = mode;
     config.log = Log;
     std::unique_ptr<net::Session> session(new net::Session(config));
     CHECK(session->Start() == NET_OK);
     return session;
+}
+
+std::unique_ptr<net::Session> MakeSession(const Lobby &lobby, net::RelayMode mode)
+{
+    return MakeSessionAt(lobby.Address(), mode);
 }
 
 bool Listed(net::Session &session, const NetGuid &instance)
@@ -252,6 +258,9 @@ void JoinByCode(net::RelayMode guestMode)
     CHECK(lobby.Sessions() == 1);
 
     CHECK(guest->FindByCode(code.c_str()) == NET_CODE_CONTACTING);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(guest->CodeSession(nullptr, nullptr) == NET_CODE_CONTACTING);
+    Listed(*guest, hosted.guidInstance);
     NetCodeStatus pending = relay ? NET_CODE_RELAYING : NET_CODE_CONNECTING;
     CHECK(WaitFor([&] { return guest->CodeSession(nullptr, nullptr) == pending; }));
     NetGuid instance = {};
@@ -266,11 +275,15 @@ void JoinByCode(net::RelayMode guestMode)
     CHECK(WaitFor([&] { return Listed(*guest, hosted.guidInstance); }));
 
     CHECK(Join(*guest, instance) == NET_OK);
+    CHECK(guest->CodeSession(nullptr, nullptr) == NET_CODE_IDLE);
     NetPlayerID hostPlayer = Player(*host, "host");
     NetPlayerID guestPlayer = Player(*guest, "guest");
     CHECK(Talks(*host, hostPlayer, *guest, guestPlayer));
     CHECK(lobby.Relays() == (relay ? 1u : 0u));
     CHECK(!guest->IsHost());
+    CHECK(guest->CodeSession(nullptr, nullptr) == NET_CODE_IDLE);
+    std::string none;
+    CHECK(guest->HostCode(&none) == NET_CODE_IDLE);
 }
 
 void TwoGuests()
@@ -380,6 +393,7 @@ void LobbyDown()
     Lobby lobby(false);
     std::unique_ptr<net::Session> host = MakeSession(lobby, net::RelayMode::Auto);
     std::unique_ptr<net::Session> guest = MakeSession(lobby, net::RelayMode::Auto);
+    Listed(*guest, kApp);
     auto start = Clock::now();
     Host(*host);
     CHECK(guest->FindByCode("7K3M-9QX2") == NET_CODE_CONTACTING);
@@ -399,6 +413,47 @@ void LobbyDown()
     CHECK(guestMs >= 0 && guestMs <= 6500);
     CHECK(code.empty());
     CHECK(lobby.Sessions() == 0);
+}
+
+void InvalidPort()
+{
+    Lobby lobby;
+    std::unique_ptr<net::Session> host =
+        MakeSessionAt("127.0.0.1:" + std::to_string(lobby.Port() + 65536), net::RelayMode::Auto);
+    std::unique_ptr<net::Session> guest = MakeSessionAt("127.0.0.1:" + std::to_string(lobby.Port()) + "x",
+                                                        net::RelayMode::Auto);
+    auto start = Clock::now();
+    Host(*host);
+    std::string code;
+    CHECK(WaitFor([&] { return host->HostCode(&code) == NET_CODE_LOBBY_UNREACHABLE; }, 2000));
+    Listed(*guest, kApp);
+    CHECK(guest->FindByCode("7K3M-9QX2") == NET_CODE_CONTACTING);
+    CHECK(WaitFor([&] { return guest->CodeSession(nullptr, nullptr) == NET_CODE_LOBBY_UNREACHABLE; }, 2000));
+    CHECK(ElapsedMs(start) < 2000);
+    CHECK(code.empty());
+    CHECK(lobby.Sessions() == 0);
+}
+
+void QueryPaddingThroughRelay()
+{
+    Lobby lobby;
+    std::unique_ptr<net::Session> host = MakeSession(lobby, net::RelayMode::Auto);
+    NetSessionDesc desc = {};
+    desc.dwSize = sizeof(desc);
+    desc.guidApplication = kApp;
+    desc.dwMaxPlayers = 4;
+    std::string name(255, 'L');
+    desc.lpszSessionNameA = (char *)name.c_str();
+    desc.lpszPasswordA = (char *)"";
+    CHECK(host->Open(&desc, NET_OPEN_CREATE) == NET_OK);
+    NetSessionDesc hosted = {};
+    CHECK(host->GetSessionDesc(&hosted) == NET_OK);
+    std::string code = HostCode(*host);
+    std::unique_ptr<net::Session> guest = MakeSession(lobby, net::RelayMode::Always);
+    bool relayed = false;
+    CHECK(Find(*guest, code, hosted.guidInstance, &relayed));
+    CHECK(relayed);
+    CHECK(Join(*guest, hosted.guidInstance) == NET_OK);
 }
 
 void RateLimited()
@@ -439,6 +494,8 @@ int main()
         { "code variants", CodeVariants },
         { "unregister", Unregister },
         { "lobby down", LobbyDown },
+        { "invalid port", InvalidPort },
+        { "long name relayed", QueryPaddingThroughRelay },
         { "rate limited", RateLimited },
     };
     for (const Scenario &scenario : scenarios) {

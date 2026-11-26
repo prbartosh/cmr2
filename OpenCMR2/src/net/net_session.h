@@ -137,6 +137,7 @@ private:
     void StopResolver();
     void ResolveLoop();
     void StartCodeHosting();
+    void StopFind();
     static int Intercept(_ENetHost *host, _ENetEvent *event);
     void HandleRaw(const uint8_t *data, size_t size, uint32_t address, uint16_t port);
 
@@ -215,6 +216,9 @@ private:
     std::condition_variable resolverWake;
     std::thread resolver;
     bool codeFoundLogged = false;
+    bool lobbyInvalidLogged = false;
+    bool findDeferred = false;
+    lobby::Code deferredCode = {};
 };
 
 } // namespace net
