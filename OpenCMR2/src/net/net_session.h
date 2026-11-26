@@ -214,6 +214,7 @@ private:
     bool resolverStop = false;
     std::condition_variable resolverWake;
     std::thread resolver;
+    bool codeFoundLogged = false;
 };
 
 } // namespace net

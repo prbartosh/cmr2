@@ -164,6 +164,17 @@ if(OPENCMR2_BINK_TEST_DATA_DIR)
                 ${CMAKE_CURRENT_SOURCE_DIR}/lan_game.py --host-probe $<TARGET_FILE:stage_probe>
                 --data ${OPENCMR2_BINK_TEST_DATA_DIR} --players 3)
             set_tests_properties(lan_game_3 PROPERTIES TIMEOUT 150)
+            if(TARGET opencmr2-lobby)
+                add_test(NAME lan_game_code COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/lan_game.py --host-probe $<TARGET_FILE:stage_probe>
+                    --data ${OPENCMR2_BINK_TEST_DATA_DIR} --join-code --lobby $<TARGET_FILE:opencmr2-lobby>)
+                set_tests_properties(lan_game_code PROPERTIES TIMEOUT 120)
+                add_test(NAME lan_game_code_relay COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/lan_game.py --host-probe $<TARGET_FILE:stage_probe>
+                    --data ${OPENCMR2_BINK_TEST_DATA_DIR} --join-code --lobby $<TARGET_FILE:opencmr2-lobby>
+                    --relay always)
+                set_tests_properties(lan_game_code_relay PROPERTIES TIMEOUT 120)
+            endif()
         endif()
         add_test(NAME stage_lighting COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/stage_lighting.py --probe $<TARGET_FILE:stage_probe>
