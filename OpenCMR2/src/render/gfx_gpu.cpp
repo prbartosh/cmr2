@@ -73,6 +73,8 @@ struct FragmentLightingUniforms {
     float shadowParams[4];
     float shadowParams2[4];
     float sunDirEye[4];
+    float pbrParams[4];
+    float atmoParams[4];
 };
 
 struct ClearUniforms {
@@ -393,6 +395,7 @@ struct GpuTexture {
     // into the cube, which is then only sampled. Drawing in the cube's layers
     // directly broke the whole picture on the Adreno 840 (#46).
     SDL_GPUTexture *faces[6] = {};
+    SDL_GPUTexture *cubeMips[4] = {};      // prefiltered roughness mip scratch targets (w/2..w/16)
     SDL_GPUTextureFormat format;
     bool cpuDecode = false;                // BC data decoded on the CPU (no BC support or compressed_mipmaps)
     int mipLevels = 1;                     // actual mip levels created on the GPU
@@ -437,10 +440,10 @@ struct Executor : GfxExecutor {
     SDL_Window *window = nullptr;
     SDL_GPUShader *vs3d = nullptr, *vsTL = nullptr, *fs = nullptr, *fsMrt = nullptr;
     SDL_GPUShader *vsClear = nullptr, *fsClear = nullptr, *fsClearMrt = nullptr;
-    SDL_GPUShader *vsPost = nullptr, *fsPostBright = nullptr, *fsPostBlur = nullptr;
+    SDL_GPUShader *vsPost = nullptr, *fsPostBright = nullptr, *fsPostBlur = nullptr, *fsCubeBlur = nullptr;
     SDL_GPUShader *fsPostGtao = nullptr, *fsPostAoBlur = nullptr, *fsPostComposite = nullptr;
     SDL_GPUShader *vsShadow = nullptr, *fsShadow = nullptr;
-    SDL_GPUGraphicsPipeline *postBrightPipeline = nullptr, *postBlurPipeline = nullptr;
+    SDL_GPUGraphicsPipeline *postBrightPipeline = nullptr, *postBlurPipeline = nullptr, *cubeBlurPipeline = nullptr;
     SDL_GPUGraphicsPipeline *postGtaoPipeline = nullptr, *postAoBlurPipeline = nullptr, *postCompositePipeline = nullptr;
     SDL_GPUSampler *postSampler = nullptr, *depthSampler = nullptr, *shadowSampler = nullptr;
     SDL_GPUTexture *shadowMap = nullptr;
@@ -529,6 +532,7 @@ struct Executor : GfxExecutor {
         SDL_ReleaseGPUTexture(device, bloomQuarterB);
         SDL_ReleaseGPUGraphicsPipeline(device, postBrightPipeline);
         SDL_ReleaseGPUGraphicsPipeline(device, postBlurPipeline);
+        SDL_ReleaseGPUGraphicsPipeline(device, cubeBlurPipeline);
         SDL_ReleaseGPUGraphicsPipeline(device, postGtaoPipeline);
         SDL_ReleaseGPUGraphicsPipeline(device, postAoBlurPipeline);
         SDL_ReleaseGPUGraphicsPipeline(device, postCompositePipeline);
@@ -552,6 +556,7 @@ struct Executor : GfxExecutor {
         SDL_ReleaseGPUShader(device, vsPost);
         SDL_ReleaseGPUShader(device, fsPostBright);
         SDL_ReleaseGPUShader(device, fsPostBlur);
+        SDL_ReleaseGPUShader(device, fsCubeBlur);
         SDL_ReleaseGPUShader(device, fsPostGtao);
         SDL_ReleaseGPUShader(device, fsPostAoBlur);
         SDL_ReleaseGPUShader(device, fsPostComposite);
@@ -692,6 +697,11 @@ struct Executor : GfxExecutor {
                 postCompositePipeline = CreatePostPipeline(fsPostComposite, colorFormat);
             }
             if (postBrightPipeline && postBlurPipeline && postCompositePipeline) {
+                fsCubeBlur = Shader(SHADER_CODE(post_cube_blur_frag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
+                if (fsCubeBlur != NULL)
+                    cubeBlurPipeline = CreatePostPipeline(fsCubeBlur, colorFormat);
+                if (cubeBlurPipeline != NULL)
+                    Sys_Log("gfx: Cook-Torrance GGX PBR + prefiltered cubemap IBL enabled");
                 hdrMsaaSamples = (msaaSamples != SDL_GPU_SAMPLECOUNT_1 &&
                                   SDL_GPUTextureSupportsSampleCount(device, hdrFormat, msaaSamples))
                                      ? msaaSamples
@@ -1058,9 +1068,23 @@ struct Executor : GfxExecutor {
             usage |= SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
         if (cube && target) {
             usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+            int cubeMipCount = 1;
+            if (t->width >= 64 && t->width == t->height && cubeBlurPipeline != NULL) {
+                int m = 1;
+                while ((t->width >> m) >= 16 && m < 5)
+                    m++;
+                cubeMipCount = m;
+            }
+            g->mipLevels = cubeMipCount;
             for (int f = 0; f < 6; f++)
                 g->faces[f] = CreateTexture(SDL_GPU_TEXTURETYPE_2D, g->format, t->width, t->height, 1, 1,
-                                            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET);
+                                            SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+            for (int m = 1; m < cubeMipCount; m++) {
+                int mw = std::max(1, t->width >> m);
+                int mh = std::max(1, t->height >> m);
+                g->cubeMips[m - 1] = CreateTexture(SDL_GPU_TEXTURETYPE_2D, g->format, mw, mh, 1, 1,
+                                                   SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+            }
         }
         g->texture = CreateTexture(cube ? SDL_GPU_TEXTURETYPE_CUBE : SDL_GPU_TEXTURETYPE_2D, g->format, t->width,
                                    t->height, cube ? 6 : 1, g->mipLevels, usage);
@@ -1214,6 +1238,8 @@ struct Executor : GfxExecutor {
         SDL_ReleaseGPUTexture(device, g->depth);
         for (SDL_GPUTexture *face : g->faces)
             SDL_ReleaseGPUTexture(device, face);
+        for (SDL_GPUTexture *mipTex : g->cubeMips)
+            SDL_ReleaseGPUTexture(device, mipTex);
         delete g;
         t->gpu = NULL;
     }
@@ -1539,6 +1565,7 @@ struct Executor : GfxExecutor {
                a.ambientSource == b.ambientSource && a.emissiveSource == b.emissiveSource && a.fog == b.fog &&
                a.fogTableMode == b.fogTableMode && a.fogVertexMode == b.fogVertexMode &&
                a.fogStart == b.fogStart && a.fogEnd == b.fogEnd && a.ambient == b.ambient &&
+               a.weatherKind == b.weatherKind && a.weatherIntensity == b.weatherIntensity &&
                memcmp(&a.world, &b.world, sizeof(a.world)) == 0 && memcmp(&a.view, &b.view, sizeof(a.view)) == 0 &&
                memcmp(&a.projection, &b.projection, sizeof(a.projection)) == 0 &&
                memcmp(a.texture, b.texture, sizeof(a.texture)) == 0 &&
@@ -1659,8 +1686,10 @@ struct Executor : GfxExecutor {
     }
 
     void FillFragmentLightingUniforms(const GfxDrawState &s, const VertexUniforms &vu, bool overhaul,
-                                      bool perPixel, bool hemisphere, float fresnelStrength, bool shadowActive,
+                                      bool perPixel, bool hemisphere, float fresnelStrength, bool pbrShading,
+                                      bool wetSurfaces, bool atmoFog, bool shadowActive,
                                       const ShadowSetup &shadowSetup, float shadowStrength, int pcfQuality,
+                                      bool foundSun, const GfxVector &sunLightDir, float sunLuma,
                                       FragmentLightingUniforms &fl)
     {
         memset(&fl, 0, sizeof(fl));
@@ -1681,7 +1710,11 @@ struct Executor : GfxExecutor {
         fl.enhanceParams[1] = hemisphere ? 1.0f : 0.0f;
         fl.enhanceParams[2] = fresnelStrength;
         fl.enhanceParams[3] = overhaul ? 1.0f : 0.0f;
+
+        GfxVector toSunWorld = foundSun ? VecNormalize({ -sunLightDir.x, -sunLightDir.y, -sunLightDir.z })
+                                        : GfxVector{ 0.3f, 0.85f, 0.4f };
         if (shadowActive && shadowMapSize > 0 && shadowSetup.count > 0) {
+            toSunWorld = shadowSetup.toSunWorld;
             GfxMatrix invView;
             if (InvertAffineMatrix(s.view, invView)) {
                 Multiply(invView, shadowSetup.cascades[0].lightVP, fl.eyeToLightClip[0]);
@@ -1694,16 +1727,47 @@ struct Executor : GfxExecutor {
                 fl.shadowParams2[1] = shadowSetup.count > 1 ? 1.75f : 1.50f;
                 fl.shadowParams2[2] = 1.35f;
                 fl.shadowParams2[3] = 0.0f;
-                TransformPoint(shadowSetup.toSunWorld, 0.0f, s.view, fl.sunDirEye);
-                float slen = sqrtf(fl.sunDirEye[0] * fl.sunDirEye[0] + fl.sunDirEye[1] * fl.sunDirEye[1] +
-                                   fl.sunDirEye[2] * fl.sunDirEye[2]);
-                if (slen > 1e-5f) {
-                    fl.sunDirEye[0] /= slen;
-                    fl.sunDirEye[1] /= slen;
-                    fl.sunDirEye[2] /= slen;
-                }
             }
         }
+        TransformPoint(toSunWorld, 0.0f, s.view, fl.sunDirEye);
+        float slen = sqrtf(fl.sunDirEye[0] * fl.sunDirEye[0] + fl.sunDirEye[1] * fl.sunDirEye[1] +
+                           fl.sunDirEye[2] * fl.sunDirEye[2]);
+        if (slen > 1e-5f) {
+            fl.sunDirEye[0] /= slen;
+            fl.sunDirEye[1] /= slen;
+            fl.sunDirEye[2] /= slen;
+        }
+        fl.sunDirEye[3] = foundSun ? std::clamp(sunLuma, 0.0f, 1.0f) : 0.0f;
+
+        // Stage 13: PBR + Prefiltered Cubemap IBL + Wet Surfaces + Atmospheric/Height Fog.
+        float maxCubeMip = 0.0f;
+        for (int st = 0; st < 2; st++) {
+            GfxTexture *t = Gfx_DrawnTexture(s.stages[st].texture, overhaul);
+            if (t != NULL && (t->flags & GFX_TEXTURE_CUBE) && t->gpu != NULL) {
+                GpuTexture *cg = (GpuTexture *)t->gpu;
+                if (cg->mipLevels > 1)
+                    maxCubeMip = std::max(maxCubeMip, (float)(cg->mipLevels - 1));
+            }
+        }
+        float rainWet = (overhaul && wetSurfaces && s.weatherKind == 1)
+                            ? std::clamp(s.weatherIntensity * 1.15f, 0.0f, 1.0f)
+                            : 0.0f;
+        fl.pbrParams[0] = (overhaul && pbrShading) ? 1.0f : 0.0f;
+        fl.pbrParams[1] = maxCubeMip;
+        fl.pbrParams[2] = rainWet;
+        fl.pbrParams[3] = (overhaul && atmoFog) ? 1.0f : 0.0f;
+
+        // Horizon atmospheric scatter tint scales with stage daylight brightness (respects dusk/night/fog).
+        float dayFactor = foundSun ? std::clamp((sunLuma - 0.12f) / 0.65f, 0.0f, 1.0f) : 0.5f;
+        float skyR = (0.10f + 0.56f * dayFactor) * (1.0f - 0.22f * rainWet);
+        float skyG = (0.13f + 0.63f * dayFactor) * (1.0f - 0.18f * rainWet);
+        float skyB = (0.20f + 0.68f * dayFactor) * (1.0f - 0.12f * rainWet);
+        fl.atmoParams[0] = skyR;
+        fl.atmoParams[1] = skyG;
+        fl.atmoParams[2] = skyB;
+        fl.atmoParams[3] = (overhaul && atmoFog && foundSun && dayFactor > 0.2f)
+                               ? (0.48f * dayFactor * (1.0f - 0.55f * rainWet))
+                               : 0.0f;
     }
 
     // fade: the draw is a 3D one into the back buffer, which the distance
@@ -1780,6 +1844,14 @@ struct Executor : GfxExecutor {
                     sampled.minFilter = sampled.magFilter = GFX_FILTER_LINEAR;
                     sampled.mipFilter = GFX_MIPFILTER_LINEAR;
                 } else if (g->generatedMips) {
+                    sampled.mipFilter = GFX_MIPFILTER_NONE;
+                }
+            }
+            if (is3D && kind == 2 && g != NULL && g->mipLevels > 1) {
+                if (overhaul) {
+                    sampled.minFilter = sampled.magFilter = GFX_FILTER_LINEAR;
+                    sampled.mipFilter = GFX_MIPFILTER_LINEAR;
+                } else {
                     sampled.mipFilter = GFX_MIPFILTER_NONE;
                 }
             }
@@ -2035,8 +2107,8 @@ struct Executor : GfxExecutor {
         return SDL_BeginGPURenderPass(cmd, colors, numColorTargets, &depth);
     }
 
-    // Ends the render pass on target; a cube face's goes on into the cube.
-    void EndPass(SDL_GPUCommandBuffer *cmd, SDL_GPURenderPass *pass, GfxTexture *target)
+    // Ends the render pass on target; a cube face's goes on into the cube (plus prefiltered roughness mips).
+    void EndPass(SDL_GPUCommandBuffer *cmd, SDL_GPURenderPass *pass, GfxTexture *target, bool prefilterCube = false)
     {
         SDL_EndGPURenderPass(pass);
         if (target == NULL)
@@ -2054,6 +2126,32 @@ struct Executor : GfxExecutor {
         dst.layer = (Uint32)face;
         SDL_CopyGPUTextureToTexture(copy, &src, &dst, root->width, root->height, 1, false);
         SDL_EndGPUCopyPass(copy);
+
+        // Stage 13: Generate prefiltered roughness mipmap chain (levels 1..4) for dynamic cube reflections.
+        if (prefilterCube && g->mipLevels > 1 && cubeBlurPipeline != NULL && postSampler != NULL) {
+            for (int m = 1; m < g->mipLevels && m <= 4; m++) {
+                SDL_GPUTexture *srcTex = (m == 1) ? g->faces[face] : g->cubeMips[m - 2];
+                SDL_GPUTexture *dstTex = g->cubeMips[m - 1];
+                if (srcTex == NULL || dstTex == NULL)
+                    break;
+                int sw = std::max(1, root->width >> (m - 1));
+                int sh = std::max(1, root->height >> (m - 1));
+                int mw = std::max(1, root->width >> m);
+                int mh = std::max(1, root->height >> m);
+                SDL_GPUTextureSamplerBinding bind = { srcTex, postSampler };
+                PostUniforms blurU = { { 1.0f / (float)sw, 1.0f / (float)sh, 1.35f, 0.0f } };
+                DrawPostPass(cmd, cubeBlurPipeline, dstTex, mw, mh, &bind, 1, &blurU, sizeof(blurU));
+
+                SDL_GPUCopyPass *mcopy = SDL_BeginGPUCopyPass(cmd);
+                SDL_GPUTextureLocation msrc = {}, mdst = {};
+                msrc.texture = dstTex;
+                mdst.texture = g->texture;
+                mdst.layer = (Uint32)face;
+                mdst.mip_level = (Uint32)m;
+                SDL_CopyGPUTextureToTexture(mcopy, &msrc, &mdst, mw, mh, 1, false);
+                SDL_EndGPUCopyPass(mcopy);
+            }
+        }
     }
 
     void DrawPostPass(SDL_GPUCommandBuffer *cmd, SDL_GPUGraphicsPipeline *pipeline, SDL_GPUTexture *dst, int w, int h,
@@ -2375,6 +2473,9 @@ struct Executor : GfxExecutor {
         const bool perPixel = overhaul && Platform_GetSettingInt("video.per_pixel_lighting", 1) != 0;
         const bool hemisphere = overhaul && Platform_GetSettingInt("video.hemisphere_ambient", 1) != 0;
         const bool carFresnel = overhaul && Platform_GetSettingInt("video.car_fresnel", 1) != 0;
+        const bool pbrShading = overhaul && Platform_GetSettingInt("video.pbr_shading", 1) != 0;
+        const bool wetSurfaces = overhaul && Platform_GetSettingInt("video.wet_surfaces", 1) != 0;
+        const bool atmoFog = overhaul && Platform_GetSettingInt("video.atmospheric_fog", 1) != 0;
         const bool materialMaps = overhaul && Platform_GetSettingInt("video.override_material_maps", 1) != 0;
         const float fresnelStrength =
             carFresnel ? std::clamp(Platform_GetSettingFloat("video.car_fresnel_strength", 0.65f), 0.0f, 1.0f) : 0.0f;
@@ -2481,8 +2582,9 @@ struct Executor : GfxExecutor {
                     // The back buffer's pass stays open over the texture
                     // drawing skipped in its phase.
                     if (pass != NULL && phase == 0) {
-                        EndPass(cmd, pass, passTarget);
+                        EndPass(cmd, pass, passTarget, pbrShading);
                         pass = NULL;
+                        fragmentUniformsSet = false;
                     }
                     target = c.target;
                     continue;
@@ -2573,9 +2675,10 @@ struct Executor : GfxExecutor {
                     FillVertexUniforms(c, s, targetW, targetH, viewport, scaled, vu);
                     SDL_PushGPUVertexUniformData(cmd, 0, &vu, sizeof(vu));
                     FragmentLightingUniforms fl;
-                    FillFragmentLightingUniforms(s, vu, overhaul, perPixel, hemisphere, fresnelStrength,
-                                                 shadowActive && target == NULL, shadowSetup, shadowStrength,
-                                                 shadowPcfQuality, fl);
+                    FillFragmentLightingUniforms(s, vu, overhaul, perPixel, hemisphere, fresnelStrength, pbrShading,
+                                                 wetSurfaces, atmoFog, shadowActive && target == NULL, shadowSetup,
+                                                 shadowStrength, shadowPcfQuality, foundSun, sunLightDir, bestSunLuma,
+                                                 fl);
                     SDL_PushGPUFragmentUniformData(cmd, 1, &fl, sizeof(fl));
                     vertexUniformState = &s;
                     vertexUniformW = targetW;
@@ -2631,7 +2734,7 @@ struct Executor : GfxExecutor {
                 }
             }
             if (pass != NULL) {
-                EndPass(cmd, pass, passTarget);
+                EndPass(cmd, pass, passTarget, phase == 0 && pbrShading);
                 pass = NULL;
             }
         }

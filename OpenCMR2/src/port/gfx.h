@@ -271,6 +271,8 @@ void Gfx_SetRenderTarget(GfxTexture *target);
    the fade off. */
 void Gfx_CaptureBackdrop(void);
 void Gfx_SetDistanceFade(float start, float end);
+/* Current stage weather state for visual enhancements (kind: 0=clear, 1=rain, 2=snow; intensity 0..1). */
+void Gfx_SetWeatherState(int kind, float intensity);
 
 /* ---- fixed-function state -------------------------------------------------- */
 

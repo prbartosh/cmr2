@@ -125,7 +125,7 @@ endif()
 
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/render/shaders)
 set(SHADER_SOURCES fixed3d.vert fixedtl.vert fixed.frag clear.vert clear.frag
-    post.vert post_bright.frag post_blur.frag post_gtao.frag post_ao_blur.frag post_composite.frag
+    post.vert post_bright.frag post_blur.frag post_cube_blur.frag post_gtao.frag post_ao_blur.frag post_composite.frag
     shadow.vert shadow.frag)
 set(SHADER_FILES)
 foreach(shader IN LISTS SHADER_SOURCES)

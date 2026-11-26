@@ -534,6 +534,15 @@ extern "C" void Gfx_SetDistanceFade(float start, float end)
     Touch();
 }
 
+extern "C" void Gfx_SetWeatherState(int kind, float intensity)
+{
+    if (s_state.weatherKind == kind && s_state.weatherIntensity == intensity)
+        return;
+    s_state.weatherKind = kind;
+    s_state.weatherIntensity = intensity;
+    Touch();
+}
+
 // ---- fixed-function state --------------------------------------------------------------
 
 extern "C" void Gfx_SetTransform(int type, const GfxMatrix *matrix)

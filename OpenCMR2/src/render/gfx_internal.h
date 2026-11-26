@@ -93,6 +93,8 @@ struct GfxDrawState {
     int fogVertexMode = GFX_FOG_NONE, fogTableMode = GFX_FOG_NONE;
     float fogStart = 0.0f, fogEnd = 1.0f;
     float fadeStart = 0.0f, fadeEnd = 0.0f;   // Gfx_SetDistanceFade (end <= start: off)
+    int weatherKind = 0;                      // Gfx_SetWeatherState (0=clear, 1=rain, 2=snow)
+    float weatherIntensity = 0.0f;            // 0..1 precipitation strength
     bool depthTest = true, depthWrite = true;
     int depthFunc = GFX_CMP_LESSEQUAL;
     int cull = GFX_CULL_CCW;
