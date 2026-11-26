@@ -871,6 +871,24 @@ void TestRelayLimits()
         Running lobby(options);
         CHECK(!lobby.started);
     }
+    for (size_t sessions : { (size_t)0, lobby::kMaxSessionsLimit + 1 }) {
+        lobby::Options options = TestOptions();
+        options.maxSessions = sessions;
+        Running lobby(options);
+        CHECK(!lobby.started);
+    }
+    {
+        lobby::Options options = TestOptions();
+        options.maxSessions = lobby::kMaxSessionsLimit;
+        Running lobby(options);
+        CHECK(lobby.started);
+    }
+    {
+        lobby::Options options = TestOptions();
+        options.cookieWindowMs = 0;
+        Running lobby(options);
+        CHECK(!lobby.started);
+    }
 }
 
 void TestFuzz()
@@ -947,6 +965,7 @@ void TestFuzz()
     SleepMs(200);
     drain();
     CHECK(largestReply <= wire::kMinRequest);
+    CHECK(lobby.server.SessionCount() > 1);
     Log("fuzz: %zu replies, largest %zu bytes", replies, largestReply);
 
     host.Drain();
@@ -1123,6 +1142,53 @@ void TestCookies()
     } else {
         printf("lobby_server: 127.0.0.2 not available, cookie address case skipped\n");
     }
+}
+
+void TestUnprovenRequests()
+{
+    lobby::Options options = TestOptions();
+    options.maxSessionsPerAddress = 1;
+    Running lobby(options);
+    CHECK(lobby.started);
+    if (!lobby.started)
+        return;
+    uint16_t port = lobby.Port();
+    Client client;
+    client.Manual();
+    wire::Code unknown = net::joincode::FromBits(0x13579bdfull);
+    wire::Challenge challenge;
+    for (uint32_t i = 0; i < 12; i++) {
+        client.Send(port, MakeResolve(10 + i, unknown, wire::Endpoint()));
+        CHECK(client.AwaitReply(port, challenge));
+        CHECK(challenge.nonce == 10 + i);
+    }
+    for (uint32_t i = 0; i < 6; i++) {
+        wire::Register request;
+        request.nonce = 30 + i;
+        request.instance = MakeGuid((uint8_t)(100 + i));
+        client.Send(port, request);
+        CHECK(client.AwaitReply(port, challenge));
+        CHECK(challenge.nonce == 30 + i);
+        wire::Relay relay;
+        relay.nonce = 40 + i;
+        relay.code = unknown;
+        client.Send(port, relay);
+        CHECK(client.AwaitReply(port, challenge));
+        CHECK(challenge.nonce == 40 + i);
+    }
+    CHECK(lobby.server.SessionCount() == 0);
+    CHECK(lobby.server.RelayCount() == 0);
+
+    client.Automatic();
+    Hosted hosted;
+    CHECK(RegisterHost(client, port, 50, MakeGuid(110), wire::Endpoint(), hosted));
+    CHECK(lobby.server.SessionCount() == 1);
+    for (uint32_t i = 0; i < 10; i++) {
+        client.Send(port, MakeResolve(60 + i, unknown, wire::Endpoint()));
+        CHECK(client.AwaitFailure(port, 60 + i, wire::FAILURE_NOT_FOUND));
+    }
+    client.Send(port, MakeResolve(70, unknown, wire::Endpoint()));
+    CHECK(client.AwaitFailure(port, 70, wire::FAILURE_RATE_LIMITED));
 }
 
 void TestCookieWindow()
@@ -1418,6 +1484,7 @@ int main()
     TestRelay();
     TestRelayLimits();
     TestCookies();
+    TestUnprovenRequests();
     TestCookieWindow();
     TestIntroduceLimit();
     TestRelayCaps();
