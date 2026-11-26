@@ -1,5 +1,6 @@
 #include "port/sys.h"
 #include "FrontendMenus.h"
+#include "FrontendJoinCode.h"
 #include "GameInfo.h"
 #include "Graphics.h"
 #include "Frontend.h"
@@ -2527,6 +2528,7 @@ void FrontendMenu_BuildNetworkSessionBrowser(void)
     Menu_Init(&g_menu0x00824c18, 0, 0x35, 0, &g_menu0x00822598, NULL, 1, 0, 1);
     Menu_AddItemType4(&g_menu0x00824c18, 0, 0x1ec, (MenuItemAction)FrontendNetwork_JoinSelectedSession, 0);
     Menu_AddItemType4(&g_menu0x00824c18, 0, 0x3d, (MenuItemAction)FrontendNetwork_CreateSelectedSession, 0);
+    Menu_AddItemType4(&g_menu0x00824c18, FrontendJoinCode_BrowserLabel(), -1, (MenuItemAction)FrontendJoinCode_Open, 0);
     Menu_AddItemType1(&g_menu0x00824c18, 0, 0x1b, 0, 0);
     Menu_SetCallbacks(&g_menu0x00824c18, (MenuCallback)FrontendMenu_EnterNetworkSessionBrowser, (MenuCallback)FrontendMenu_UpdateNetworkSessionBrowser, (MenuCallback)FrontendMenu_DrawNetworkSessionBrowser, (MenuCallback)FrontendNetwork_LeaveConnectionPages);
     Menu_ValidateCursor(&g_menu0x00824c18, 0);
