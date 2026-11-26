@@ -896,7 +896,7 @@ bool WaitFor(const std::function<bool()> &condition, int ms = 5000)
 
 class FakeLobby {
 public:
-    std::atomic<int> registers{0}, unregisters{0}, resolves{0}, relays{0}, forwarded{0};
+    std::atomic<int> registers{0}, unregisters{0}, resolves{0}, relays{0}, forwarded{0}, forwardedEnet{0};
 
     FakeLobby()
     {
@@ -1054,6 +1054,8 @@ private:
         if (to == nullptr)
             return;
         forwarded++;
+        if (size < 4 || memcmp(data, lobby::kMagic, 4) != 0)
+            forwardedEnet++;
         SendTo(relaySocket, *to, std::vector<uint8_t>(data, data + size));
     }
 
@@ -1068,7 +1070,7 @@ private:
 
 const NetGuid kApp = { { 0x43, 0x4d, 0x52, 0x32, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1, 2 } };
 
-std::unique_ptr<net::Session> MakeSession(uint16_t lobbyPort, net::RelayMode mode)
+std::unique_ptr<net::Session> MakeSession(uint16_t lobbyPort, net::RelayMode mode, uint16_t peerPort = 0)
 {
     net::Config config;
     config.port = 0;
@@ -1078,6 +1080,8 @@ std::unique_ptr<net::Session> MakeSession(uint16_t lobbyPort, net::RelayMode mod
     if (lobbyPort != 0)
         config.lobby = "127.0.0.1:" + std::to_string(lobbyPort);
     config.relay = mode;
+    if (peerPort != 0)
+        config.peers.push_back("127.0.0.1:" + std::to_string(peerPort));
     config.log = Log;
     std::unique_ptr<net::Session> session(new net::Session(config));
     CHECK(session->Start() == NET_OK);
@@ -1166,16 +1170,111 @@ void JoinByCode(net::RelayMode guestMode)
         host->Send(hostPlayer, NET_ID_ALL, TRUE, "hi", 2);
         return Receives(*guest, hostPlayer);
     }));
-    if (guestMode == net::RelayMode::Always)
+    if (guestMode == net::RelayMode::Always) {
         CHECK(fake.forwarded > 0);
-    else
+        CHECK(fake.forwardedEnet > 0);
+    } else {
         CHECK(fake.relays == 0);
+        CHECK(fake.forwardedEnet == 0);
+    }
 
     CHECK(guest->Close() == NET_OK);
     CHECK(host->Close() == NET_OK);
     CHECK(WaitFor([&] { return fake.unregisters == 1; }));
     CHECK(host->HostCode(&code) == NET_CODE_IDLE);
     CHECK(code.empty());
+}
+
+NetSessionDesc Host(net::Session &session)
+{
+    NetSessionDesc desc = {};
+    desc.dwSize = sizeof(desc);
+    desc.guidApplication = kApp;
+    desc.dwMaxPlayers = 4;
+    desc.lpszSessionNameA = (char *)"Coded";
+    desc.lpszPasswordA = (char *)"";
+    CHECK(session.Open(&desc, NET_OPEN_CREATE) == NET_OK);
+    NetSessionDesc hosted = {};
+    CHECK(session.GetSessionDesc(&hosted) == NET_OK);
+    return hosted;
+}
+
+HRESULT Join(net::Session &session, const NetGuid &instance)
+{
+    NetSessionDesc join = {};
+    join.dwSize = sizeof(join);
+    join.guidInstance = instance;
+    join.lpszPasswordA = (char *)"";
+    return session.Open(&join, NET_OPEN_JOIN);
+}
+
+void JoinPinned()
+{
+    FakeLobby fake;
+    std::unique_ptr<net::Session> host = MakeSession(fake.Port(), net::RelayMode::Auto);
+    NetSessionDesc hosted = Host(*host);
+    std::string code;
+    CHECK(WaitFor([&] { return host->HostCode(&code) == NET_CODE_READY; }));
+    std::unique_ptr<net::Session> guest = MakeSession(fake.Port(), net::RelayMode::Always, host->BoundPort());
+    CHECK(WaitFor([&] { return Listed(*guest, hosted.guidInstance); }));
+    CHECK(guest->FindByCode(code.c_str()) == NET_CODE_CONTACTING);
+    bool relayed = false;
+    CHECK(WaitFor([&] {
+        Listed(*guest, hosted.guidInstance);
+        return guest->CodeSession(nullptr, &relayed) == NET_CODE_FOUND;
+    }));
+    CHECK(relayed);
+    CHECK(fake.forwarded > 0);
+    for (int i = 0; i < 10; i++) {
+        Listed(*guest, hosted.guidInstance);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    CHECK(Join(*guest, hosted.guidInstance) == NET_OK);
+    NetName name = { sizeof(NetName), 0, (char *)"p", (char *)"p" };
+    NetPlayerID hostPlayer = 0, guestPlayer = 0;
+    CHECK(host->CreatePlayer(&hostPlayer, &name, nullptr, 0) == NET_OK);
+    CHECK(guest->CreatePlayer(&guestPlayer, &name, nullptr, 0) == NET_OK);
+    CHECK(WaitFor([&] {
+        guest->Send(guestPlayer, hostPlayer, TRUE, "hi", 2);
+        return Receives(*host, guestPlayer);
+    }));
+    CHECK(fake.forwardedEnet == 0);
+}
+
+void AbandonIsSilent()
+{
+    FakeLobby fake;
+    std::unique_ptr<net::Session> host = MakeSession(fake.Port(), net::RelayMode::Auto);
+    Host(*host);
+    std::string code;
+    CHECK(WaitFor([&] { return host->HostCode(&code) == NET_CODE_READY; }));
+    host->Abandon();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(fake.unregisters == 0);
+    CHECK(host->HostCode(&code) == NET_CODE_IDLE);
+}
+
+void MigrationRegisters()
+{
+    FakeLobby fake;
+    std::unique_ptr<net::Session> host = MakeSession(fake.Port(), net::RelayMode::Auto);
+    NetSessionDesc hosted = Host(*host);
+    std::string code;
+    CHECK(WaitFor([&] { return host->HostCode(&code) == NET_CODE_READY; }));
+    std::unique_ptr<net::Session> a = MakeSession(fake.Port(), net::RelayMode::Auto, host->BoundPort());
+    std::unique_ptr<net::Session> b = MakeSession(fake.Port(), net::RelayMode::Auto, host->BoundPort());
+    CHECK(WaitFor([&] { return Listed(*a, hosted.guidInstance); }));
+    CHECK(Join(*a, hosted.guidInstance) == NET_OK);
+    CHECK(WaitFor([&] { return Listed(*b, hosted.guidInstance); }));
+    CHECK(Join(*b, hosted.guidInstance) == NET_OK);
+    CHECK(a->HostCode(&code) == NET_CODE_IDLE);
+    CHECK(host->Close() == NET_OK);
+    CHECK(WaitFor([&] { return a->IsHost(); }));
+    CHECK(WaitFor([&] { return a->HostCode(&code) == NET_CODE_READY; }));
+    CHECK(fake.registers == 2);
+    CHECK(fake.unregisters == 1);
+    CHECK(!b->IsHost());
+    CHECK(b->HostCode(&code) == NET_CODE_IDLE);
 }
 
 void SessionWithoutLobby()
@@ -1200,7 +1299,7 @@ void SessionUnknownCode()
     CHECK(guest->CodeSession(nullptr, nullptr) == NET_CODE_IDLE);
 }
 
-} // namespace
+}
 
 int main()
 {
@@ -1227,6 +1326,9 @@ int main()
     SessionUnknownCode();
     JoinByCode(net::RelayMode::Auto);
     JoinByCode(net::RelayMode::Always);
+    JoinPinned();
+    AbandonIsSilent();
+    MigrationRegisters();
 
     if (s_failures != 0) {
         fprintf(stderr, "net_rendezvous: %d failures\n", s_failures);

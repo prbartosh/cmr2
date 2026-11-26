@@ -35,7 +35,7 @@ bool UsableLocal(const lobby::Endpoint &candidate, const lobby::Endpoint &observ
     return candidate.port != 0 && IsPrivateAddress(candidate.address) && candidate != observed;
 }
 
-} // namespace
+}
 
 bool IsPrivateAddress(uint32_t address)
 {
@@ -580,4 +580,4 @@ bool Rendezvous::IsRelay(const lobby::Endpoint &endpoint) const
     return false;
 }
 
-} // namespace net
+}

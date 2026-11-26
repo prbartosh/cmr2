@@ -118,6 +118,6 @@ private:
     bool foundRelayed = false;
 };
 
-} // namespace net
+}
 
 #endif
