@@ -30,6 +30,7 @@
 #include "MeshVertex.h"
 #include "SceneNode.h"
 #include "LightZone.h"
+#include "Input.h"
 #define SDL_MAIN_HANDLED
 #include <chrono>
 #include <SDL3/SDL_main.h>
@@ -46,6 +47,7 @@ extern void Input_ClearKeyPressQueue();
 extern int Args_Parse(char *);
 extern Menu *FrontendMenu_GetActiveMenu();
 extern Menu *g_pMenu0x00831778;
+extern Menu g_joinCodeMenu;
 extern void RallyData_SetEditedDriverOrCategoryName(unsigned int, char *);
 extern "C" unsigned int Crt_GetRandState();
 extern CarPartSet *g_carPartSets;
@@ -519,6 +521,15 @@ int main(int argc, char **argv) {
     // OPENCMR2_PROBE_LAN_SECONDS: wall time allowed (40; more under the sanitizers).
     const Uint64 lanLimit = getenv("OPENCMR2_PROBE_LAN_SECONDS") ? 1000 * strtoull(getenv("OPENCMR2_PROBE_LAN_SECONDS"), nullptr, 10) : 40000;
     bool lanReady = false;
+    int displayWidth = 0, displayHeight = 0;
+    if (const char *size = getenv("OPENCMR2_PROBE_DISPLAY_SIZE"))
+        if (sscanf(size, "%dx%d", &displayWidth, &displayHeight) != 2 || displayWidth < 640 || displayHeight < 480)
+            return 2;
+    const char *joinCodeLog = getenv("OPENCMR2_PROBE_JOIN_CODE_LOG");
+    std::string joinCode, joinCodeKeys;
+    size_t joinCodeTyped = 0;
+    unsigned joinCodeFrames = 0;
+    bool joinCodeSubmitted = false;
     for (unsigned frame = 0; frame < 200000 && probe.tick < ticks && !CGame::m_shouldExit; ++frame) {
         // Socket threads use wall time, even when the simulation clock is
         // controlled. Give both independent game processes time to exchange
@@ -543,6 +554,14 @@ int main(int argc, char **argv) {
             CGameInfo::SetScreenWidth(probe.challengeWidth);
             CGameInfo::SetScreenHeight(probe.challengeHeight);
             probe.challengeSizeSet = true;
+        }
+        if (displayWidth && frame > 0 && (int(g_pGraphics->resX) != displayWidth || int(g_pGraphics->resY) != displayHeight)) {
+            fprintf(stderr, "probe: display %dx%d at frame %u\n", displayWidth, displayHeight, frame);
+            if (!Gfx_SetVideoMode(displayWidth, displayHeight, FALSE)) return 1;
+            g_pGraphics->resX = displayWidth;
+            g_pGraphics->resY = displayHeight;
+            CGameInfo::SetScreenWidth(displayWidth);
+            CGameInfo::SetScreenHeight(displayHeight);
         }
         // Create the fixture from a real garage session. A second probe run
         // selects it through the frontend's Load Game menu.
@@ -644,6 +663,26 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+            bool holdCode = joinCodeLog && menu == &g_joinCodeMenu, codeReturn = false;
+            if (holdCode && !joinCodeSubmitted) {
+                if (joinCode.empty()) {
+                    if (++joinCodeFrames >= 5) {
+                        std::ifstream log(joinCodeLog);
+                        std::string line;
+                        while (std::getline(log, line))
+                            if (line.compare(0, 15, "net: join code ") == 0)
+                                joinCode = line.substr(15, 9);
+                        joinCodeKeys = std::string(joinCode.size(), '\b') + joinCode + '\r';
+                    }
+                } else if (joinCodeTyped < joinCodeKeys.size()) {
+                    CInput::QueueInputCharacter((unsigned char)joinCodeKeys[joinCodeTyped++]);
+                } else {
+                    fprintf(stderr, "probe: typed join code %s\n", joinCode.c_str());
+                    joinCodeSubmitted = true;
+                    holdCode = false;
+                    codeReturn = true;
+                }
+            }
             // OPENCMR2_PROBE_RESULTS_PRESSES=N: in the results menu after the
             // finish, press Down N times (80 ms each, 160 ms apart) instead
             // of Enter, and count how often the cursor moved.
@@ -666,7 +705,7 @@ int main(int argc, char **argv) {
                     ++pressesDone;
                 }
             } else
-            if ((frame % 12 == 6 || !menu) && !(holdMap && mapOpening) && !holdLobby) {
+            if ((frame % 12 == 6 || !menu || codeReturn) && !(holdMap && mapOpening) && !holdLobby && !holdCode) {
                 keys[INPUT_KEY_RETURN] = 0x80;
                 // Blocking movie playback consumes SDL events itself.
                 SDL_Event event{};

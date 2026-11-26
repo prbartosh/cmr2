@@ -207,6 +207,7 @@ private:
     uint32_t lastLobbyResolve = 0;
     bool lobbyResolving = false;
     bool lobbyResolved = false;
+    bool codeFoundLogged = false;
 };
 
 } // namespace net

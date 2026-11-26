@@ -755,6 +755,7 @@ NetCodeStatus Session::FindByCode(const char *text)
         return NET_CODE_INVALID;
     if (host == nullptr || state != State::Idle)
         return NET_CODE_IDLE;
+    codeFoundLogged = false;
     rendezvous.Find(code);
     return rendezvous.FindStatus(nullptr, nullptr);
 }
@@ -766,6 +767,10 @@ NetCodeStatus Session::CodeSession(NetGuid *instance, bool *relayed)
     bool viaRelay = false;
     NetCodeStatus status = rendezvous.FindStatus(&guid, &viaRelay);
     if (status == NET_CODE_FOUND) {
+        if (!codeFoundLogged) {
+            codeFoundLogged = true;
+            LOG("net: game found by code (%s)", viaRelay ? "relay" : "direct");
+        }
         if (instance != nullptr)
             memcpy(instance->bytes, guid.data(), guid.size());
         if (relayed != nullptr)
