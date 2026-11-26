@@ -1,0 +1,251 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # 32-bit x86 reference build on the same Ubuntu LTS as native Linux.
+  linux-x86:
+    runs-on: ubuntu-24.04
+    env:
+      PKG_CONFIG_LIBDIR: /usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig
+    steps:
+      - name: Install 32-bit build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y clang g++-multilib ninja-build glslang-tools pkg-config \
+            libx11-dev:i386 libxext-dev:i386 libxrandr-dev:i386 libxcursor-dev:i386 \
+            libxi-dev:i386 libxss-dev:i386 libxtst-dev:i386 libxkbcommon-dev:i386 \
+            libwayland-dev:i386 wayland-protocols libegl1-mesa-dev:i386 \
+            libasound2-dev:i386 libudev-dev:i386 libdbus-1-dev:i386
+      - uses: actions/checkout@v4
+      # Ubuntu 24.04 has no SDL3 package: compile it for i386 too.
+      - run: cmake --preset linux-x86 -DOPENCMR2_VENDORED_SDL=ON
+      - run: cmake --build --preset linux-x86
+      - run: ctest --preset linux-x86
+      - name: Package
+        run: |
+          python3 tools/package_release.py --binary build/linux-x86/src/opencmr2 \
+            --library build/linux-x86/src/libSDL3.so.0 \
+            --license build/linux-x86/_deps/sdl3-src/LICENSE.txt \
+            --output dist/OpenCMR2-Linux-i686.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCMR2-Linux-i686
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build glslang-tools \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libegl1-mesa-dev libasound2-dev libpulse-dev libudev-dev libdbus-1-dev
+      - uses: actions/checkout@v4
+      # Ubuntu 24.04 has no SDL3 package: the build fetches it.
+      - run: cmake --preset linux -DOPENCMR2_VENDORED_SDL=ON
+      - run: cmake --build --preset linux
+      - run: ctest --preset linux
+      - name: Package
+        run: |
+          python3 tools/package_release.py --binary build/linux/src/opencmr2 \
+            --library build/linux/src/libSDL3.so.0 \
+            --license build/linux/_deps/sdl3-src/LICENSE.txt \
+            --output dist/OpenCMR2-Linux-${{ matrix.arch }}.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCMR2-Linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Portable AppImage built on Debian 12 (glibc 2.36) so it runs across
+  # older and newer Linux distributions without needing Flatpak or FUSE2.
+  linux-appimage:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            appimage_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            appimage_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: debian:bookworm
+    steps:
+      - name: Install build and packaging dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl file git python3 \
+            clang-16 cmake ninja-build glslang-tools pkg-config \
+            desktop-file-utils appstream \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libegl1-mesa-dev libdecor-0-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev
+      - uses: actions/checkout@v4
+      - name: Validate Linux desktop metadata
+        run: |
+          desktop-file-validate packaging/linux/io.github.pablocpas.OpenCMR2.desktop
+          appstreamcli validate --no-net packaging/linux/io.github.pablocpas.OpenCMR2.metainfo.xml
+      - name: Configure and build
+        run: |
+          cmake --preset linux \
+            -DCMAKE_C_COMPILER=clang-16 \
+            -DCMAKE_CXX_COMPILER=clang++-16 \
+            -DOPENCMR2_VENDORED_SDL=ON
+          cmake --build --preset linux
+      - name: Test
+        run: ctest --preset linux
+      - name: Package AppImage
+        run: |
+          curl --fail --location --retry 3 \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.appimage_arch }}.AppImage" \
+            -o /tmp/appimagetool
+          chmod +x /tmp/appimagetool
+          packaging/linux/build_appimage.sh \
+            --build-dir build/linux \
+            --arch "${{ matrix.appimage_arch }}" \
+            --appimagetool /tmp/appimagetool \
+            --output "dist/OpenCMR2-Linux-${{ matrix.arch }}.AppImage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCMR2-Linux-AppImage-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - run: brew install ninja glslang
+      - uses: actions/checkout@v4
+      # Builds SDL3, shipped in the release, and spirv-cross for the Metal shaders.
+      - run: cmake --preset macos -DOPENCMR2_VENDORED_SDL=ON
+      - run: cmake --build --preset macos
+      - run: ctest --preset macos
+      - name: Package
+        run: |
+          python3 tools/package_release.py --binary build/macos/src/opencmr2 \
+            --library build/macos/src/libSDL3.0.dylib \
+            --license build/macos/_deps/sdl3-src/LICENSE.txt \
+            --output dist/OpenCMR2-macOS-arm64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCMR2-macOS-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: glslang
+        shell: pwsh
+        run: |
+          curl.exe --fail --location --retry 3 --retry-delay 5 --output glslang.zip https://github.com/KhronosGroup/glslang/releases/download/main-tot/glslang-main-windows-x86_64-release.zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Expand-Archive glslang.zip -DestinationPath glslang
+          & "$PWD\glslang\bin\glslang.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Add-Content $env:GITHUB_PATH "$PWD\glslang\bin"
+      # clang++ from Visual Studio's LLVM component; SDL3 is fetched.
+      - run: cmake --preset windows-x64 -DOPENCMR2_VENDORED_SDL=ON
+      - run: cmake --build --preset windows-x64
+      - run: ctest --preset windows-x64
+      - name: Package
+        shell: pwsh
+        run: |
+          python -m pip install pefile==2024.8.26
+          $crt = Join-Path $env:VCToolsRedistDir "x64/Microsoft.VC143.CRT"
+          python tools/package_release.py --binary build/windows-x64/src/opencmr2.exe `
+            --dll-dir $crt --license build/windows-x64/_deps/sdl3-src/LICENSE.txt `
+            --output dist/OpenCMR2-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCMR2-Windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The version comes from git describe and the commit count.
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install SDK, NDK and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-37.0" "ndk;30.0.16248370" "cmake;4.1.2" > /dev/null
+      # Signed with the release key when the repository has it, otherwise
+      # with a debug key (see android/app/build.gradle.kts).
+      - name: Release key
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+        if: env.KEYSTORE != ''
+        run: |
+          echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "OPENCMR2_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+      - name: Build
+        working-directory: android
+        env:
+          OPENCMR2_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          OPENCMR2_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          OPENCMR2_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew testDebugUnitTest assembleRelease
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk dist/OpenCMR2-Android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenCMR2-Android
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-x86, linux, linux-appimage, macos, windows, android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: OpenCMR2-*
+          path: dist
+          merge-multiple: true
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
